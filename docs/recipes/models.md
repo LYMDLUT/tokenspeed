@@ -447,6 +447,61 @@ ts serve zai-org/GLM-5.3 \
   --speculative-num-steps 3
 ```
 
+## HY V4 (Hy4-preview)
+
+`tencent/Hy4-preview` (`HYV4ForCausalLM`, 770B total / 49B active) runs on the
+GLM-DSA serving path with four additions: a gated MLA output, a per-head
+learnable attention sink, independent Hyper-Connections (iHC, four residual
+channels) and a clamped SwiGLU on the routed experts. The base checkpoint ships
+one MTP layer (`model.mtp_layers.0`), so MTP needs no separate draft checkpoint.
+
+Constraints that follow from the architecture:
+
+* The learnable sink is applied inside the sparse DSA kernels (FlashMLA on
+  NVIDIA, the portable Triton kernel elsewhere). Kernels that cannot apply a
+  sink are excluded from selection, so a sink-bearing model never silently
+  drops it.
+* iHC reduces and re-scatters every channel of a token at once, so attention
+  must see full token rows: use attention data parallelism (`--attn-tp-size 1`)
+  or a layout where attention all-reduces. The reduce-scatter attention layout
+  is rejected at startup.
+* `enable_lm_head_fp32` is honored by accumulating the LM head GEMM in FP32
+  with the BF16 weight, so no FP32 copy of the head is kept.
+* The iHC residual channels are carried in FP32 from the embedding to the
+  head; each sub-block still runs in BF16 on its reduced input. Rounding the
+  channels to BF16 at every sub-block boundary compounds across the layers
+  into a logit drift large enough to flip greedy answers.
+* The routed experts require a MoE kernel that sums each token's expert
+  outputs in a fixed order (`requires_deterministic_finalize`), so outputs are
+  reproducible run to run. The FlashInfer cutlass kernels (BF16 and block-FP8)
+  provide it by finalizing outside the GEMM2 epilogue, whose atomic adds would
+  reorder the sum; kernels that cannot guarantee it are not selected.
+* Validated so far: the BF16 checkpoint on four 8x H20 (96 GB) nodes with
+  attention TP32 and EP32. Keep the KV cache in BF16 unless you have validated
+  FP8 KV accuracy on your workload.
+
+Four nodes of 8x H20, attention TP32 with EP32:
+
+```bash
+# node 0 (serves the HTTP API)
+ts serve tencent/Hy4-preview \
+  --served-model-name hy4 \
+  --nnodes 4 --node-rank 0 \
+  --dist-init-addr <node0-host>:25000 \
+  --attn-tp-size 32 --dense-tp-size 32 \
+  --enable-expert-parallel \
+  --max-model-len 65536 \
+  --max-num-seqs 64
+
+# nodes 1-3: the same command with --node-rank 1, 2, 3
+```
+
+`ts serve` defaults the reasoning and tool-call parsers to `hy_v4`; the pinned
+gateway (smg 1.11) provides both. The chat template accepts `reasoning_effort`
+values `high` (the default), `low` and `no_think`. With
+`--grammar-backend xgrammar`, a `json_schema` response format is enforced after
+the reasoning block closes, or from the first token under `no_think`.
+
 ## GLM 5.3 Flash
 
 GLM-5.3-Flash automatically configures its KDA/DSA backends and supports MTP from

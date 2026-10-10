@@ -71,6 +71,10 @@ DEEPSEEK_V4_TOOL_CALL_PARSER = "deepseek_v4"
 DEEPSEEK_V41_REASONING_PARSER = "deepseek_v41"
 GLM_REASONING_PARSER = "glm45"
 GLM_TOOL_CALL_PARSER = "glm47_moe"
+# Registered in smg since 1.11.0 (the pinned gateway); older builds reject the
+# names at startup.
+HY_V4_REASONING_PARSER = "hy_v4"
+HY_V4_TOOL_CALL_PARSER = "hy_v4"
 INKLING_REASONING_PARSER = "inkling"
 INKLING_TOOL_CALL_PARSER = "inkling"
 INKLING_ATTENTION_BACKEND = "fa4"
@@ -424,6 +428,24 @@ def _is_glm_dsa_model(model_id: str | None) -> bool:
     )
 
 
+_HY_V4_NAME = re.compile(r"(?:^|[/_.-])hy[-_]?v?4(?:[-_./]|$)", re.IGNORECASE)
+
+
+def _is_hy_v4_model(model_id: str | None) -> bool:
+    if not model_id:
+        return False
+    config = _load_model_config(model_id)
+    if config:
+        # "hy4" is short enough to collide with unrelated paths, so a local
+        # config is authoritative and the name only identifies hub ids.
+        architectures = config.get("architectures") or []
+        return config.get("model_type") == "hy_v4" or any(
+            arch in {"HYV4ForCausalLM", "HYV4ForCausalLMNextN"}
+            for arch in architectures
+        )
+    return _HY_V4_NAME.search(model_id.rstrip("/")) is not None
+
+
 def _is_inkling_model(model_id: str | None) -> bool:
     if not model_id:
         return False
@@ -536,6 +558,16 @@ def _args_with_default_model_parsers(
             gateway_result.extend(["--reasoning-parser", KIMI_K3_REASONING_PARSER])
         if "--tool-call-parser" not in gateway_result:
             gateway_result.extend(["--tool-call-parser", KIMI_K3_TOOL_CALL_PARSER])
+
+    elif _is_hy_v4_model(model_id):
+        if (
+            "--reasoning-parser" not in engine_result
+            and "--reasoning-parser" not in gateway_result
+        ):
+            engine_result.extend(["--reasoning-parser", HY_V4_REASONING_PARSER])
+            gateway_result.extend(["--reasoning-parser", HY_V4_REASONING_PARSER])
+        if "--tool-call-parser" not in gateway_result:
+            gateway_result.extend(["--tool-call-parser", HY_V4_TOOL_CALL_PARSER])
 
     return engine_result, gateway_result
 
