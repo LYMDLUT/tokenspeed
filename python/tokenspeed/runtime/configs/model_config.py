@@ -96,12 +96,11 @@ _DSA_ARCHITECTURES = frozenset(
         "DeepseekV32ForCausalLMNextN",
         "Glm53FlashForConditionalGeneration",
         "Glm53FlashForConditionalGenerationNextN",
-        # HY V4: MLA + DSA with the same indexer geometry, plus a gated output
-        # projection and a per-head learnable sink the DSA backend forwards.
-        "HYV4ForCausalLM",
-        "HYV4ForCausalLMNextN",
     }
 )
+# HY V4: MLA + DSA with the same indexer geometry, plus a gated output
+# projection and a per-head learnable sink the DSA backend forwards.
+_HYV4_ARCHITECTURES = frozenset({"HYV4ForCausalLM", "HYV4ForCausalLMNextN"})
 _MSA_ARCHITECTURES = frozenset(
     {
         "MiniMaxM3SparseForConditionalGeneration",
@@ -253,6 +252,10 @@ def configure_dsa_attention(model_config, server_args: ServerArgs) -> None:
     # leaf reads. A plugin hook that scores the checkpoint's bf16 keys sets
     # "bf16" after this (layers/attention/configs/dsa.py INDEX_K_FORMATS).
     model_config.index_k_format = "fp8_scaled"
+    # Whether the model's attention drops the padded rows itself, so a prefill
+    # replays a padded breakable graph (DSAConfig.padded_prefill_replay). A
+    # model hook that does sets it after this (configure_hyv4_attention).
+    model_config.dsa_padded_prefill_replay = False
 
     model_config.scaling = 1 / math.sqrt(
         model_config.qk_nope_head_dim + model_config.qk_rope_head_dim
@@ -263,6 +266,19 @@ def configure_dsa_attention(model_config, server_args: ServerArgs) -> None:
         scaling_factor = rope_scaling["factor"]
         mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
         model_config.scaling = model_config.scaling * mscale * mscale
+
+
+def configure_hyv4_attention(model_config, server_args: ServerArgs) -> None:
+    """DSA geometry, plus the padded prefill replay HY V4's attention allows.
+
+    HY V4's attention break holds every read of the live metadata and slices
+    off the padded rows; its MTP draft has not been validated under prefill
+    graphs yet.
+    """
+    configure_dsa_attention(model_config, server_args)
+    model_config.dsa_padded_prefill_replay = (
+        resolve_architecture(model_config.hf_config) == "HYV4ForCausalLM"
+    )
 
 
 def configure_mla_attention(model_config, server_args: ServerArgs) -> None:
@@ -317,6 +333,12 @@ _ATTENTION_FAMILY_SPECS = (
         name="GLM",
         architectures=_DSA_ARCHITECTURES,
         configure=configure_dsa_attention,
+        default_backend="dsa",
+    ),
+    _AttentionFamilySpec(
+        name="HY V4",
+        architectures=_HYV4_ARCHITECTURES,
+        configure=configure_hyv4_attention,
         default_backend="dsa",
     ),
     _AttentionFamilySpec(

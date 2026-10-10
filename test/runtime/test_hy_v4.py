@@ -43,8 +43,8 @@ from tokenspeed_kernel.ops.residual.torch import (
 
 from tokenspeed.runtime.configs.hy_v4_config import HYV4Config
 from tokenspeed.runtime.configs.model_config import (
-    _DSA_ARCHITECTURES,
     AttentionArch,
+    _resolve_attention_family,
     configure_dsa_attention,
 )
 from tokenspeed.runtime.layers.quantization.modelopt_mxfp8 import ModelOptMxfp8Config
@@ -143,9 +143,22 @@ class HYV4ConfigTests(unittest.TestCase):
         self.assertEqual(model_config.index_topk, 2048)
         self.assertAlmostEqual(model_config.scaling, 256**-0.5)
 
-    def test_architectures_registered_as_dsa(self):
-        self.assertIn("HYV4ForCausalLM", _DSA_ARCHITECTURES)
-        self.assertIn("HYV4ForCausalLMNextN", _DSA_ARCHITECTURES)
+    def test_only_the_target_replays_padded_prefill_graphs(self):
+        for arch, expected in (
+            ("HYV4ForCausalLM", True),
+            ("HYV4ForCausalLMNextN", False),
+        ):
+            config = HYV4Config(architectures=[arch])
+            model_config = SimpleNamespace(hf_text_config=config, hf_config=config)
+            family = _resolve_attention_family(config, config)
+            family.configure(model_config, ServerArgs(model="x"))
+            self.assertIs(model_config.dsa_padded_prefill_replay, expected)
+
+    def test_architectures_resolve_to_the_hy_v4_dsa_family(self):
+        for arch in ("HYV4ForCausalLM", "HYV4ForCausalLMNextN"):
+            config = HYV4Config(architectures=[arch])
+            family = _resolve_attention_family(config, config)
+            self.assertEqual((family.name, family.default_backend), ("HY V4", "dsa"))
 
 
 class HYV4CheckpointNameTests(unittest.TestCase):
