@@ -1909,6 +1909,7 @@ class KimiLinearMoE(nn.Module):
                     else None
                 )
             ),
+            deterministic_finalize=False,
         )
 
         if mapping.attn.dp_size > 1:

@@ -72,7 +72,7 @@ def test_wrapper_never_enables_pdl(monkeypatch) -> None:
     monkeypatch.setattr(cutlass_unquant, "cutlass_fused_moe", fake_cutlass_fused_moe)
     x = torch.zeros(2, 8, dtype=torch.bfloat16, device="cuda")
     cutlass_unquant.flashinfer_cutlass_unquant_moe_apply(
-        {},
+        {"deterministic_finalize": False},
         x,
         SimpleNamespace(
             w13_weight=torch.zeros(4, 16, 8, dtype=torch.bfloat16, device="cuda"),
@@ -119,7 +119,7 @@ def test_wrapper_passes_one_persistent_zeroed_workspace(monkeypatch) -> None:
 
     def apply(tokens: int) -> None:
         cutlass_unquant.flashinfer_cutlass_unquant_moe_apply(
-            {},
+            {"deterministic_finalize": False},
             torch.zeros(tokens, hidden, dtype=torch.bfloat16, device=device),
             layer,
             None,
@@ -211,6 +211,7 @@ def test_ep_rank_with_repeated_placeholder_experts(ep_rank: int) -> None:
         fast_math=True,
         combine_order="rank",
         solution="flashinfer_cutlass",
+        requires_deterministic_finalize=False,
     )
     reference_w13 = w13.clone()
     layer = SimpleNamespace(
