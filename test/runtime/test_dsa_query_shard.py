@@ -246,6 +246,7 @@ def test_the_sharded_arm_attends_gathered_groups_with_full_heads(monkeypatch, ra
         v_head_dim=KV_DIM - 2,
         scaling=0.5,
         logit_cap=0.0,
+        attn_sink=None,
     )
     local_rows = plan.local_rows
     q = torch.randn(local_rows, 2 * KV_DIM, dtype=torch.bfloat16)
@@ -328,6 +329,7 @@ def test_the_sharded_arm_refuses_a_query_carrying_the_tp_slice():
         v_head_dim=KV_DIM - 2,
         scaling=0.5,
         logit_cap=0.0,
+        attn_sink=None,
     )
     rows = plan.local_rows
     with pytest.raises(RuntimeError, match="every head"):
@@ -492,6 +494,7 @@ def _decode_layer(heads: int):
         v_head_dim=128,
         scaling=0.1,
         logit_cap=0.0,
+        attn_sink=None,
     )
 
 
