@@ -117,10 +117,11 @@ class DSABackend(PagedAttentionBackend):
             if spec.index_kpool is not None
             else None
         )
-        if self.kpool_runtime is not None:
-            # GLM-5.3-Flash (the one KPool consumer) handles padded prefill
-            # replay explicitly in its model code, so the class-level DSA
-            # restriction does not apply to it.
+        if self.kpool_runtime is not None or spec.padded_prefill_replay:
+            # GLM-5.3-Flash (the one KPool consumer) and models declaring
+            # padded_prefill_replay handle padded prefill replay explicitly in
+            # their model code, so the class-level DSA restriction does not
+            # apply to them.
             self.cuda_graph_support = CudaGraphSupport(prefill_graph=True)
 
     def configure_runtime(

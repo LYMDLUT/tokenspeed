@@ -230,6 +230,12 @@ def configure_glm_attention(model_config) -> None:
     model_config.index_n_heads = mla_config.index_n_heads
     model_config.index_kpool = getattr(mla_config, "index_kpool", None)
     model_config.index_topk_pattern = getattr(mla_config, "index_topk_pattern", None)
+    # HY V4's attention break holds every read of the live metadata and slices
+    # off the padded rows; its MTP draft has not been validated under prefill
+    # graphs yet.
+    model_config.dsa_padded_prefill_replay = (
+        resolve_architecture(model_config.hf_config) == "HYV4ForCausalLM"
+    )
 
     model_config.scaling = 1 / math.sqrt(
         model_config.qk_nope_head_dim + model_config.qk_rope_head_dim

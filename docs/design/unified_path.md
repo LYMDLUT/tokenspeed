@@ -273,8 +273,12 @@ over the target and draft `child_backends()` trees once
 (`resolve_cuda_graph_support`), logs every culprit class, and downgrades the
 two graph subsystems (`ForwardStepRunner.disable`, `PrefillGraph.disable`).
 `DSABackend` and Qwen4-Exp's PLE/indexer consumers disable the prefill graph
-(rationale comments live on those classes). Qwen4-Exp's root composes its
-actual children, so these restrictions also apply when there is no GDN leaf.
+(rationale comments live on those classes). A DSA instance re-enables it when
+its model reads the backend metadata only inside the eager attention break and
+drops the padded rows there: GLM-5.3-Flash (KPool) and models whose
+`DSAConfig.padded_prefill_replay` is set (HY V4's target model). Qwen4-Exp's
+root composes its actual children, so these restrictions also apply when there
+is no GDN leaf.
 
 Rules: declarations are static "never works" facts — a runtime prefill
 capture failure is FATAL (no silent eager degrade: a family that cannot

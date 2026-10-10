@@ -73,6 +73,7 @@ def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
         index_head_dim=text_config.index_head_dim,
         index_n_heads=text_config.index_n_heads,
         index_kpool=text_config.index_kpool,
+        padded_prefill_replay=False,
     )
     linear = LinearAttnConfig(
         num_k_heads=text_config.linear_num_heads,

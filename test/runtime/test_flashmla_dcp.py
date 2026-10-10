@@ -638,7 +638,13 @@ def test_pure_dsa_dcp_shards_index_and_latent_capacity(degree):
     base = _mla_config()
     fields = asdict(base.components[0])
     fields.update(backend_name="dsa")
-    spec = DSAConfig(**fields, index_topk=2048, index_n_heads=16, index_head_dim=128)
+    spec = DSAConfig(
+        **fields,
+        index_topk=2048,
+        index_n_heads=16,
+        index_head_dim=128,
+        padded_prefill_replay=False,
+    )
     config = replace(
         base,
         device="cuda",

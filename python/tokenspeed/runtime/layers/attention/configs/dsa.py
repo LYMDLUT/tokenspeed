@@ -53,6 +53,10 @@ class DSAConfig(MLAConfig):
     index_head_dim: int
     index_n_heads: int
     index_kpool: int | None = None
+    # The model reads the live metadata (cache writes, the indexer top-k and
+    # the sparse kernel) only inside one eager break that drops the padded
+    # rows itself, so its prefill can replay a padded breakable graph.
+    padded_prefill_replay: bool
 
     @classmethod
     def _spec_kwargs(
@@ -64,6 +68,7 @@ class DSAConfig(MLAConfig):
             index_head_dim=model_config.index_head_dim,
             index_n_heads=model_config.index_n_heads,
             index_kpool=getattr(model_config, "index_kpool", None),
+            padded_prefill_replay=model_config.dsa_padded_prefill_replay,
         )
 
     @classmethod

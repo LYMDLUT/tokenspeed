@@ -48,7 +48,11 @@ from transformers import PretrainedConfig
 
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
-from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
+from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    break_point,
+    current_valid_rows,
+    slice_to_real_tokens,
+)
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
@@ -304,7 +308,6 @@ class HYV4Attention(GlmMoeDsaAttention):
             return attn_output
         return (attn_output.float() * torch.sigmoid(gate.float())).to(attn_output.dtype)
 
-    @break_point
     def forward(
         self,
         positions: torch.Tensor,
@@ -315,11 +318,11 @@ class HYV4Attention(GlmMoeDsaAttention):
     ) -> torch.Tensor:
         """HY V4 sparse attention: the GLM-DSA path plus the output gate.
 
-        Same break-point contract as the GLM-DSA attention (cache writes, the
-        indexer -> top-k stage and the FlashMLA kernel are not capturable). The
-        hidden states are gathered once and shared by the indexer and the gate,
-        and the gate is applied before any draft narrowing so its rows always
-        match the attention output.
+        The token-shaped projections around the sparse core stay in the
+        caller's graph segments; only :meth:`_sparse_attention` is an eager
+        break. The hidden states are gathered once and shared by the indexer
+        and the gate, and the gate is applied before any draft narrowing so its
+        rows always match the attention output.
         """
         if hidden_states.shape[0] == 0:
             return hidden_states
@@ -342,11 +345,86 @@ class HYV4Attention(GlmMoeDsaAttention):
         if q_a.size(0) > 0:
             self.fused_qk_layernorm(input_q_a=q_a, input_kv_a=kv_a, output_q_a=q_norm)
 
+        should_compute_indexer = self._computes_topk(
+            ctx, num_tokens=int(q_norm.shape[0])
+        )
+        if should_compute_indexer or self.linear_gate is not None:
+            hidden_states = comm_manager.pre_attn_comm(hidden_states, ctx)
+        index_q = index_k = index_weights = None
+        if should_compute_indexer:
+            indexer_output = self.indexer(hidden_states, q_norm, positions)
+            index_q = indexer_output.query
+            index_k = indexer_output.key
+            index_weights = indexer_output.weights
+
+        q = self.q_b_proj(q_norm)[0]
+        attn_output = self._sparse_attention(
+            positions, q, latent_cache, index_q, index_k, index_weights, ctx
+        )
+        attn_output = self._apply_output_gate(attn_output, hidden_states)
+        if ctx.draft_narrowing is not None:
+            attn_output = attn_output.index_select(0, ctx.gather_ids)
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    def _computes_topk(self, ctx: ForwardContext, *, num_tokens: int) -> bool:
+        """Whether this layer runs its indexer and selects its own top-k.
+
+        Target layers decide statically. NextN reuses the selection a previous
+        draft iteration left in the shared slot.
+        """
+        if not self.skip_indexer_topk:
+            return True
+        if not self.is_nextn:
+            return False
+        shared_topk = ctx.attn_backend.sparse_topk
+        decode_window = self._resolve_decode_window(
+            ctx,
+            getattr(ctx.attn_backend, "forward_decode_metadata", None),
+            total_tokens=num_tokens,
+        )
+        return (decode_window.start > 0 and shared_topk.prefill is None) or (
+            decode_window.num_tokens > 0 and shared_topk.decode is None
+        )
+
+    @break_point
+    def _sparse_attention(
+        self,
+        positions: torch.Tensor,
+        q: torch.Tensor,
+        latent_cache: torch.Tensor,
+        index_q: torch.Tensor | None,
+        index_k: torch.Tensor | None,
+        index_weights: torch.Tensor | None,
+        ctx: ForwardContext,
+    ) -> torch.Tensor:
+        """Cache writes, top-k selection and the sparse FlashMLA kernels.
+
+        Same break-point contract as the GLM-DSA attention: none of this is
+        capturable. The index tensors are ``None`` when the layer reuses the
+        shared top-k.
+        """
+        valid_rows = current_valid_rows()
+        if valid_rows is not None:
+            # A padded prefill-graph replay hands this break the whole token
+            # bucket; the prefill/decode split and the DSA kernels below are
+            # sized by the live metadata, so drop the filler rows up front.
+            positions, q, latent_cache, index_q, index_k, index_weights = (
+                slice_to_real_tokens(
+                    valid_rows,
+                    positions,
+                    q,
+                    latent_cache,
+                    index_q,
+                    index_k,
+                    index_weights,
+                )
+            )
         decode_metadata = getattr(ctx.attn_backend, "forward_decode_metadata", None)
         decode_window = self._resolve_decode_window(
             ctx,
             decode_metadata,
-            total_tokens=int(q_norm.shape[0]),
+            total_tokens=int(q.shape[0]),
         )
         num_decode_tokens = decode_window.num_tokens
         num_prefill_tokens = decode_window.start
@@ -370,26 +448,19 @@ class HYV4Attention(GlmMoeDsaAttention):
         elif decode_locs is not None:
             out_cache_loc = decode_locs
         else:
-            out_cache_loc = torch.empty(0, dtype=torch.int64, device=q_norm.device)
+            out_cache_loc = torch.empty(0, dtype=torch.int64, device=q.device)
 
-        should_compute_indexer = not self.skip_indexer_topk or (
-            self.is_nextn
-            and (
-                (num_prefill_tokens > 0 and shared_topk.prefill is None)
-                or (num_decode_tokens > 0 and shared_topk.decode is None)
+        if index_k is not None:
+            indexer_output = GlmDsaIndexerOutput(
+                query=index_q, key=index_k, weights=index_weights
             )
-        )
-        if should_compute_indexer or self.linear_gate is not None:
-            hidden_states = comm_manager.pre_attn_comm(hidden_states, ctx)
-        if should_compute_indexer:
-            indexer_output = self.indexer(hidden_states, q_norm, positions)
             index_slots, index_mask = resolve_cache_slots(
-                out_cache_loc, ctx.attn_backend.cache_placement(self.attn_mqa)
+                out_cache_loc, backend.cache_placement(self.attn_mqa)
             )
             ctx.token_to_kv_pool.set_index_k_buffer(
                 self.attn_mqa.layer_id,
                 index_slots,
-                indexer_output.key,
+                index_k,
                 write_mask=index_mask,
             )
             if ctx.num_extends > 0:
@@ -404,7 +475,6 @@ class HYV4Attention(GlmMoeDsaAttention):
                     ctx,
                 )
 
-        q = self.q_b_proj(q_norm)[0]
         attn_output = torch.empty(
             q.size(0),
             self.num_local_heads * self.v_head_dim,
@@ -456,12 +526,7 @@ class HYV4Attention(GlmMoeDsaAttention):
                 topk_indices=topk_indices,
                 topk_lens=topk_lens,
             )
-
-        attn_output = self._apply_output_gate(attn_output, hidden_states)
-        if ctx.draft_narrowing is not None:
-            attn_output = attn_output.index_select(0, ctx.gather_ids)
-        output, _ = self.o_proj(attn_output)
-        return output
+        return attn_output
 
 
 class HYV4MoE(DeepseekV3MoE):
