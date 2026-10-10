@@ -62,6 +62,9 @@ from tokenspeed.runtime.layers.moe import (
 from tokenspeed.runtime.layers.moe.topk import TopK
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.modelopt_mxfp8 import (
+    preprocess_modelopt_mxfp8_weights,
+)
 from tokenspeed.runtime.layers.quantization.utils import block_dequant
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
@@ -1014,6 +1017,11 @@ def load_hyv4_weights(
         ep_rank=owner.mapping.moe.ep_rank,
         ep_size=owner.mapping.moe.ep_size,
     )
+    weights = preprocess_modelopt_mxfp8_weights(
+        weights,
+        owner.quant_config,
+        keeps_mxfp8=lambda name: ".mlp.experts." in name,
+    )
 
     for name, loaded_weight in weights:
         if "rotary_emb.inv_freq" in name:
@@ -1051,6 +1059,10 @@ def load_hyv4_weights(
             continue
 
         if ".mlp.experts." in name:
+            if name.endswith("_proj_scale"):
+                # MXFP8 packed experts: the E8M0 scales feed the MoE
+                # ``*_weight_scale_inv`` parameters.
+                name += "_inv"
             if moe_loader.matches(name):
                 loaded_params.add(moe_loader.load(name, loaded_weight))
             # Experts owned by another EP rank are skipped here.

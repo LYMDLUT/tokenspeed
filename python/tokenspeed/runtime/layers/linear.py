@@ -46,6 +46,7 @@ from tokenspeed.runtime.layers.parameter import (
 from tokenspeed.runtime.layers.quantization import (
     Fp8Config,
     ModelOptMixedConfig,
+    ModelOptMxfp8Config,
     Mxfp4Config,
     Nvfp4Config,
     W8A8Fp8Config,
@@ -209,7 +210,7 @@ class LinearBase(torch.nn.Module):
                 self.quant_method = UnquantizedLinearMethod()
         elif isinstance(quant_config, CompressedTensorsConfig):
             self.quant_method = quant_config.get_quant_method(self, prefix)
-        elif isinstance(quant_config, ModelOptMixedConfig):
+        elif isinstance(quant_config, (ModelOptMixedConfig, ModelOptMxfp8Config)):
             self.quant_method = quant_config.get_quant_method(self, prefix)
         else:
             if isinstance(quant_config, Fp8Config):
