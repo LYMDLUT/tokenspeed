@@ -476,9 +476,27 @@ Constraints that follow from the architecture:
   reproducible run to run. The FlashInfer cutlass kernels (BF16 and block-FP8)
   provide it by finalizing outside the GEMM2 epilogue, whose atomic adds would
   reorder the sum; kernels that cannot guarantee it are not selected.
-* Validated so far: the BF16 checkpoint on four 8x H20 (96 GB) nodes with
-  attention TP32 and EP32. Keep the KV cache in BF16 unless you have validated
-  FP8 KV accuracy on your workload.
+* MXFP8 checkpoints (ModelOpt `quant_algo: MXFP8`: E4M3 weights with one E8M0
+  scale per 32 input channels) are detected from the checkpoint's
+  `quantization_config`; no `--quantization` flag is needed. On Hopper the
+  routed experts stay MXFP8 and run on the Marlin W8A16 MoE kernel, half the
+  BF16 expert memory. Its route alignment switches to a stable sort under the
+  deterministic-finalize requirement, so outputs stay reproducible. Batches
+  with at least 192 routes per expert (prefill) instead dequantize the local
+  experts into one BF16 scratch per GPU and use the CUTLASS grouped GEMM,
+  since Marlin's mma.sync tiles leave Hopper tensor cores idle once the GEMM
+  is compute bound; the dequantization is exact. Decode batches of at most
+  16 routes with expert parallelism take a Triton GEMV over the same Marlin
+  layout instead: Marlin's split-K lock chain is bandwidth-starved at one
+  or two local routes, and counting those routes on the device would break
+  decode CUDA graphs. Dense projections are
+  dequantized to BF16 while loading; an E4M3 value times a power of two is
+  exact in BF16, so this matches a weight-only MXFP8 GEMM up to accumulation
+  order.
+* Validated so far: the BF16 and MXFP8 checkpoints on four 8x H20 (96 GB)
+  nodes with attention TP32 and EP32, and the MXFP8 checkpoint on two such
+  nodes with TP16 and EP16. Keep the KV cache in BF16 unless you have
+  validated FP8 KV accuracy on your workload.
 
 Four nodes of 8x H20, attention TP32 with EP32:
 

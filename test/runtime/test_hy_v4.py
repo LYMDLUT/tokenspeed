@@ -47,6 +47,7 @@ from tokenspeed.runtime.configs.model_config import (
     AttentionArch,
     configure_dsa_attention,
 )
+from tokenspeed.runtime.layers.quantization.modelopt_mxfp8 import ModelOptMxfp8Config
 from tokenspeed.runtime.models import hy_v4_nextn
 from tokenspeed.runtime.models.hy_v4 import (
     load_hyv4_weights,
@@ -275,10 +276,10 @@ class HYV4WeightLoaderTests(unittest.TestCase):
         "model.layers.0.self_attn.rotary_emb.inv_freq",
     ]
 
-    def _load(self, owner, names, **kwargs):
+    def _load(self, owner, names, weights=(), **kwargs):
         load_hyv4_weights(
             owner,
-            ((name, torch.empty(1)) for name in names),
+            [(name, torch.empty(1)) for name in names] + list(weights),
             module_prefix="model",
             checkpoint_prefix="model",
             **kwargs,
@@ -317,6 +318,56 @@ class HYV4WeightLoaderTests(unittest.TestCase):
         with self.assertLogs("tokenspeed.runtime.models.hy_v4", "WARNING") as logs:
             self._load(owner, self._CHECKPOINT + ["model.layers.0.extra.weight"])
         self.assertIn("model.layers.0.extra.weight", logs.output[0])
+
+    @unittest.skipUnless(torch.cuda.is_available(), "MXFP8 dequantizes on CUDA")
+    def test_mxfp8_checkpoint_feeds_bf16_dense_and_fp8_experts(self):
+        experts = "model.layers.0.mlp.experts."
+        owner, calls = _owner_with_params(
+            [
+                "model.layers.0.self_attn.o_proj.weight",
+                experts + "w13_weight",
+                experts + "w13_weight_scale_inv",
+                experts + "w2_weight",
+                experts + "w2_weight_scale_inv",
+            ]
+        )
+        owner.quant_config = ModelOptMxfp8Config.from_config(
+            {"quant_method": "modelopt", "quantization": {"quant_algo": "MXFP8"}}
+        )
+        received = {}
+        owner.get_parameter("model.layers.0.self_attn.o_proj.weight").weight_loader = (
+            lambda _param, weight: received.setdefault("o_proj", weight)
+        )
+        fp8 = torch.ones(2, 4, 64).to(torch.float8_e4m3fn)
+        scale = torch.full((2, 4, 2), 127, dtype=torch.uint8)
+        self._load(
+            owner,
+            [],
+            weights=[
+                ("model.layers.0.self_attn.o_proj.weight", fp8[0]),
+                ("model.layers.0.self_attn.o_proj.weight_scale", scale[0]),
+                (experts + "gate_up_proj", fp8),
+                (experts + "gate_up_proj_scale", scale),
+                (experts + "down_proj", fp8),
+                (experts + "down_proj_scale", scale),
+            ],
+        )
+        self.assertEqual(received["o_proj"].dtype, torch.bfloat16)
+        self.assertTrue(bool((received["o_proj"] == 1).all()))
+        loaded = {(name, kwargs["shard_id"]) for name, _, kwargs in calls}
+        self.assertEqual(
+            loaded,
+            {
+                (experts + param, shard)
+                for param, shards in (
+                    ("w13_weight", ("w1", "w3")),
+                    ("w13_weight_scale_inv", ("w1", "w3")),
+                    ("w2_weight", ("w2",)),
+                    ("w2_weight_scale_inv", ("w2",)),
+                )
+                for shard in shards
+            },
+        )
 
     def test_nextn_maps_the_mtp_block(self):
         captured = {}
