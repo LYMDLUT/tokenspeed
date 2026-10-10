@@ -696,7 +696,10 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
 
         device = indexer_output.query.device
         seq_lens_cpu = prefix_lens_cpu + extend_lens_cpu
-        seq_lens = seq_lens_cpu.to(device=device, dtype=torch.int32)
+        # The host->device copies here are non-blocking: a blocking copy waits
+        # for every kernel already queued, including the previous step's, so
+        # the host could no longer launch this step while that one runs.
+        seq_lens = seq_lens_cpu.to(device=device, dtype=torch.int32, non_blocking=True)
         max_seq_len = int(seq_lens_cpu.max().item())
         page_size = ctx.token_to_kv_pool.arena.kv_page_size
         max_pages = (max_seq_len + page_size - 1) // page_size
@@ -737,11 +740,15 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             seq_lens=seq_lens,
             page_table=page_table,
             kv_workspace_slots=kv_workspace_slots,
-            row_starts=row_starts_cpu.to(device=device, dtype=torch.int32),
-            row_ends=row_ends_cpu.to(device=device, dtype=torch.int32),
+            row_starts=row_starts_cpu.to(
+                device=device, dtype=torch.int32, non_blocking=True
+            ),
+            row_ends=row_ends_cpu.to(
+                device=device, dtype=torch.int32, non_blocking=True
+            ),
             candidate_lens_cpu=candidate_lens_cpu,
             kv_seq_lens=candidate_lens_cpu.to(
-                device=device, dtype=torch.int32
+                device=device, dtype=torch.int32, non_blocking=True
             ).contiguous(),
             max_seq_len=max_seq_len,
             num_prefill_tokens=num_prefill_tokens,
