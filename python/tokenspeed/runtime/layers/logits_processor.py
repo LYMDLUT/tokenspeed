@@ -290,6 +290,12 @@ class LogitsProcessor(nn.Module):
 
         # Gate the fused lm_head GEMM to Kimi only. See ``_lm_head_matmul``.
         self._use_fused_lm_head = getattr(self.config, "model_type", None) == "kimi_k2"
+        # Checkpoints trained with an FP32 LM head (``head_dtype="float32"``,
+        # e.g. HY V4's ``enable_lm_head_fp32``) accumulate the head GEMM into
+        # FP32 while the weight stays in the model dtype. BF16 products are
+        # exact in FP32, so this matches an FP32 head up to summation order
+        # without materializing an FP32 copy of the weight.
+        self._fp32_lm_head = getattr(self.config, "head_dtype", None) == "float32"
 
     def configure_dp_logits_layout(self, runtime: DpSamplingRuntimeConfig) -> None:
         if (
@@ -469,6 +475,10 @@ class LogitsProcessor(nn.Module):
 
     def _init_dist_argmax_state(self, lm_head: VocabParallelEmbedding):
         if _force_deterministic_rsag():
+            return None
+        if self._fp32_lm_head:
+            # The sharded-argmax buffers are sized for the weight dtype; FP32
+            # logits take the regular gather path instead.
             return None
         if not 2 <= self.tp_size <= 32:
             return None  # the kernel's cross-rank reduce is a single warp shuffle
@@ -717,7 +727,17 @@ class LogitsProcessor(nn.Module):
         if should_apply_lm_head_quant_method(lm_head, quant_method):
             logits = quant_method.apply(lm_head, hidden_states, embedding_bias)
         elif hasattr(lm_head, "weight"):
-            if self._use_fused_lm_head:
+            if self._fp32_lm_head:
+                weight = lm_head.weight
+                activations = hidden_states.to(weight.dtype)
+                if activations.is_cuda and weight.dtype in (
+                    torch.bfloat16,
+                    torch.float16,
+                ):
+                    logits = torch.mm(activations, weight.T, out_dtype=torch.float32)
+                else:
+                    logits = activations.float() @ weight.float().T
+            elif self._use_fused_lm_head:
                 logits = _lm_head_matmul(hidden_states, lm_head.weight)
             else:
                 logits = torch.matmul(

@@ -92,6 +92,10 @@ _DSA_ARCHITECTURES = frozenset(
         "DeepseekV32ForCausalLMNextN",
         "Glm53FlashForConditionalGeneration",
         "Glm53FlashForConditionalGenerationNextN",
+        # HY V4: MLA + DSA with the same indexer geometry, plus a gated output
+        # projection and a per-head learnable sink the DSA backend forwards.
+        "HYV4ForCausalLM",
+        "HYV4ForCausalLMNextN",
     }
 )
 _MSA_ARCHITECTURES = frozenset(

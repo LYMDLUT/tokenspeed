@@ -1,0 +1,356 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""HY V4 config, weight-loading and iHC numerics tests (cheap, no GPU)."""
+
+from __future__ import annotations
+
+import os
+import sys
+import unittest
+from types import SimpleNamespace
+from unittest import mock
+
+# CI Registration (parsed via AST, runtime no-op)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=20, suite="runtime-1gpu")
+
+import torch
+from tokenspeed_kernel.ops.residual.torch import (
+    torch_ihc_head,
+    torch_ihc_post,
+    torch_ihc_pre,
+)
+
+from tokenspeed.runtime.configs.hy_v4_config import HYV4Config
+from tokenspeed.runtime.configs.model_config import (
+    _DSA_ARCHITECTURES,
+    AttentionArch,
+    configure_glm_attention,
+)
+from tokenspeed.runtime.models import hy_v4_nextn
+from tokenspeed.runtime.models.hy_v4 import (
+    load_hyv4_weights,
+    normalize_hyv4_checkpoint_name,
+)
+from tokenspeed.runtime.models.hy_v4_nextn import HYV4ForCausalLMNextN
+
+# Per-layer vectors of the released ``tencent/Hy4-preview`` checkpoint.
+_RELEASED_FULL_INDEXERS = [0, 1] + list(range(5, 78, 4))
+
+
+def _reference_ihc_pre(x, fn, scale, base, hc, magnitude, hc_eps, rms_eps):
+    """Line-by-line copy of the reference ``HYV4HCPreLayer.forward``."""
+    shape = x.size()
+    flat = x.flatten(1).float()
+    rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + rms_eps)
+    mixes = torch.nn.functional.linear(flat, fn) * rsqrt
+    pre = torch.sigmoid(mixes[..., :hc] * scale[0] + base[:hc]) + hc_eps
+    post = (
+        magnitude * torch.sigmoid(mixes[..., hc : 2 * hc] * scale[1] + base[hc:])
+        + hc_eps
+    )
+    return torch.sum(pre.unsqueeze(-1) * x.reshape(shape), dim=1).to(x.dtype), post
+
+
+def _reference_ihc_head(x, fn, scale, base, hc_eps, rms_eps):
+    """Line-by-line copy of the reference ``HYV4HCHeadLayer.forward``."""
+    shape, dtype = x.size(), x.dtype
+    flat = x.flatten(1).float()
+    rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + rms_eps)
+    mixes = torch.nn.functional.linear(flat, fn) * rsqrt
+    pre = torch.sigmoid(mixes * scale + base) + hc_eps
+    return torch.sum(pre.unsqueeze(-1) * flat.reshape(shape), dim=1).to(dtype)
+
+
+class HYV4ConfigTests(unittest.TestCase):
+    def test_defaults_reproduce_released_layer_vectors(self):
+        config = HYV4Config()
+        self.assertEqual(config.num_hidden_layers, 78)
+        self.assertEqual(config.mlp_layer_types[0], "dense")
+        self.assertTrue(all(t == "sparse" for t in config.mlp_layer_types[1:]))
+        self.assertEqual(config.first_k_dense_replace, 1)
+        full = [i for i, t in enumerate(config.indexer_types) if t == "full"]
+        self.assertEqual(full, _RELEASED_FULL_INDEXERS)
+
+    def test_derived_attention_geometry(self):
+        config = HYV4Config()
+        self.assertEqual(config.qk_head_dim, 256)
+        # RoPE covers only the rope slice.
+        self.assertEqual(config.head_dim, 64)
+        self.assertEqual(config.rope_theta, 10000000.0)
+        self.assertIsNone(config.rope_scaling)
+        self.assertEqual(config.head_dtype, "float32")
+        self.assertEqual(config.topk_method, "noaux_tc")
+        self.assertTrue(config.indexer_rope_interleave)
+
+    def test_sparse_layer_aliases_fold_to_dsa(self):
+        config = HYV4Config(
+            num_hidden_layers=2,
+            layer_types=["sparse", "sparse_attention"],
+            mlp_layer_types=["dense", "sparse"],
+            indexer_types=["full", "shared"],
+        )
+        self.assertEqual(config.layer_types, ["deepseek_sparse_attention"] * 2)
+
+    def test_rejects_mismatched_layer_vectors(self):
+        with self.assertRaises(ValueError):
+            HYV4Config(num_hidden_layers=4, indexer_types=["full"])
+        with self.assertRaises(ValueError):
+            HYV4Config(num_hidden_layers=4, mlp_layer_types=["dense"])
+
+    def test_rejects_dense_attention_layers(self):
+        with self.assertRaisesRegex(ValueError, "full_attention"):
+            HYV4Config(
+                num_hidden_layers=2,
+                layer_types=["sparse", "full_attention"],
+                mlp_layer_types=["dense", "sparse"],
+                indexer_types=["full", "shared"],
+            )
+
+    def test_rejects_yarn(self):
+        with self.assertRaises(ValueError):
+            HYV4Config(rope_parameters={"rope_theta": 1e7, "rope_type": "yarn"})
+
+    def test_runtime_attention_config_is_dsa(self):
+        config = HYV4Config()
+        model_config = SimpleNamespace(hf_text_config=config, hf_config=config)
+        configure_glm_attention(model_config)
+        self.assertEqual(model_config.attention_arch, AttentionArch.DSA)
+        self.assertEqual(model_config.head_dim, 256)
+        self.assertEqual(model_config.kv_lora_rank, 512)
+        self.assertEqual(model_config.index_topk, 2048)
+        self.assertAlmostEqual(model_config.scaling, 256**-0.5)
+
+    def test_architectures_registered_as_dsa(self):
+        self.assertIn("HYV4ForCausalLM", _DSA_ARCHITECTURES)
+        self.assertIn("HYV4ForCausalLMNextN", _DSA_ARCHITECTURES)
+
+
+class HYV4CheckpointNameTests(unittest.TestCase):
+    def test_ihc_boundary_names_flatten(self):
+        self.assertEqual(
+            normalize_hyv4_checkpoint_name("model.layers.3.hc_attn_layer.hc_pre.hc_fn"),
+            "model.layers.3.hc_attn_layer.hc_fn",
+        )
+        self.assertEqual(
+            normalize_hyv4_checkpoint_name(
+                "model.layers.3.hc_mlp_layer.hc_pre.hc_scale"
+            ),
+            "model.layers.3.hc_mlp_layer.hc_scale",
+        )
+
+    def test_head_names_drop_prefix(self):
+        for suffix in ("fn", "scale", "base"):
+            self.assertEqual(
+                normalize_hyv4_checkpoint_name(f"model.hc_head.hc_head_{suffix}"),
+                f"model.hc_head.hc_{suffix}",
+            )
+
+    def test_other_names_untouched(self):
+        name = "model.layers.1.self_attn.learnable_sink_param"
+        self.assertEqual(normalize_hyv4_checkpoint_name(name), name)
+
+
+class HYV4IHCNumericsTests(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(0)
+        self.hc, self.hidden = 4, 96
+        self.x = (torch.randn(7, self.hc, self.hidden) * 3).bfloat16()
+
+    def test_pre_matches_reference(self):
+        fn = torch.randn(2 * self.hc, self.hc * self.hidden) * 0.02
+        scale = torch.tensor([0.7, 1.3])
+        base = torch.randn(2 * self.hc)
+        expected, expected_post = _reference_ihc_pre(
+            self.x, fn, scale, base, self.hc, 2.0, 1e-6, 1e-5
+        )
+        actual, actual_post = torch_ihc_pre(
+            self.x, fn, scale, base, 2.0, 1e-5, 1e-6, None, None
+        )
+        self.assertTrue(torch.equal(actual, expected))
+        self.assertTrue(torch.equal(actual_post, expected_post))
+
+    def test_fused_norm_equals_separate_norm(self):
+        fn = torch.randn(2 * self.hc, self.hc * self.hidden) * 0.02
+        scale = torch.tensor([0.7, 1.3])
+        base = torch.randn(2 * self.hc)
+        weight = torch.randn(self.hidden).bfloat16()
+        reduced, _ = torch_ihc_pre(self.x, fn, scale, base, 2.0, 1e-5, 1e-6, None, None)
+        fused, _ = torch_ihc_pre(self.x, fn, scale, base, 2.0, 1e-5, 1e-6, weight, 1e-5)
+        separate = torch.nn.functional.rms_norm(reduced, (self.hidden,), weight, 1e-5)
+        self.assertTrue(torch.equal(fused, separate))
+
+    def test_post_scatters_with_gates(self):
+        block = torch.randn(7, self.hidden).bfloat16()
+        gates = torch.rand(7, self.hc) * 2
+        expected = (
+            gates.unsqueeze(-1) * block.float().unsqueeze(-2) + self.x.float()
+        ).to(torch.bfloat16)
+        self.assertTrue(torch.equal(torch_ihc_post(block, self.x, gates), expected))
+
+    def test_head_matches_reference(self):
+        fn = torch.randn(self.hc, self.hc * self.hidden) * 0.02
+        scale = torch.tensor([0.9])
+        base = torch.randn(self.hc)
+        expected = _reference_ihc_head(self.x, fn, scale, base, 1e-6, 1e-5)
+        actual = torch_ihc_head(self.x, fn, scale, base, 1e-5, 1e-6)
+        self.assertTrue(torch.equal(actual, expected))
+
+    def test_rejects_wrong_projection_shape(self):
+        fn = torch.randn(self.hc, self.hc * self.hidden)  # head shape, not pre
+        with self.assertRaises(ValueError):
+            torch_ihc_pre(
+                self.x,
+                fn,
+                torch.ones(2),
+                torch.zeros(self.hc),
+                2.0,
+                1e-5,
+                1e-6,
+                None,
+                None,
+            )
+
+
+def _owner_with_params(names: list[str]) -> tuple[torch.nn.Module, list]:
+    """Build a module tree holding ``names`` whose loaders record each call."""
+    owner = torch.nn.Module()
+    owner.config = SimpleNamespace(n_routed_experts=2, q_lora_rank=4)
+    owner.mapping = SimpleNamespace(moe=SimpleNamespace(ep_rank=0, ep_size=1))
+    owner.quant_config = None
+    calls = []
+    for name in names:
+        module = owner
+        *parents, leaf = name.split(".")
+        for part in parents:
+            if not hasattr(module, part):
+                module.add_module(part, torch.nn.Module())
+            module = getattr(module, part)
+        param = torch.nn.Parameter(torch.empty(1), requires_grad=False)
+        param.weight_loader = (
+            lambda _param, _weight, *args, _name=name, **kwargs: calls.append(
+                (_name, args, kwargs)
+            )
+        )
+        module.register_parameter(leaf, param)
+    return owner, calls
+
+
+class HYV4WeightLoaderTests(unittest.TestCase):
+    _PARAMS = [
+        "model.layers.0.self_attn.fused_qkv_a_proj_with_mqa.weight",
+        "model.layers.0.self_attn.indexer.wk_weights_proj.weight",
+        "model.layers.0.mlp.gate_up_proj.weight",
+        "model.layers.0.hc_attn_layer.hc_fn",
+    ]
+    _CHECKPOINT = [
+        "model.layers.0.self_attn.q_a_proj.weight",
+        "model.layers.0.self_attn.kv_a_proj_with_mqa.weight",
+        "model.layers.0.self_attn.indexer.wk.weight",
+        "model.layers.0.self_attn.indexer.weights_proj.weight",
+        "model.layers.0.mlp.gate_proj.weight",
+        "model.layers.0.mlp.up_proj.weight",
+        "model.layers.0.hc_attn_layer.hc_pre.hc_fn",
+        "model.layers.0.self_attn.rotary_emb.inv_freq",
+    ]
+
+    def _load(self, owner, names, **kwargs):
+        load_hyv4_weights(
+            owner,
+            ((name, torch.empty(1)) for name in names),
+            module_prefix="model",
+            checkpoint_prefix="model",
+            **kwargs,
+        )
+
+    def test_routes_checkpoint_names_onto_fused_params(self):
+        owner, calls = _owner_with_params(self._PARAMS)
+        self._load(owner, self._CHECKPOINT)
+        qkv_a, indexer, gate_up = self._PARAMS[:3]
+        self.assertEqual(
+            calls,
+            [
+                (qkv_a, (), {"begin_size": 0}),
+                (qkv_a, (), {"begin_size": 4}),
+                (indexer, (0,), {}),
+                (indexer, (1,), {}),
+                (gate_up, (0,), {}),
+                (gate_up, (1,), {}),
+                ("model.layers.0.hc_attn_layer.hc_fn", (), {}),
+            ],
+        )
+
+    def test_unloaded_parameter_raises(self):
+        owner, _ = _owner_with_params(self._PARAMS)
+        with self.assertRaisesRegex(RuntimeError, "hc_attn_layer.hc_fn"):
+            self._load(owner, self._CHECKPOINT[:-2])
+
+    def test_shared_parameters_may_stay_unloaded(self):
+        owner, _ = _owner_with_params(self._PARAMS + ["lm_head.weight"])
+        self._load(owner, self._CHECKPOINT, shared_params=("lm_head.",))
+        with self.assertRaisesRegex(RuntimeError, "lm_head.weight"):
+            self._load(owner, self._CHECKPOINT)
+
+    def test_unmatched_checkpoint_tensor_warns(self):
+        owner, _ = _owner_with_params(self._PARAMS)
+        with self.assertLogs("tokenspeed.runtime.models.hy_v4", "WARNING") as logs:
+            self._load(owner, self._CHECKPOINT + ["model.layers.0.extra.weight"])
+        self.assertIn("model.layers.0.extra.weight", logs.output[0])
+
+    def test_nextn_maps_the_mtp_block(self):
+        captured = {}
+
+        def fake_load(owner, weights, **kwargs):
+            captured["names"] = [name for name, _ in weights]
+            captured["kwargs"] = kwargs
+
+        draft = SimpleNamespace(post_load_weights=lambda: None)
+        checkpoint = [
+            "model.layers.3.mlp.down_proj.weight",
+            "model.mtp_layers.0.enorm.weight",
+            "model.mtp_layers.0.eh_proj.weight",
+            "model.mtp_layers.0.final_layernorm.weight",
+            "model.mtp_layers.0.self_attn.q_a_proj.weight",
+            "model.mtp_layers.0.hc_attn_layer.hc_pre.hc_fn",
+        ]
+        with mock.patch.object(hy_v4_nextn, "load_hyv4_weights", fake_load):
+            HYV4ForCausalLMNextN.load_weights(
+                draft, ((name, torch.empty(1)) for name in checkpoint)
+            )
+        self.assertEqual(
+            captured["names"],
+            [
+                "model.enorm.weight",
+                "model.eh_proj.weight",
+                "model.final_layernorm.weight",
+                "model.decoder.self_attn.q_a_proj.weight",
+                "model.decoder.hc_attn_layer.hc_pre.hc_fn",
+            ],
+        )
+        self.assertEqual(
+            captured["kwargs"]["shared_params"], ("model.embed_tokens.", "lm_head.")
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
