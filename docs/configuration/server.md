@@ -45,6 +45,12 @@ For a compact compatibility table, see
 | `--stream-output` | Return generated text as disjoint streaming segments. |
 | `--weight-version` | Initial model-weight version stamped into generation metadata. Defaults to `default`. |
 
+The smg gateway health-probes the engine with a one-token generate. `ts serve`
+sets the gateway's `--health-check-timeout-secs` to
+`TOKENSPEED_HEALTH_CHECK_TIMEOUT` (20 s by default) plus 5 s, so a scheduler
+busy with a long prefill backlog is not marked unhealthy while the engine's own
+probe is still waiting. Pass `--health-check-timeout-secs` to override it.
+
 ### Weight Version Metadata
 
 Every generation response includes the current version in
