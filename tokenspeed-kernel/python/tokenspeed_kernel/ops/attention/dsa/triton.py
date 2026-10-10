@@ -37,7 +37,9 @@ def _dsa_packed_kv_kernel(
     topk_lens,
     out,
     lse,
+    sink,
     RETURN_LSE: tl.constexpr,
+    HAS_SINK: tl.constexpr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     kv_lora_rank: tl.constexpr,
@@ -111,6 +113,12 @@ def _dsa_packed_kv_kernel(
         score = tl.where(valid, score, -float("inf"))
         max_score = tl.maximum(max_score, tl.max(score, axis=0))
 
+    if HAS_SINK:
+        # The learnable sink is one extra candidate with no value vector: it
+        # only shifts the softmax denominator, so it joins the max fold instead
+        # of producing an output term.
+        max_score = tl.maximum(max_score, tl.load(sink + head).to(tl.float32))
+
     denom = tl.full((), 0.0, tl.float32)
     acc = tl.zeros((BLOCK_V,), tl.float32)
     v_mask = v_offsets < kv_lora_rank
@@ -174,15 +182,22 @@ def _dsa_packed_kv_kernel(
         ).to(tl.float32)
         acc += tl.sum(probs[:, None] * v_vals * v_scale, axis=0)
 
+    # A row with no selected key stays empty (zero output, -inf LSE) even
+    # with a sink, matching the other DSA backends.
+    has_keys = denom > 0.0
+    if HAS_SINK:
+        sink_value = tl.load(sink + head).to(tl.float32)
+        denom += tl.exp(sink_value - max_score)
+
     result = acc / denom
-    result = tl.where(denom > 0.0, result, 0.0)
+    result = tl.where(has_keys, result, 0.0)
     out_base = (token * num_heads + head) * kv_lora_rank
     tl.store(out + out_base + v_offsets, result, mask=v_mask)
     if RETURN_LSE:
         if v_block == 0:
             tl.store(
                 lse + token * num_heads + head,
-                tl.where(denom > 0.0, max_score + tl.log(denom), -float("inf")),
+                tl.where(has_keys, max_score + tl.log(denom), -float("inf")),
             )
 
 
@@ -194,7 +209,9 @@ def _dsa_dense_kv_kernel(
     topk_lens,
     out,
     lse,
+    sink,
     RETURN_LSE: tl.constexpr,
+    HAS_SINK: tl.constexpr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     kv_lora_rank: tl.constexpr,
@@ -259,6 +276,12 @@ def _dsa_dense_kv_kernel(
         score = tl.where(valid, score, -float("inf"))
         max_score = tl.maximum(max_score, tl.max(score, axis=0))
 
+    if HAS_SINK:
+        # The learnable sink is one extra candidate with no value vector: it
+        # only shifts the softmax denominator, so it joins the max fold instead
+        # of producing an output term.
+        max_score = tl.maximum(max_score, tl.load(sink + head).to(tl.float32))
+
     denom = tl.full((), 0.0, tl.float32)
     acc = tl.zeros((BLOCK_V,), tl.float32)
     v_mask = v_offsets < kv_lora_rank
@@ -302,15 +325,22 @@ def _dsa_dense_kv_kernel(
         ).to(tl.float32)
         acc += tl.sum(probs[:, None] * v_vals, axis=0)
 
+    # A row with no selected key stays empty (zero output, -inf LSE) even
+    # with a sink, matching the other DSA backends.
+    has_keys = denom > 0.0
+    if HAS_SINK:
+        sink_value = tl.load(sink + head).to(tl.float32)
+        denom += tl.exp(sink_value - max_score)
+
     result = acc / denom
-    result = tl.where(denom > 0.0, result, 0.0)
+    result = tl.where(has_keys, result, 0.0)
     out_base = (token * num_heads + head) * kv_lora_rank
     tl.store(out + out_base + v_offsets, result, mask=v_mask)
     if RETURN_LSE:
         if v_block == 0:
             tl.store(
                 lse + token * num_heads + head,
-                tl.where(denom > 0.0, max_score + tl.log(denom), -float("inf")),
+                tl.where(has_keys, max_score + tl.log(denom), -float("inf")),
             )
 
 
@@ -324,6 +354,7 @@ def _run_packed_kv(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     return_lse: bool,
+    sink: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     row_bytes = int(packed_kv.shape[1])
     out = torch.empty(
@@ -346,7 +377,11 @@ def _run_packed_kv(
         topk_lens,
         out,
         lse,
+        # ``HAS_SINK`` is False whenever the caller has no sink, but Triton still
+        # needs a pointer of the right type, so pass a one-element stand-in.
+        sink if sink is not None else q,
         return_lse,
+        sink is not None,
         q.shape[1],
         q.shape[2],
         kv_lora_rank,
@@ -373,6 +408,7 @@ def _run_dense_kv(
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     return_lse: bool,
+    sink: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     kv_dim = int(kv_lora_rank) + int(qk_rope_head_dim)
     out = torch.empty(
@@ -393,7 +429,9 @@ def _run_dense_kv(
         topk_lens,
         out,
         lse,
+        sink if sink is not None else q,
         return_lse,
+        sink is not None,
         q.shape[1],
         q.shape[2],
         kv_lora_rank,
@@ -443,6 +481,7 @@ def _run_dsa(
     qk_rope_head_dim: int,
     softmax_scale: float,
     k_scale: float,
+    sink: torch.Tensor | None,
     out: torch.Tensor | None,
     return_lse: bool,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -467,6 +506,7 @@ def _run_dsa(
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
             return_lse=return_lse,
+            sink=sink,
         )
     else:
         result, lse = _run_dense_kv(
@@ -478,6 +518,7 @@ def _run_dsa(
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
             return_lse=return_lse,
+            sink=sink,
         )
 
     if out is not None:
@@ -510,6 +551,7 @@ def _run_dsa(
         "topk_layout": frozenset({"global_slots"}),
         "logit_cap": frozenset({False}),
         "return_lse": frozenset({False, True}),
+        "sinks": frozenset({False, True}),
     },
     priority=Priority.PORTABLE,
 )
@@ -532,8 +574,9 @@ def triton_dsa_decode(
     return_lse: bool = False,
     out: torch.Tensor | None = None,
     enable_pdl: bool = False,
+    attn_sink: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    del kv_seq_lens
+    del kv_seq_lens, enable_pdl
     return _run_dsa(
         q=q,
         kv_cache=kv_cache,
@@ -544,6 +587,7 @@ def triton_dsa_decode(
         qk_rope_head_dim=qk_rope_head_dim,
         softmax_scale=softmax_scale,
         k_scale=k_scale,
+        sink=attn_sink,
         out=out,
         return_lse=return_lse,
     )
@@ -573,6 +617,7 @@ def triton_dsa_decode(
         "topk_layout": frozenset({"global_slots"}),
         "logit_cap": frozenset({False}),
         "return_lse": frozenset({False, True}),
+        "sinks": frozenset({False, True}),
     },
     priority=Priority.PORTABLE,
 )
@@ -595,8 +640,9 @@ def triton_dsa_prefill(
     return_lse: bool = False,
     out: torch.Tensor | None = None,
     enable_pdl: bool = False,
+    attn_sink: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    del kv_seq_lens
+    del kv_seq_lens, enable_pdl
     return _run_dsa(
         q=q,
         kv_cache=kv_cache,
@@ -607,6 +653,7 @@ def triton_dsa_prefill(
         qk_rope_head_dim=qk_rope_head_dim,
         softmax_scale=softmax_scale,
         k_scale=k_scale,
+        sink=attn_sink,
         out=out,
         return_lse=return_lse,
     )

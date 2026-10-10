@@ -83,6 +83,11 @@ class PagedAttention(nn.Module):
         self._group_id: str | None = None
         self.k_scale = None
         self.v_scale = None
+        # Per-head learnable attention-sink logits for architectures that carry
+        # one (HY V4). The attention backend reads this off the layer, so it is
+        # declared here rather than probed with ``getattr``. None means the
+        # architecture has no sink and the kernel must not apply one.
+        self.attn_sink: torch.Tensor | None = None
 
     @property
     def group_id(self) -> str:
