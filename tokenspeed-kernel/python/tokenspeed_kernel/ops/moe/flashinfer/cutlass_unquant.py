@@ -41,6 +41,31 @@ if platform.is_nvidia:
         first_half = w.w13_weight.data[:, :half_w, :].clone()
         w.w13_weight.data[:, :half_w, :] = w.w13_weight.data[:, half_w:, :]
         w.w13_weight.data[:, half_w:, :] = first_half
+        # Same contract as the FP8 cutlass path: a clamp limit (HY V4's
+        # ``swiglu_limit``), a non-unit alpha or a non-zero beta must reach the
+        # SwigluBias epilogue instead of being silently dropped.
+        w.swiglu_alpha_t = w.swiglu_beta_t = w.swiglu_limit_t = None
+        swiglu_arg = getattr(w, "swiglu_arg", None)
+        if swiglu_arg is not None:
+            num_experts = w.w13_weight.shape[0]
+            device = w.w13_weight.device
+
+            def _per_expert(value: float) -> torch.nn.Parameter:
+                return torch.nn.Parameter(
+                    torch.full(
+                        (num_experts,), float(value), dtype=torch.float32, device=device
+                    ),
+                    requires_grad=False,
+                )
+
+            alpha = swiglu_arg.alpha
+            if alpha is not None and float(alpha) != 1.0:
+                w.swiglu_alpha_t = _per_expert(alpha)
+            beta = getattr(w, "swiglu_beta", None)
+            if beta is not None and float(beta) != 0.0:
+                w.swiglu_beta_t = _per_expert(beta)
+            if swiglu_arg.limit is not None:
+                w.swiglu_limit_t = _per_expert(swiglu_arg.limit)
         return None
 
     @register_kernel(
@@ -63,6 +88,7 @@ if platform.is_nvidia:
             "activation": frozenset({"silu", "swiglu"}),
             "routing_mode": frozenset({"precomputed_topk"}),
             "supports_deferred_finalize": frozenset({False}),
+            "deterministic_finalize": frozenset({False, True}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),
             "ispp_alignment": frozenset({1}),
@@ -89,7 +115,16 @@ if platform.is_nvidia:
                 scores, k=getattr(w, "top_k"), dim=-1, sorted=False
             )
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-            topk_weights = topk_weights.to(x.dtype)
+        # flashinfer>=0.7 requires fp32 final scales.
+        topk_weights = topk_weights.to(torch.float32)
+        swiglu_alpha = getattr(w, "swiglu_alpha_t", None)
+        swiglu_beta = getattr(w, "swiglu_beta_t", None)
+        swiglu_limit = getattr(w, "swiglu_limit_t", None)
+        if swiglu_alpha is None and swiglu_beta is None and swiglu_limit is None:
+            activation_type = ActivationType.Swiglu
+        else:
+            activation_type = ActivationType.SwigluBias
+
         return cutlass_fused_moe(
             input=x,
             token_selected_experts=topk_ids.to(torch.int),
@@ -98,11 +133,16 @@ if platform.is_nvidia:
             fc2_expert_weights=w.w2_weight,
             output_dtype=x.dtype,
             quant_scales=None,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
             ep_size=getattr(w, "ep_size", 1),
             ep_rank=getattr(w, "ep_rank", 0),
             tp_size=getattr(w, "tp_size", 1),
             tp_rank=getattr(w, "tp_rank", 0),
             tune_max_num_tokens=get_autotune_max_num_tokens(),
-            activation_type=ActivationType.Swiglu,
+            activation_type=activation_type,
             enable_pdl=enable_pdl,
+            # The fused GEMM2 epilogue reduces the top-k outputs with atomics.
+            use_fused_finalize=not plan["deterministic_finalize"],
         )[0]

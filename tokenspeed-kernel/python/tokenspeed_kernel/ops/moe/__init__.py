@@ -378,6 +378,7 @@ def _build_traits(
     weight_dtype: str,
     activation: str | None,
     requires_deferred_finalize: bool,
+    requires_deterministic_finalize: bool,
     routing_mode: str | None,
     a2a_backend: str | None,
     ep_size: int | None,
@@ -398,6 +399,8 @@ def _build_traits(
         traits["activation"] = activation
     if requires_deferred_finalize:
         traits["supports_deferred_finalize"] = True
+    if requires_deterministic_finalize:
+        traits["deterministic_finalize"] = True
     if routing_mode is not None:
         traits["routing_mode"] = routing_mode
 
@@ -439,6 +442,7 @@ def moe_plan(
     ep_size: int | None = None,
     ispp: int | None = None,
     *,
+    requires_deterministic_finalize: bool,
     hidden: int | None,
     swiglu_form: str | None,
     activation_clamped: bool,
@@ -461,6 +465,13 @@ def moe_plan(
         input_dtype: Hidden-state dtype used for the apply-kernel signature.
         activation: Optional activation name required by the layer.
         requires_deferred_finalize: Require a kernel that can defer finalize.
+        requires_deterministic_finalize: Require a kernel whose top-k
+            reduction ("finalize") sums each token's expert outputs in a fixed
+            order, so the output is bitwise reproducible run to run. Kernels
+            that reduce through atomics declare
+            ``deterministic_finalize={False}``; a selected kernel that does not
+            declare support is rejected. False leaves the reduction order to
+            the kernel.
         routing_mode: Optional routing-mode requirement. "precomputed_topk"
             requires a kernel that consumes externally computed top-k ids and
             weights (for models whose routing function the fused kernels
@@ -532,6 +543,7 @@ def moe_plan(
         weight_dtype=weight_dtype,
         activation=activation,
         requires_deferred_finalize=requires_deferred_finalize,
+        requires_deterministic_finalize=requires_deterministic_finalize,
         routing_mode=routing_mode,
         a2a_backend=a2a_backend,
         ep_size=ep_size,
@@ -569,6 +581,12 @@ def moe_plan(
         raise ValueError(
             f"MoE kernel {apply_spec.name!r} does not support persistent workspace"
         )
+    if requires_deterministic_finalize and True not in (
+        apply_spec.traits.get("deterministic_finalize", frozenset())
+    ):
+        raise ValueError(
+            f"MoE kernel {apply_spec.name!r} does not support deterministic finalize"
+        )
 
     routing_modes = apply_spec.traits.get("routing_mode", frozenset())
     support_routing = "kernel_routing" in routing_modes
@@ -593,6 +611,7 @@ def moe_plan(
         "support_routing": support_routing,
         "supports_precomputed_topk": supports_precomputed_topk,
         "supports_deferred_finalize": supports_deferred_finalize,
+        "deterministic_finalize": requires_deterministic_finalize,
         "solution": apply_spec.solution,
         "internal_activation_dtype": internal_activation_dtype,
     }

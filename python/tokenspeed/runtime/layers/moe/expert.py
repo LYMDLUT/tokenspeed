@@ -81,6 +81,8 @@ class MoELayer(torch.nn.Module):
         routing_mode: str | None = None,
         internal_activation_dtype_override: str | None = None,
         persistent_max_num_tokens_per_gpu: int | None = None,
+        *,
+        deterministic_finalize: bool,
     ):
         super().__init__()
         self.layer_index = layer_index
@@ -312,6 +314,7 @@ class MoELayer(torch.nn.Module):
                 deepep_low_latency_max_num_tokens_per_gpu
             ),
             persistent_max_num_tokens_per_gpu=persistent_max_num_tokens_per_gpu,
+            requires_deterministic_finalize=deterministic_finalize,
             solution=moe_backend,
             fast_math=True,
         )

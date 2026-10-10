@@ -50,6 +50,7 @@ def test_triton_bf16_moe_matches_torch(activation: str) -> None:
         activation_clamped=False,
         expert_id_repeats=False,
         fast_math=True,
+        requires_deterministic_finalize=False,
     )
     actual = tokenspeed_kernel.moe_apply(
         plan,

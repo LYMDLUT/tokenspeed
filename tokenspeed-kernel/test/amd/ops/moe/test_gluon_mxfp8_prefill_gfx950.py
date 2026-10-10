@@ -120,6 +120,7 @@ def _plan(policy: str):
         activation_clamped=False,
         expert_id_repeats=False,
         fast_math=True,
+        requires_deterministic_finalize=False,
     )
 
 

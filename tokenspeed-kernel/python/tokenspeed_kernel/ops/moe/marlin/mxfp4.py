@@ -187,6 +187,7 @@ def marlin_mxfp4_moe_weights(plan: dict, w: torch.nn.Module) -> None:
         "swiglu_form": frozenset({"standard"}),
         "routing_mode": frozenset({"precomputed_topk"}),
         "supports_deferred_finalize": frozenset({False}),
+        "deterministic_finalize": frozenset({False}),
         "supports_ep": frozenset({True}),
         "supports_all_to_all_ep": frozenset({False}),
         "ispp_alignment": frozenset({MXFP4_BLOCK}),

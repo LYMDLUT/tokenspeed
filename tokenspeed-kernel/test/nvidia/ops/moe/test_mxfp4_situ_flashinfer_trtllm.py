@@ -244,6 +244,7 @@ def test_moe_plan_selects_mxfp4_situ_hybrid_routing() -> None:
         activation_clamped=False,
         expert_id_repeats=False,
         fast_math=True,
+        requires_deterministic_finalize=False,
     )
     assert plan["apply_kernel_name"] == "flashinfer_trtllm_mxfp4_situ_moe_apply"
     assert plan["support_routing"] is True
