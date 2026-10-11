@@ -821,6 +821,61 @@ def mhc_fused_hc(
 # post boundary scatters the sub-block output across every channel, and the head
 # merges the channels. All three boundaries take FP32 parameters and evaluate
 # their gates in FP32, so they are dispatched by role rather than by dtype.
+# Every boundary checks its operands' shapes and devices before dispatch and
+# raises ValueError. The checks read tensor metadata only, so they never
+# synchronize the device and are safe under CUDA graph capture.
+
+
+def _check_ihc_residual(residual: _torch.Tensor) -> None:
+    if residual.ndim < 2 or residual.shape[-2] <= 1 or residual.shape[-1] < 1:
+        raise ValueError(
+            "iHC residual must be [..., hc_mult, hidden_size] with hc_mult > 1 "
+            f"and hidden_size > 0, got {tuple(residual.shape)}"
+        )
+
+
+def _check_ihc_operand(
+    residual: _torch.Tensor,
+    value: _torch.Tensor,
+    name: str,
+    shape: tuple[int, ...],
+) -> None:
+    if tuple(value.shape) != shape:
+        raise ValueError(
+            f"iHC {name} must have shape {shape}, got {tuple(value.shape)}"
+        )
+    if value.device != residual.device:
+        raise ValueError(
+            f"iHC {name} device must match the residual ({residual.device}), "
+            f"got {value.device}"
+        )
+
+
+def _check_ihc_parameter(
+    residual: _torch.Tensor,
+    value: _torch.Tensor,
+    name: str,
+    shape: tuple[int, ...],
+) -> None:
+    _check_ihc_operand(residual, value, name, shape)
+    # The Triton kernels index parameters as flat vectors.
+    if not value.is_contiguous():
+        raise ValueError(f"iHC {name} must be contiguous, got strides {value.stride()}")
+
+
+def _check_ihc_projection(
+    residual: _torch.Tensor,
+    fn: _torch.Tensor,
+    hc_scale: _torch.Tensor,
+    hc_base: _torch.Tensor,
+    *,
+    gate_count: int,
+    scale_count: int,
+) -> None:
+    total_k = residual.shape[-2] * residual.shape[-1]
+    _check_ihc_parameter(residual, fn, "fn", (gate_count, total_k))
+    _check_ihc_parameter(residual, hc_scale, "hc_scale", (scale_count,))
+    _check_ihc_parameter(residual, hc_base, "hc_base", (gate_count,))
 
 
 def _ihc_traits(residual: _torch.Tensor) -> dict[str, int]:
@@ -850,17 +905,21 @@ def ihc_pre(
 ) -> tuple[_torch.Tensor, _torch.Tensor]:
     """Reduce the iHC channels for one sub-block and emit its post gates.
 
+    All tensors must be on the residual's device.
+
     Args:
         residual: BF16 or FP32 residual channels shaped
-            ``[..., hc_mult, hidden_size]``.
-        fn: FP32 pre/post mixing projection shaped
+            ``[..., hc_mult, hidden_size]`` with ``hc_mult > 1``.
+        fn: Contiguous FP32 pre/post mixing projection shaped
             ``[2 * hc_mult, hc_mult * hidden_size]``.
-        hc_scale: FP32 pre-mix and post-mix scales shaped ``[2]``.
-        hc_base: FP32 pre/post mixing biases shaped ``[2 * hc_mult]``.
+        hc_scale: Contiguous FP32 pre-mix and post-mix scales shaped ``[2]``.
+        hc_base: Contiguous FP32 pre/post mixing biases shaped
+            ``[2 * hc_mult]``.
         magnitude: Scale applied to the post-gate sigmoid branch.
         rms_eps: Epsilon of the RMS factor applied to the projection output.
         hc_eps: Epsilon added to both sigmoid gates.
-        norm_weight: Optional RMSNorm weight fused into the reduce pass.
+        norm_weight: Optional contiguous RMSNorm weight shaped
+            ``[hidden_size]``, fused into the reduce pass.
         norm_eps: RMSNorm epsilon; required with ``norm_weight``.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
@@ -871,9 +930,20 @@ def ihc_pre(
     """
     if (norm_weight is None) != (norm_eps is None):
         raise ValueError("norm_weight and norm_eps must be provided together")
+    _check_ihc_residual(residual)
+    _check_ihc_projection(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        gate_count=2 * residual.shape[-2],
+        scale_count=2,
+    )
+    if norm_weight is not None:
+        _check_ihc_parameter(
+            residual, norm_weight, "norm_weight", (residual.shape[-1],)
+        )
     traits = _ihc_traits(residual)
-    if residual.shape[-2] <= 1:
-        raise ValueError("iHC requires more than one residual channel")
     signature = format_signature(
         residual=dense_tensor_format(residual.dtype),
         fn=dense_tensor_format(fn.dtype),
@@ -916,10 +986,13 @@ def ihc_post(
 ) -> _torch.Tensor:
     """Gate one sub-block output and scatter it across the residual channels.
 
+    All tensors must be on the residual's device.
+
     Args:
-        block_output: BF16 sub-block output shaped ``[..., hidden_size]``.
+        block_output: BF16 sub-block output shaped ``[..., hidden_size]``,
+            with the leading dimensions of ``residual``.
         residual: BF16 or FP32 residual channels shaped
-            ``[..., hc_mult, hidden_size]``.
+            ``[..., hc_mult, hidden_size]`` with ``hc_mult > 1``.
         gates: FP32 post gates shaped ``[..., hc_mult]`` from :func:`ihc_pre`.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
@@ -927,6 +1000,14 @@ def ihc_post(
     Returns:
         Updated residual channels with the shape and dtype of ``residual``.
     """
+    _check_ihc_residual(residual)
+    _check_ihc_operand(
+        residual,
+        block_output,
+        "block_output",
+        (*residual.shape[:-2], residual.shape[-1]),
+    )
+    _check_ihc_operand(residual, gates, "gates", tuple(residual.shape[:-1]))
     traits = _ihc_traits(residual)
     signature = format_signature(
         block_output=dense_tensor_format(block_output.dtype),
@@ -962,12 +1043,15 @@ def ihc_head(
 ) -> _torch.Tensor:
     """Merge the iHC channels into one hidden state before the final norm.
 
+    All tensors must be on the residual's device.
+
     Args:
         residual: BF16 or FP32 residual channels shaped
-            ``[..., hc_mult, hidden_size]``.
-        fn: FP32 head projection shaped ``[hc_mult, hc_mult * hidden_size]``.
-        hc_scale: FP32 head scale shaped ``[1]``.
-        hc_base: FP32 head biases shaped ``[hc_mult]``.
+            ``[..., hc_mult, hidden_size]`` with ``hc_mult > 1``.
+        fn: Contiguous FP32 head projection shaped
+            ``[hc_mult, hc_mult * hidden_size]``.
+        hc_scale: Contiguous FP32 head scale shaped ``[1]``.
+        hc_base: Contiguous FP32 head biases shaped ``[hc_mult]``.
         rms_eps: Epsilon of the RMS factor applied to the projection output.
         hc_eps: Epsilon added to the sigmoid gate.
         override: Optional exact registered kernel name.
@@ -976,6 +1060,15 @@ def ihc_head(
     Returns:
         The merged BF16 hidden state shaped ``[..., hidden_size]``.
     """
+    _check_ihc_residual(residual)
+    _check_ihc_projection(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        gate_count=residual.shape[-2],
+        scale_count=1,
+    )
     traits = _ihc_traits(residual)
     signature = format_signature(
         residual=dense_tensor_format(residual.dtype),
