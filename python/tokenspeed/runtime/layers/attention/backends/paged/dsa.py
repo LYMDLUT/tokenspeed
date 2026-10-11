@@ -112,6 +112,9 @@ class DSABackend(PagedAttentionBackend):
         self.q_data_type = config.dtype
         self.num_local_heads = spec.num_attention_heads // spec.attn_tp_size
         self._prefill_page_table: torch.Tensor | None = None
+        # Per-bs (per-token decode lengths, paged-MQA-logits plan); see
+        # _refresh_decode_plan.
+        self._decode_plans: dict[int, tuple[torch.Tensor, object]] = {}
         self.kpool_runtime = (
             KPoolRuntime(spec.index_kpool, spec.index_topk)
             if spec.index_kpool is not None
@@ -253,12 +256,49 @@ class DSABackend(PagedAttentionBackend):
         self._dense_backend.init_cuda_graph_state(max_bs)
 
     # Capture is inherited: the leaf default routes through this wrapper's
-    # refresh, whose lazy arm builds the piggybacked _dsa_seq_lens_2d /
-    # _dsa_plan once per bs on the dense leaf's cached metadata.
+    # refresh, which builds the decode plan buffers of a bs on first use
+    # (_refresh_decode_plan).
 
     # ------------------------------------------------------------------
     # Metadata
     # ------------------------------------------------------------------
+
+    def _refresh_decode_plan(
+        self, bs: int, seq_lens: torch.Tensor, *, plan_from_row: int
+    ) -> None:
+        """Write this round's per-token decode lengths, and their paged-MQA-
+        logits plan from row ``plan_from_row`` on, into the buffers of ``bs``.
+
+        The paged-MQA-logits kernel only supports next_n == 1, so each verify
+        token is its own row (``bs * spec_num_tokens`` rows); the per-token
+        causal bound is applied downstream in the top-k (see
+        deep_gemm_dsa_decode_topk). The buffers are published on the dense
+        leaf's per-bs decode view, which the decode graph of that bs captured
+        and a mixed round reuses, so every refresh writes them in place.
+        Rebinding them would leave the graph replaying a stale plan against
+        live lengths, which the kernel's scheduler can run past forever.
+        """
+        seq_lens_2d = (
+            seq_lens[:bs].unsqueeze(1).expand(-1, self.spec_num_tokens).reshape(-1, 1)
+        )
+        buffers = self._decode_plans.get(bs)
+        if buffers is None:
+            with torch.inference_mode(False):
+                lens = seq_lens_2d.clone(memory_format=torch.contiguous_format)
+            plan = dsa_plan(
+                seq_lens_2d=lens[plan_from_row:], page_size=self.kernel_page_size
+            )
+            buffers = self._decode_plans[bs] = (lens, plan)
+        else:
+            lens, plan = buffers
+            lens.copy_(seq_lens_2d)
+            dsa_plan(
+                seq_lens_2d=lens[plan_from_row:],
+                page_size=self.kernel_page_size,
+                out=plan,
+            )
+        metadata = self.forward_decode_metadata
+        metadata._dsa_seq_lens_2d, metadata._dsa_plan = buffers
 
     def refresh_decode_metadata(
         self,
@@ -278,30 +318,7 @@ class DSABackend(PagedAttentionBackend):
             num_extends=num_extends,
             for_graph_replay=for_graph_replay,
         )
-        metadata = self.forward_decode_metadata
-        if getattr(metadata, "_dsa_seq_lens_2d", None) is None:
-            # First refresh at a lazily-built bs (no capture ran): allocate the
-            # per-token view once; subsequent refreshes update it in place.
-            metadata._dsa_seq_lens_2d = (
-                seq_lens[:bs]
-                .unsqueeze(1)
-                .expand(-1, self.spec_num_tokens)
-                .reshape(-1, 1)
-                .contiguous()
-            )
-            metadata._dsa_plan = dsa_plan(
-                seq_lens_2d=metadata._dsa_seq_lens_2d,
-                page_size=self.kernel_page_size,
-            )
-            return
-        metadata._dsa_seq_lens_2d.copy_(
-            seq_lens[:bs].unsqueeze(1).expand(-1, self.spec_num_tokens).reshape(-1, 1)
-        )
-        dsa_plan(
-            seq_lens_2d=metadata._dsa_seq_lens_2d,
-            page_size=self.kernel_page_size,
-            out=metadata._dsa_plan,
-        )
+        self._refresh_decode_plan(bs, seq_lens, plan_from_row=0)
 
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
         metadata = self.forward_decode_metadata
@@ -352,28 +369,14 @@ class DSABackend(PagedAttentionBackend):
         # A draft's plan is rebuilt by the wrapper's refresh_decode_metadata
         # after this init (the unified draft contract).
         if forward_mode.is_mixed() and not self.is_draft:
-            metadata = self.forward_decode_metadata
-            # Per-token context lengths: the paged-MQA-logits kernel only supports
-            # next_n == 1, so each verify token is its own row (bs * spec_num_tokens
-            # rows). The per-token causal bound is applied downstream in the top-k.
-            # See deep_gemm_dsa_decode_topk.
-            metadata._dsa_seq_lens_2d = (
-                seq_lens.unsqueeze(1)
-                .expand(-1, self.spec_num_tokens)
-                .reshape(-1, 1)
-                .contiguous()
-            )
-            if num_extends < bs:
-                # Decode rows only: skip the extend requests' per-token block.
-                seq_lens_2d = metadata._dsa_seq_lens_2d[
-                    num_extends * self.spec_num_tokens :
-                ]
-            else:
-                # The dsa_plan is unused, alias to full-batch seq_lens_2d to
-                # generate dsa_plan as a placeholder
-                seq_lens_2d = metadata._dsa_seq_lens_2d
-            metadata._dsa_plan = dsa_plan(
-                seq_lens_2d=seq_lens_2d, page_size=self.kernel_page_size
+            # Plan the decode rows only, past the extend requests' per-token
+            # block; without decode rows the plan is unused and covers all.
+            self._refresh_decode_plan(
+                bs,
+                seq_lens,
+                plan_from_row=(
+                    num_extends * self.spec_num_tokens if num_extends < bs else 0
+                ),
             )
 
         self._prefill_page_table = None
