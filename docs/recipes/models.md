@@ -477,9 +477,10 @@ Constraints that follow from the architecture:
   rows itself. MTP keeps the target's prefill graphs; the draft's first step
   after a prefill runs eagerly.
 * Validated so far: the BF16 and MXFP8 checkpoints on four 8x H20 (96 GB)
-  nodes with attention TP32 and EP32, and the MXFP8 checkpoint on two such
-  nodes with TP16 and EP16. Keep the KV cache in BF16 unless you have
-  validated FP8 KV accuracy on your workload.
+  nodes with attention TP32 and EP32, there also the MXFP8 checkpoint with MTP
+  (one and three draft steps), and the MXFP8 checkpoint on two such nodes with
+  TP16 and EP16. Keep the KV cache in BF16 unless you have validated FP8 KV
+  accuracy on your workload.
 
 Four nodes of 8x H20, attention TP32 with EP32:
 
@@ -496,6 +497,18 @@ ts serve tencent/Hy4-preview \
 
 # nodes 1-3: the same command with --node-rank 1, 2, 3
 ```
+
+MTP drafts from the checkpoint's own MTP layer; add to every node's command:
+
+```bash
+  --speculative-algorithm MTP --speculative-num-steps 3
+```
+
+With three draft steps a verification accepts about 3.2 tokens on math and code
+prompts, which roughly halves the per-token latency of a lightly loaded server.
+Near the batch limit the verified draft tokens cost about as much as they save:
+at 64 concurrent requests, throughput stays within 3% (one step) to 6% (three
+steps) of decoding without MTP.
 
 `ts serve` defaults the reasoning and tool-call parsers to `hy_v4`; the pinned
 gateway (smg 1.11) provides both. The chat template accepts `reasoning_effort`
