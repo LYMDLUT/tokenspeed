@@ -36,6 +36,14 @@ _SPARSE_ATTENTION_LAYER_TYPE = "deepseek_sparse_attention"
 _SPARSE_ATTENTION_ALIASES = ("sparse_attention", "sparse")
 
 
+def _normalized_rope_fields(fields: dict | None) -> dict:
+    """Copy of ``fields`` with the legacy ``type`` key spelled ``rope_type``."""
+    return {
+        ("rope_type" if key == "type" else key): value
+        for key, value in (fields or {}).items()
+    }
+
+
 class HYV4Config(PretrainedConfig):
     """HY V4 text configuration.
 
@@ -60,7 +68,7 @@ class HYV4Config(PretrainedConfig):
         num_hidden_layers: int = 78,
         num_attention_heads: int = 64,
         num_key_value_heads: int = 8,
-        head_dim: int = 64,
+        head_dim: int | None = None,
         hidden_act: str = "silu",
         max_position_embeddings: int = 1048576,
         initializer_range: float = 0.006,
@@ -204,6 +212,16 @@ class HYV4Config(PretrainedConfig):
                 "indexer_types must contain one entry per hidden layer: "
                 f"expected {num_hidden_layers}, got {len(self.indexer_types)}"
             )
+        num_dense = self.mlp_layer_types.count("dense")
+        if self.mlp_layer_types != ["dense"] * num_dense + ["sparse"] * (
+            num_hidden_layers - num_dense
+        ):
+            # The shared DeepSeek MoE plumbing takes the dense layers to be the
+            # leading ``first_k_dense_replace`` layers.
+            raise ValueError(
+                "HYV4 mlp_layer_types must list the 'dense' layers first and only "
+                f"'sparse' layers after them, got {self.mlp_layer_types}"
+            )
         self.layer_types = (
             [
                 (
@@ -234,17 +252,32 @@ class HYV4Config(PretrainedConfig):
         self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
         # RoPE covers only the rope slice, so ``head_dim`` points at it and the
         # shared rotary embedding computes the right frequencies unmodified.
+        if head_dim is not None and head_dim != qk_rope_head_dim:
+            raise ValueError(
+                f"HYV4 head_dim must equal qk_rope_head_dim ({qk_rope_head_dim}), "
+                f"got {head_dim}"
+            )
         self.head_dim = qk_rope_head_dim
 
-        if rope_parameters is None:
-            rope_parameters = {"rope_theta": 10000000, "rope_type": "default"}
-        if rope_parameters.get("rope_type", "default") != "default":
+        # ``rope_scaling`` is the legacy spelling of ``rope_parameters``.
+        # ``PretrainedConfig`` would let a non-empty one replace the validated
+        # dict, so the two are merged and checked here.
+        rope_fields = _normalized_rope_fields(rope_parameters)
+        legacy_fields = _normalized_rope_fields(kwargs.pop("rope_scaling", None))
+        for key, value in legacy_fields.items():
+            if rope_fields.setdefault(key, value) != value:
+                raise ValueError(
+                    f"HYV4 rope_scaling and rope_parameters disagree on {key!r}: "
+                    f"{value!r} vs {rope_fields[key]!r}"
+                )
+        rope_fields.setdefault("rope_type", "default")
+        rope_fields.setdefault("rope_theta", 10000000)
+        if rope_fields["rope_type"] != "default":
             raise ValueError(
-                "HYV4 uses plain RoPE; got rope_type "
-                f"{rope_parameters.get('rope_type')!r}"
+                f"HYV4 uses plain RoPE; got rope_type {rope_fields['rope_type']!r}"
             )
-        self.rope_parameters = dict(rope_parameters)
-        self.rope_theta = float(rope_parameters.get("rope_theta", 10000000.0))
+        self.rope_parameters = rope_fields
+        self.rope_theta = float(rope_fields["rope_theta"])
         # ``enable_lm_head_fp32`` surfaces as ``head_dtype`` so the logits
         # processor accumulates the head GEMM in FP32 with a BF16 weight.
         self.head_dtype: str | None = "float32" if enable_lm_head_fp32 else None

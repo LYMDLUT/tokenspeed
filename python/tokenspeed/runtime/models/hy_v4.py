@@ -67,9 +67,9 @@ from tokenspeed.runtime.layers.moe.topk import TopK
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.modelopt_mxfp8 import (
+    ModelOptMxfp8Config,
     preprocess_modelopt_mxfp8_weights,
 )
-from tokenspeed.runtime.layers.quantization.utils import block_dequant
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.deepseek_v3 import (
@@ -85,7 +85,9 @@ from tokenspeed.runtime.models.glm5 import (
     GlmMoeDsaAttention,
     GlmMoeDsaForCausalLM,
     _glm_dsa_skip_indexer_topk,
-    pad_fused_qkv_a_proj_weight_for_fp8_blockscale,
+)
+from tokenspeed.runtime.moe.distribution_recorder import (
+    get_global_expert_distribution_recorder,
 )
 from tokenspeed.runtime.utils import LazyValue, add_prefix, get_colorful_logger
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
@@ -180,7 +182,8 @@ class HYV4Attention(GlmMoeDsaAttention):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
-        is_nextn: bool = False,
+        *,
+        is_nextn: bool,
     ) -> None:
         hidden_size = config.hidden_size
         # Bypass the GLM constructor: it builds its own indexer and normalizes
@@ -212,17 +215,15 @@ class HYV4Attention(GlmMoeDsaAttention):
             self.kv_a_layernorm,
         )
         self.index_topk = config.index_topk
-        self.is_nextn = is_nextn
-        # NextN/MTP owns indexer weights but may reuse the previous draft
-        # iteration's top-k, so it always builds the module and decides at run
-        # time. Shared target layers own no indexer and consume the
-        # context-carried top-k.
-        self.skip_indexer_topk = (
-            True if is_nextn else _glm_dsa_skip_indexer_topk(config, layer_id)
+        # Shared target layers own no indexer and attend over the top-k the
+        # last full layer left in the shared slot. The MTP layer always selects
+        # its own.
+        self.skip_indexer_topk = not is_nextn and _glm_dsa_skip_indexer_topk(
+            config, layer_id
         )
         self.indexer: HYV4DsaIndexer | None = (
             None
-            if self.skip_indexer_topk and not is_nextn
+            if self.skip_indexer_topk
             else HYV4DsaIndexer(
                 config=config,
                 hidden_size=hidden_size,
@@ -306,11 +307,9 @@ class HYV4Attention(GlmMoeDsaAttention):
             shaped = attn_output.view(attn_output.shape[0], -1, self.v_head_dim)
             shaped = shaped * torch.sigmoid(gate.float()).to(shaped.dtype).unsqueeze(-1)
             return shaped.reshape(attn_output.shape[0], -1)
-        if attn_output.is_cuda:
-            # One fused pass instead of a sigmoid plus a multiply.
-            sigmoid_mul(attn_output, gate)
-            return attn_output
-        return (attn_output.float() * torch.sigmoid(gate.float())).to(attn_output.dtype)
+        # One fused pass instead of a sigmoid plus a multiply.
+        sigmoid_mul(attn_output, gate)
+        return attn_output
 
     def forward(
         self,
@@ -335,9 +334,6 @@ class HYV4Attention(GlmMoeDsaAttention):
             block_scale,
             torch.bfloat16,
         )
-        qkv_width = self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim
-        if qkv.shape[-1] != qkv_width:
-            qkv = qkv[..., :qkv_width]
         qkv = comm_manager.pre_attn_comm(qkv, ctx)
 
         q_a, latent_cache = qkv.split(
@@ -349,9 +345,7 @@ class HYV4Attention(GlmMoeDsaAttention):
         if q_a.size(0) > 0:
             self.fused_qk_layernorm(input_q_a=q_a, input_kv_a=kv_a, output_q_a=q_norm)
 
-        should_compute_indexer = self._computes_topk(
-            ctx, num_tokens=int(q_norm.shape[0])
-        )
+        should_compute_indexer = not self.skip_indexer_topk
         if should_compute_indexer or self.linear_gate is not None:
             hidden_states = comm_manager.pre_attn_comm(hidden_states, ctx)
         index_q = index_k = index_weights = None
@@ -370,26 +364,6 @@ class HYV4Attention(GlmMoeDsaAttention):
             attn_output = attn_output.index_select(0, ctx.gather_ids)
         output, _ = self.o_proj(attn_output)
         return output
-
-    def _computes_topk(self, ctx: ForwardContext, *, num_tokens: int) -> bool:
-        """Whether this layer runs its indexer and selects its own top-k.
-
-        Target layers decide statically. NextN reuses the selection a previous
-        draft iteration left in the shared slot.
-        """
-        if not self.skip_indexer_topk:
-            return True
-        if not self.is_nextn:
-            return False
-        shared_topk = ctx.attn_backend.sparse_topk
-        decode_window = self._resolve_decode_window(
-            ctx,
-            getattr(ctx.attn_backend, "forward_decode_metadata", None),
-            total_tokens=num_tokens,
-        )
-        return (decode_window.start > 0 and shared_topk.prefill is None) or (
-            decode_window.num_tokens > 0 and shared_topk.decode is None
-        )
 
     @break_point
     def _sparse_attention(
@@ -424,10 +398,9 @@ class HYV4Attention(GlmMoeDsaAttention):
                     index_weights,
                 )
             )
-        decode_metadata = getattr(ctx.attn_backend, "forward_decode_metadata", None)
         decode_window = self._resolve_decode_window(
             ctx,
-            decode_metadata,
+            ctx.attn_backend.forward_decode_metadata,
             total_tokens=int(q.shape[0]),
         )
         num_decode_tokens = decode_window.num_tokens
@@ -576,10 +549,7 @@ class HYV4MoE(DeepseekV3MoE):
         )
         self.experts = MoELayer(
             top_k=config.num_experts_per_tok,
-            num_experts=(
-                config.n_routed_experts
-                + global_server_args_dict["ep_num_redundant_experts"]
-            ),
+            num_experts=config.n_routed_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             quant_config=quant_config,
@@ -676,7 +646,8 @@ class HYV4DecoderLayer(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
-        is_nextn: bool = False,
+        *,
+        is_nextn: bool,
     ) -> None:
         super().__init__()
         self.config = config
@@ -848,9 +819,6 @@ class HYV4DecoderLayer(nn.Module):
             ctx=ctx,
             comm_manager=self.comm_manager,
         )
-        if ctx.draft_narrowing is not None:
-            hidden_states = hidden_states.index_select(0, ctx.gather_ids)
-            attn_post = attn_post.index_select(0, ctx.gather_ids)
         attn_output, _ = self.comm_manager.post_attn_comm(attn_output, attn_output, ctx)
         hidden_states = ihc_post(attn_output, hidden_states, attn_post)
 
@@ -888,6 +856,9 @@ class HYV4Model(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        check_hyv4_quant_config(quant_config)
+        check_hyv4_expert_placement()
+        check_hyv4_speculative_algorithm()
         self.config = config
         self.mapping = mapping
         self.padding_id = config.pad_token_id
@@ -911,6 +882,7 @@ class HYV4Model(nn.Module):
                     quant_config=quant_config,
                     prefix=add_prefix(f"layers.{layer_id}", prefix),
                     alt_stream=self.alt_stream,
+                    is_nextn=False,
                 )
                 for layer_id in range(config.num_hidden_layers)
             ]
@@ -919,7 +891,6 @@ class HYV4Model(nn.Module):
         self.hc_head: HYV4HCBoundary | None = (
             HYV4HCBoundary(config, is_head=True) if config.enable_ihc else None
         )
-        self.layers_to_capture: set[int] = set()
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
@@ -944,8 +915,9 @@ class HYV4Model(nn.Module):
                 hidden_states.float().unsqueeze(1).repeat(1, self.config.hc_mult, 1)
             )
 
-        for layer in self.layers:
-            hidden_states, residual = layer(positions, hidden_states, ctx, residual)
+        for layer_id, layer in enumerate(self.layers):
+            with get_global_expert_distribution_recorder().with_current_layer(layer_id):
+                hidden_states, residual = layer(positions, hidden_states, ctx, residual)
 
         if ctx.forward_mode.is_idle():
             if self.hc_head is not None:
@@ -1006,6 +978,18 @@ class HYV4ForCausalLM(GlmMoeDsaForCausalLM):
             }
         )
 
+    def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
+        raise ValueError(
+            "HY V4 does not capture intermediate hidden states for an EAGLE3 "
+            "draft; use --speculative-algorithm MTP."
+        )
+
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+        raise ValueError(
+            "HY V4 does not capture intermediate hidden states for a DFLASH "
+            "draft; use --speculative-algorithm MTP."
+        )
+
     def checkpoint_weight_name_filter(self, name: str) -> bool:
         """Skip the MTP block, which the NextN draft model loads."""
         return not name.startswith("model.mtp_layers.")
@@ -1025,25 +1009,63 @@ class HYV4ForCausalLM(GlmMoeDsaForCausalLM):
 
     def post_load_weights(self) -> None:
         for layer in self.model.layers:
-            finalize_hyv4_attention(layer.self_attn, self.quant_config)
+            finalize_hyv4_attention(layer.self_attn)
 
 
-def finalize_hyv4_attention(
-    attn: HYV4Attention, quant_config: QuantizationConfig | None
-) -> None:
+def check_hyv4_quant_config(quant_config: QuantizationConfig | None) -> None:
+    """Reject every quantization but ModelOpt MXFP8, which HY V4 cannot load.
+
+    HY V4 loads BF16 checkpoints and ModelOpt MXFP8 checkpoints, whose dense
+    weights are dequantized to BF16 while streaming. Under any other format
+    the fused indexer projection and the absorbed MLA weights would take raw
+    quantized values without their scales.
+    """
+    if quant_config is not None and not isinstance(quant_config, ModelOptMxfp8Config):
+        raise ValueError(
+            "HY V4 supports BF16 and ModelOpt MXFP8 checkpoints; "
+            f"{quant_config.get_name()!r} quantization is not supported."
+        )
+
+
+def check_hyv4_expert_placement() -> None:
+    """Reject expert placements other than the checkpoint's own order.
+
+    HY V4 loads logical expert ``e`` into physical expert ``e`` and routes by
+    the gate's logical top-k ids, so redundant experts, a precomputed
+    placement or EPLB rebalancing would send tokens to the wrong weights.
+    """
+    if global_server_args_dict["enable_eplb"]:
+        raise ValueError("HY V4 does not support EPLB (--enable-eplb).")
+    if global_server_args_dict["init_expert_location"] not in (None, "trivial"):
+        raise ValueError(
+            "HY V4 requires the trivial expert placement "
+            "(--init-expert-location trivial)."
+        )
+    if global_server_args_dict["ep_num_redundant_experts"]:
+        raise ValueError(
+            "HY V4 does not support redundant experts (--ep-num-redundant-experts)."
+        )
+
+
+def check_hyv4_speculative_algorithm() -> None:
+    """Reject draft models that read hidden states HY V4 does not capture.
+
+    HY V4 drafts with the checkpoint's own MTP layer. EAGLE3, DFlash and
+    DSpark drafts would otherwise fail only once the target and the draft
+    have both loaded.
+    """
+    algorithm = global_server_args_dict["speculative_algorithm"]
+    if algorithm not in (None, "MTP"):
+        raise ValueError(
+            "HY V4 supports MTP speculative decoding only "
+            f"(--speculative-algorithm MTP), got {algorithm}."
+        )
+
+
+def finalize_hyv4_attention(attn: HYV4Attention) -> None:
     """Derive the absorbed MLA weights and publish the sink after loading."""
-    weight = attn.kv_b_proj.weight
-    weight_block_size = getattr(quant_config, "weight_block_size", None)
-    if weight_block_size is not None and weight.dtype in (
-        torch.float8_e4m3fn,
-        torch.float8_e4m3fnuz,
-    ):
-        weight = block_dequant(
-            weight, attn.kv_b_proj.weight_scale_inv, weight_block_size
-        ).to(torch.get_default_dtype())
-    attn.w_kc, attn.w_vc = _prepare_mla_kv_b_proj_weights(weight, attn)
+    attn.w_kc, attn.w_vc = _prepare_mla_kv_b_proj_weights(attn.kv_b_proj.weight, attn)
     attn.bind_learnable_sink()
-    pad_fused_qkv_a_proj_weight_for_fp8_blockscale(attn)
 
 
 def load_hyv4_weights(
@@ -1069,13 +1091,29 @@ def load_hyv4_weights(
         shared_params: Name prefixes of parameters bound from another model
             after loading (the MTP draft's embedding and LM head), which the
             checkpoint is not expected to fill.
+
+    Raises:
+        RuntimeError: A parameter outside ``shared_params`` is left unloaded,
+            including a fused parameter that received only one of its shards.
     """
     config = owner.config
     params_dict = dict(owner.named_parameters())
     modules_dict = dict(owner.named_modules())
-    loaded_indexer_shards: dict[str, set[int]] = {}
     loaded_params: set[str] = set()
+    # Fused parameter -> shard ids loaded so far. Every fused parameter here
+    # takes shards 0 and 1 and counts as loaded only once both have arrived.
+    loaded_shards: dict[str, set[int]] = {}
     unmatched: list[str] = []
+
+    def record_fused_shard(param_name: str, shard_id: int) -> bool:
+        """Record one shard of a fused parameter; True once both are loaded."""
+        shards = loaded_shards.setdefault(param_name, set())
+        shards.add(shard_id)
+        complete = shards == {0, 1}
+        if complete:
+            loaded_params.add(param_name)
+        return complete
+
     moe_loader = build_moe_checkpoint_loader(
         params_dict=params_dict,
         expert_schema=ExpertCheckpointSchema(),
@@ -1118,11 +1156,10 @@ def load_hyv4_weights(
             fused = params_dict.get(fused_name)
             if fused is not None:
                 fused.weight_loader(fused, loaded_weight, shard_id)
-                loaded_params.add(fused_name)
-                shards = loaded_indexer_shards.setdefault(module_name, set())
-                shards.add(shard_id)
                 module = modules_dict.get(module_name)
-                if shards == {0, 1} and isinstance(module, GlmDsaIndexer):
+                if record_fused_shard(fused_name, shard_id) and isinstance(
+                    module, GlmDsaIndexer
+                ):
                     module.set_wk_weights_proj_loaded()
             if direct is None and fused is None:
                 unmatched.append(name)
@@ -1145,19 +1182,12 @@ def load_hyv4_weights(
                 ".fused_qkv_a_proj_with_mqa.",
             )
             begin_size = 0 if is_q else config.q_lora_rank
-            if "scale_inv" in name:
-                block = getattr(owner.quant_config, "weight_block_size", None)
-                if block is None:
-                    raise RuntimeError(
-                        "FP8 scale checkpoint requires weight_block_size"
-                    )
-                begin_size //= block[0]
             param = params_dict.get(mapped)
             if param is None:
                 unmatched.append(name)
             else:
                 param.weight_loader(param, loaded_weight, begin_size=begin_size)
-                loaded_params.add(mapped)
+                record_fused_shard(mapped, 0 if is_q else 1)
             continue
 
         stacked = False
@@ -1170,7 +1200,7 @@ def load_hyv4_weights(
                 unmatched.append(name)
             else:
                 param.weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(stacked_name)
+                record_fused_shard(stacked_name, shard_id)
             stacked = True
             break
         if stacked:
@@ -1189,7 +1219,7 @@ def load_hyv4_weights(
             f"matching parameter, e.g. {unmatched[:8]}"
         )
     # Parameters are allocated uninitialized, so one the checkpoint never
-    # reaches would serve garbage.
+    # reaches, or fills only in part, would serve garbage.
     missing = sorted(
         name
         for name in params_dict
