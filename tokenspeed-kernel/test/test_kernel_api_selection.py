@@ -2610,6 +2610,39 @@ def _mhc_post() -> object:
     return tokenspeed_kernel.mhc_post(hidden_states, residual, post, comb)
 
 
+def _ihc_pre(hc_mult: int) -> object:
+    residual = torch.empty((2, hc_mult, 64), dtype=torch.float32)
+    fn = torch.empty((2 * hc_mult, hc_mult * 64), dtype=torch.float32)
+    hc_scale = torch.empty((2,), dtype=torch.float32)
+    hc_base = torch.empty((2 * hc_mult,), dtype=torch.float32)
+    return tokenspeed_kernel.ihc_pre(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        2.0,
+        1e-6,
+        1e-6,
+        norm_weight=torch.empty((64,), dtype=torch.bfloat16),
+        norm_eps=1e-6,
+    )
+
+
+def _ihc_post() -> object:
+    block_output = torch.empty((2, 64), dtype=torch.bfloat16)
+    residual = torch.empty((2, 4, 64), dtype=torch.float32)
+    gates = torch.empty((2, 4), dtype=torch.float32)
+    return tokenspeed_kernel.ihc_post(block_output, residual, gates)
+
+
+def _ihc_head(hc_mult: int) -> object:
+    residual = torch.empty((2, hc_mult, 64), dtype=torch.float32)
+    fn = torch.empty((hc_mult, hc_mult * 64), dtype=torch.float32)
+    hc_scale = torch.empty((1,), dtype=torch.float32)
+    hc_base = torch.empty((hc_mult,), dtype=torch.float32)
+    return tokenspeed_kernel.ihc_head(residual, fn, hc_scale, hc_base, 1e-6, 1e-6)
+
+
 def _attention_gdn_chunk_prefill() -> object:
     q = torch.empty((1, 4, 16, 64), dtype=torch.bfloat16)
     k = torch.empty((1, 4, 16, 64), dtype=torch.bfloat16)
@@ -5902,6 +5935,50 @@ _CASES = [
         "mhc_post",
         "triton_mhc_post",
         _mhc_post,
+    ),
+    _case(
+        _is_supported_gpu,
+        "supported-gpu",
+        "residual",
+        "ihc_pre",
+        "triton_ihc_pre",
+        partial(_ihc_pre, hc_mult=4),
+    ),
+    _case(
+        _is_supported_gpu,
+        "supported-gpu",
+        "residual",
+        "ihc_post",
+        "triton_ihc_post",
+        _ihc_post,
+    ),
+    _case(
+        _is_supported_gpu,
+        "supported-gpu",
+        "residual",
+        "ihc_head",
+        "triton_ihc_head",
+        partial(_ihc_head, hc_mult=4),
+    ),
+    # Past the Triton kernels' 16 gate lanes: pre takes 2 * hc_mult gates and
+    # the head hc_mult.
+    _case(
+        _is_supported_gpu,
+        "supported-gpu",
+        "residual",
+        "ihc_pre",
+        "torch_ihc_pre",
+        partial(_ihc_pre, hc_mult=9),
+        id_suffix="hc9",
+    ),
+    _case(
+        _is_supported_gpu,
+        "supported-gpu",
+        "residual",
+        "ihc_head",
+        "torch_ihc_head",
+        partial(_ihc_head, hc_mult=17),
+        id_suffix="hc17",
     ),
     _case(
         _is_cdna4,

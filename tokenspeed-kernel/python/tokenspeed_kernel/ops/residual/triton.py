@@ -1976,13 +1976,17 @@ def normalized_dot_gate(residual, key_value, query_weight, key_weight, mask, eps
 #    gates, writes the post gates, and reduces the channels with the pre gates
 #    -- fusing the following RMSNorm -- reading the row exactly once.
 #
-# Projection precision. The weight is FP32 and the activations BF16. An FP32
-# FMA dot is compute bound on bandwidth-rich parts (H20: ~44 TFLOPS FP32 vs
-# 4 TB/s), so the weight is split on the fly into ``_IHC_WEIGHT_PARTS`` BF16
-# terms (hi + mid + lo carries all 24 mantissa bits of an FP32 value) packed
-# side by side along N. Each BF16 x BF16 product is exact in the FP32
-# accumulator, so one BF16 tensor-core dot reproduces the FP32 projection up to
-# summation order, at BF16 tensor-core speed.
+# Projection precision. The weight is FP32. Against BF16 activations it is
+# split on the fly into ``_IHC_WEIGHT_PARTS`` BF16 terms (hi + mid + lo carries
+# all 24 mantissa bits of an FP32 value) packed side by side along N. Each
+# BF16 x BF16 product is exact in the FP32 accumulator, so one BF16 tensor-core
+# dot reproduces the FP32 projection up to summation order. FP32 activations
+# (residual channels kept in FP32) would need the same split of every
+# activation and three dots; they take plain FP32 FMAs instead, one per gate
+# lane: the gate count padded to a power of two of at least four, the padded
+# lanes multiplying zero weights. HY V4's eight gates cost two FMAs a byte,
+# which stays bound by the residual read even where FP32 throughput is low
+# (H20: ~22 TFMA/s against 4 TB/s).
 #
 # The post boundary is a single pass that scatters the sub-block output across
 # the channels and adds the residual.
@@ -1992,6 +1996,7 @@ _IHC_BLOCK_H = 1024
 _IHC_WEIGHT_PARTS = 3
 # Upper bound on the gate count (pre + post gates for hc_mult channels).
 _IHC_MAX_GATES = 16
+_IHC_FP32_ACCUMULATOR = 8192
 
 
 def _ihc_tile_m(num_tokens: int) -> int:
@@ -2005,12 +2010,35 @@ def _ihc_tile_m(num_tokens: int) -> int:
     return 128
 
 
-def _ihc_num_splits(device: torch.device, total_k: int, token_blocks: int) -> int:
+def _ihc_fp32_tile(num_tokens: int, gate_p2: int) -> tuple[int, int, int]:
+    """(BLOCK_M, BLOCK_K, num_warps) of the FP32-residual projection, tuned on H20.
+
+    Decode batches fit one token tile and step 32 columns, so that many short K
+    splits cover the SMs; the smallest take eight warps for more loads in
+    flight. Larger batches use 16-token tiles, and prefill batches 8-token
+    tiles whose K step halves once the token tiles alone fill the device
+    several times over. The lane-wise accumulator (BLOCK_M * gate_p2 * BLOCK_K
+    values) stays within _IHC_FP32_ACCUMULATOR, 64 registers a thread at four
+    warps.
+    """
+    if num_tokens <= 16:
+        block_m, block_k = triton.next_power_of_2(num_tokens), 32
+    elif num_tokens <= 256:
+        block_m, block_k = 16, 64
+    else:
+        block_m, block_k = 8, 128 if num_tokens <= 2048 else 64
+    block_k = min(block_k, _IHC_FP32_ACCUMULATOR // (block_m * gate_p2))
+    return block_m, block_k, 8 if num_tokens <= 4 else 4
+
+
+def _ihc_num_splits(
+    device: torch.device, total_k: int, token_blocks: int, block_k: int
+) -> int:
     """Split K until the grid covers the device about twice over, keeping at
     least four K tiles per split so the partial sums stay worth their traffic."""
     sms = _num_sms(device)
     want = triton.cdiv(2 * sms, token_blocks)
-    return max(1, min(want, triton.cdiv(total_k, _IHC_BLOCK_K) // 4))
+    return max(1, min(want, triton.cdiv(total_k, block_k) // 4))
 
 
 @cache
@@ -2069,21 +2097,8 @@ def _ihc_project_kernel(
         part = tl.where(
             part_of_n[None, :] == 0, hi, tl.where(part_of_n[None, :] == 1, mid, lo)
         )
-        part = part.to(tl.bfloat16)
-        if values.dtype == tl.bfloat16:
-            mix_acc = tl.dot(values, part, mix_acc)
-            values_f32 = values.to(tl.float32)
-        else:
-            # FP32 IEEE dots have no tensor-core path; split the residual the
-            # same exact way (v == hi + mid + lo) so every product stays exact.
-            values_f32 = values.to(tl.float32)
-            v_hi = values_f32.to(tl.bfloat16)
-            v_rem = values_f32 - v_hi.to(tl.float32)
-            v_mid = v_rem.to(tl.bfloat16)
-            v_lo = (v_rem - v_mid.to(tl.float32)).to(tl.bfloat16)
-            mix_acc = tl.dot(v_hi, part, mix_acc)
-            mix_acc = tl.dot(v_mid, part, mix_acc)
-            mix_acc = tl.dot(v_lo, part, mix_acc)
+        mix_acc = tl.dot(values, part.to(tl.bfloat16), mix_acc)
+        values_f32 = values.to(tl.float32)
         square_acc += tl.sum(values_f32 * values_f32, axis=1)
 
     tl.store(
@@ -2095,6 +2110,64 @@ def _ihc_project_kernel(
         mask=m_mask[:, None],
     )
     tl.store(out_sqrsum + split_id * num_tokens + offs_m, square_acc, mask=m_mask)
+
+
+@triton.jit
+def _ihc_project_fp32_kernel(
+    residual,
+    fn,
+    out_mix,
+    out_sqrsum,
+    num_tokens,
+    total_k,
+    split_k,
+    gate_count: tl.constexpr,
+    GATE_P2: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # 64-bit row offsets: num_tokens * total_k passes 2**31 near 87k tokens.
+    split_id = tl.program_id(0).to(tl.int64)
+    token_block = tl.program_id(1).to(tl.int64)
+    offs_m = token_block * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_g = tl.arange(0, GATE_P2)
+    m_mask = offs_m < num_tokens
+    g_mask = offs_g < gate_count
+    split_start = split_id * split_k
+
+    # Lane-wise FP32 FMAs over GATE_P2 gate lanes, those past gate_count on
+    # zero weights; K is reduced once, after the loop.
+    mix_acc = tl.zeros((BLOCK_M, GATE_P2, BLOCK_K), dtype=tl.float32)
+    square_acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+    for k_start in range(0, split_k, BLOCK_K):
+        offs_k = split_start + k_start + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < total_k
+        values = tl.load(
+            residual + offs_m[:, None] * total_k + offs_k[None, :],
+            mask=m_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        weights = tl.load(
+            fn + offs_g[:, None] * total_k + offs_k[None, :],
+            mask=g_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        mix_acc += values[:, None, :] * weights[None, :, :]
+        square_acc += values * values
+
+    tl.store(
+        out_mix
+        + split_id * num_tokens * GATE_P2
+        + offs_m[:, None] * GATE_P2
+        + offs_g[None, :],
+        tl.sum(mix_acc, axis=2),
+        mask=m_mask[:, None],
+    )
+    tl.store(
+        out_sqrsum + split_id * num_tokens + offs_m,
+        tl.sum(square_acc, axis=1),
+        mask=m_mask,
+    )
 
 
 @triton.jit
@@ -2116,6 +2189,7 @@ def _ihc_gate_reduce_kernel(
     gate_count: tl.constexpr,
     GATE_P2: tl.constexpr,
     PARTS_P2: tl.constexpr,
+    SPLITS_P2: tl.constexpr,
     rms_eps: tl.constexpr,
     hc_eps: tl.constexpr,
     has_post: tl.constexpr,
@@ -2130,11 +2204,20 @@ def _ihc_gate_reduce_kernel(
     offs_g = tl.arange(0, GATE_P2)
 
     # -- gates ---------------------------------------------------------------
-    projected = tl.zeros((BLOCK_N,), dtype=tl.float32)
-    square_sum = tl.full((), 0.0, tl.float32)
-    for split_id in range(n_splits):
-        projected += tl.load(mix + (split_id * num_tokens + token) * BLOCK_N + offs_n)
-        square_sum += tl.load(sqrsum + split_id * num_tokens + token)
+    # All split partials load in one wave: a serial walk over them is a chain
+    # of dependent loads that dominates the small-batch (decode) boundary.
+    offs_s = tl.arange(0, SPLITS_P2)
+    s_mask = offs_s < n_splits
+    split_rows = offs_s * num_tokens + token
+    projected = tl.sum(
+        tl.load(
+            mix + split_rows[:, None] * BLOCK_N + offs_n[None, :],
+            mask=s_mask[:, None],
+            other=0.0,
+        ),
+        axis=0,
+    )
+    square_sum = tl.sum(tl.load(sqrsum + split_rows, mask=s_mask, other=0.0), axis=0)
     # Fold the BF16 weight parts back into one projection per gate.
     projected_g = tl.sum(tl.reshape(projected, (PARTS_P2, GATE_P2)), axis=0)
 
@@ -2275,34 +2358,57 @@ def _ihc_boundary(
     device = residual.device
 
     gate_p2 = max(4, triton.next_power_of_2(gate_count))
-    parts_p2 = triton.next_power_of_2(_IHC_WEIGHT_PARTS)
-    block_n = max(16, gate_p2 * parts_p2)
-    parts_p2 = block_n // gate_p2
-    block_m = _ihc_tile_m(num_tokens)
+    fp32_residual = residual_flat.dtype == torch.float32
+    if fp32_residual:
+        block_m, block_k, num_warps = _ihc_fp32_tile(num_tokens, gate_p2)
+        parts_p2 = 1
+        block_n = gate_p2
+    else:
+        block_m, block_k = _ihc_tile_m(num_tokens), _IHC_BLOCK_K
+        num_warps = 4 if block_m <= 32 else 8
+        parts_p2 = triton.next_power_of_2(_IHC_WEIGHT_PARTS)
+        block_n = max(16, gate_p2 * parts_p2)
+        parts_p2 = block_n // gate_p2
     token_blocks = triton.cdiv(num_tokens, block_m)
-    n_splits = _ihc_num_splits(device, total_k, token_blocks)
-    split_k = triton.cdiv(triton.cdiv(total_k, n_splits), _IHC_BLOCK_K) * _IHC_BLOCK_K
+    n_splits = _ihc_num_splits(device, total_k, token_blocks, block_k)
+    split_k = triton.cdiv(triton.cdiv(total_k, n_splits), block_k) * block_k
     n_splits = triton.cdiv(total_k, split_k)
     mix = torch.empty(
         (n_splits, num_tokens, block_n), dtype=torch.float32, device=device
     )
     sqrsum = torch.empty((n_splits, num_tokens), dtype=torch.float32, device=device)
-    _ihc_project_kernel[(n_splits, token_blocks)](
-        residual_flat,
-        fn,
-        mix,
-        sqrsum,
-        num_tokens,
-        total_k,
-        split_k,
-        gate_count=gate_count,
-        GATE_P2=gate_p2,
-        PARTS=_IHC_WEIGHT_PARTS,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        BLOCK_K=_IHC_BLOCK_K,
-        num_warps=4 if block_m <= 32 else 8,
-    )
+    if fp32_residual:
+        _ihc_project_fp32_kernel[(n_splits, token_blocks)](
+            residual_flat,
+            fn,
+            mix,
+            sqrsum,
+            num_tokens,
+            total_k,
+            split_k,
+            gate_count=gate_count,
+            GATE_P2=gate_p2,
+            BLOCK_M=block_m,
+            BLOCK_K=block_k,
+            num_warps=num_warps,
+        )
+    else:
+        _ihc_project_kernel[(n_splits, token_blocks)](
+            residual_flat,
+            fn,
+            mix,
+            sqrsum,
+            num_tokens,
+            total_k,
+            split_k,
+            gate_count=gate_count,
+            GATE_P2=gate_p2,
+            PARTS=_IHC_WEIGHT_PARTS,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
+            num_warps=num_warps,
+        )
 
     post = (
         torch.empty((num_tokens, hc_mult), dtype=torch.float32, device=device)
@@ -2337,6 +2443,7 @@ def _ihc_boundary(
         gate_count=gate_count,
         GATE_P2=gate_p2,
         PARTS_P2=parts_p2,
+        SPLITS_P2=triton.next_power_of_2(n_splits),
         rms_eps=rms_eps,
         hc_eps=hc_eps,
         has_post=has_post,
@@ -2368,6 +2475,7 @@ _IHC_PRE_SIGNATURES = frozenset(
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     signatures=_IHC_PRE_SIGNATURES,
+    traits={"hc_mult": frozenset(range(2, _IHC_MAX_GATES // 2 + 1))},
     priority=Priority.PERFORMANT,
 )
 def triton_ihc_pre(
@@ -2466,6 +2574,7 @@ def triton_ihc_post(
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     signatures=_IHC_PRE_SIGNATURES,
+    traits={"hc_mult": frozenset(range(2, _IHC_MAX_GATES + 1))},
     priority=Priority.PERFORMANT,
 )
 def triton_ihc_head(
