@@ -136,6 +136,7 @@ from tokenspeed_kernel.ops.moe.flashinfer import trtllm_unquant as _moe_trtllm_u
 from tokenspeed_kernel.ops.moe.gluon import mxfp4 as _moe_gluon_mxfp4
 from tokenspeed_kernel.ops.moe.marlin import deepep_mxfp4 as _moe_marlin_deepep_mxfp4
 from tokenspeed_kernel.ops.moe.marlin import mxfp4 as _moe_marlin_mxfp4
+from tokenspeed_kernel.ops.moe.marlin import mxfp8 as _moe_marlin_mxfp8
 from tokenspeed_kernel.ops.moe.triton import bf16 as _moe_triton_bf16
 from tokenspeed_kernel.ops.moe.triton import (
     decode_sigmoid_topk as _moe_triton_decode_sigmoid_topk,
@@ -231,6 +232,7 @@ _RELOAD_MODULES = [
     _moe_gluon,
     _moe_marlin_deepep_mxfp4,
     _moe_marlin_mxfp4,
+    _moe_marlin_mxfp8,
     _moe_marlin,
     _moe_native,
     _moe_triton_bf16,
@@ -3808,6 +3810,59 @@ def _moe_apply_fp8_cutlass() -> object:
     return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
 
 
+def _moe_plan_fp8_hy_v4(
+    fp8_scale_block_shape: tuple[int, int], solution: str | None
+) -> dict:
+    # HY V4 on one EP32 rank: clamped SwiGLU experts, 6144-wide hidden,
+    # 2048-wide FFN.
+    return tokenspeed_kernel.moe_plan(
+        "fp8",
+        input_dtype=torch.bfloat16,
+        activation="swiglu",
+        routing_mode="precomputed_topk",
+        ep_size=32,
+        ispp=2048,
+        hidden=6144,
+        swiglu_form="standard",
+        activation_clamped=True,
+        expert_id_repeats=False,
+        fp8_scale_block_shape=fp8_scale_block_shape,
+        internal_activation_dtype="input",
+        fast_math=True,
+        requires_deterministic_finalize=False,
+        solution=solution,
+    )
+
+
+def _moe_apply_mxfp8_marlin() -> object:
+    plan = _moe_plan_fp8_hy_v4((1, 32), solution=None)
+    _assert_moe_plan(
+        plan,
+        apply="marlin_mxfp8_precomputed_moe_apply",
+        preprocessor="marlin_mxfp8_moe_weights",
+    )
+    x = torch.empty((4, 16), dtype=torch.bfloat16)
+    router_logits = torch.empty((4, 8), dtype=torch.float32)
+    return tokenspeed_kernel.moe_apply(plan, x, torch.nn.Module(), router_logits)
+
+
+def test_marlin_mxfp8_moe_requires_mxfp8_block_scales(
+    h100_platform: PlatformInfo,
+) -> None:
+    host_platform = Platform.get()
+    registry = KernelRegistry.get()
+    try:
+        Platform.override(h100_platform)
+        registry.clear_cache()
+        plan = _moe_plan_fp8_hy_v4((1, 32), solution="marlin")
+        assert plan["apply_kernel_name"] == "marlin_mxfp8_precomputed_moe_apply"
+        with pytest.raises(tokenspeed_kernel.NoKernelFoundError, match="traits"):
+            _moe_plan_fp8_hy_v4((128, 128), solution="marlin")
+    finally:
+        Platform.override(host_platform)
+        registry.clear_cache()
+
+
 def _moe_apply_mxfp4_plan(
     *,
     activation: str,
@@ -5674,6 +5729,14 @@ _CASES = [
         "apply",
         "flashinfer_cutlass_fp8_moe_apply",
         _moe_apply_fp8_cutlass,
+    ),
+    _case(
+        _is_hopper_plus,
+        "hopper-plus",
+        "moe",
+        "apply",
+        "marlin_mxfp8_precomputed_moe_apply",
+        _moe_apply_mxfp8_marlin,
     ),
     _case(
         _is_hopper,

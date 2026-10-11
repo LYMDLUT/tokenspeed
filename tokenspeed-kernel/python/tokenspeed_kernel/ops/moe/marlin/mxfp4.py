@@ -300,7 +300,6 @@ def marlin_mxfp4_local_moe_apply(
     hidden = int(getattr(w, "_marlin_hidden_size", x.shape[1]))
     ispp = int(getattr(w, "_marlin_ispp", w.w2_weight.shape[1] * 16))
     num_local_experts = int(getattr(w, "num_local_experts", w.w13_weight.shape[0]))
-    is_ep = int(getattr(w, "ep_size", 1)) > 1
     local_topk_ids = local_topk_ids.to(torch.int32)
     topk_weights = topk_weights.to(torch.float32)
     num_tokens, top_k = local_topk_ids.shape
@@ -315,6 +314,8 @@ def marlin_mxfp4_local_moe_apply(
 
     workspace = marlin_make_workspace(x.device)
 
+    # -1 routes fill blocks of expert id -1, with or without EP; only the EP
+    # specialization skips them instead of reading expert -1's weights.
     gemm1_n = 2 * ispp
     intermediate1 = moe_wna16_marlin_gemm(
         x,
@@ -330,7 +331,7 @@ def marlin_mxfp4_local_moe_apply(
         moe_block_size=block_m,
         top_k=top_k,
         mul_topk_weights=False,
-        is_ep=is_ep,
+        is_ep=True,
         size_m=num_tokens,
         size_n=gemm1_n,
         size_k=hidden,
@@ -351,7 +352,7 @@ def marlin_mxfp4_local_moe_apply(
         intermediate2 = silu_and_mul(intermediate1, limit=_swiglu_limit(w))
 
     # GEMM2: fold the route weights in (mul_topk_weights) so finalize is a
-    # plain sum over top_k. EP-masked routes wrote nothing, so zero-init c.
+    # plain sum over top_k. Routes to expert -1 write nothing, so zero-init c.
     intermediate3 = moe_wna16_marlin_gemm(
         intermediate2,
         torch.zeros(num_tokens * top_k, hidden, dtype=x.dtype, device=x.device),
@@ -366,7 +367,7 @@ def marlin_mxfp4_local_moe_apply(
         moe_block_size=block_m,
         top_k=1,
         mul_topk_weights=True,
-        is_ep=is_ep,
+        is_ep=True,
         size_m=num_tokens * top_k,
         size_n=hidden,
         size_k=ispp,
