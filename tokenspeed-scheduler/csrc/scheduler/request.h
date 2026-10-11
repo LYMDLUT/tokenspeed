@@ -200,6 +200,8 @@ public:
     // admission time, and a state transition only moves them on.
     fsm::CacheProgress& CacheProgressRef() { return forwardResources("CacheProgressRef").cache_progress; }
 
+    const fsm::CacheProgress& CacheProgressRef() const { return forwardResources("CacheProgressRef").cache_progress; }
+
     std::int32_t ReserveNumTokensInNextScheduleEvent() const {
         return std::visit(
             Overloaded{

@@ -156,10 +156,11 @@ Only materialized State Endpoint/Promoted boundaries are published; ordinary
 Chunks remain request-owned. For newly completed prefix hashes, the last aligned
 prompt checkpoint is an Endpoint unless already Promoted, including before a
 short final tail. A step with no newly completed hashes does not publish or
-upgrade state. Admission from `PrefillDone` can publish pending prefill state
-before local decode or PD handoff; decode itself records and publishes no state
-checkpoints. History publication and working-state retention use the exact
-`Request::NumComputedTokens()` frontier (§5).
+upgrade state. A `PrefillDone` request publishes pending prefill state when the
+next round starts (1.5), before local decode or PD handoff; decode itself
+records and publishes no state checkpoints. History publication and
+working-state retention use the exact `Request::NumComputedTokens()` frontier
+(§5).
 
 One forward means one model dispatch, not one kernel launch. The state backend
 handles checkpoint outputs within it: the example's recurrent scan evaluates
@@ -329,6 +330,54 @@ single-forward execution with prefix caching disabled. Narrower state blocks
 must count the entire materialized suffix, not assume that two outputs always
 occupy two adjacent slots. Tests cover small pools that must reject an oversized
 request instead of accepting a request that can never produce a forward.
+
+### 1.5 In-flight prefix sharing
+
+A prompt's final pages used to be published by the admission of its first
+decode. Outside mixed mode that decode gets a round only when no prefill
+scheduled, so while prompts keep arriving, every prompt that had finished its
+prefill kept its pages unpublished, and each new prompt sharing them computed
+them again; prompts sharing an uncached prefix in one round each computed it
+too. Two rules close both gaps:
+
+- **A completed prefill publishes when the next round starts**
+  (`publishPrefilledPages`). Before any role grammar runs, each `PrefillDone`
+  request publishes what its prefill computed: the same
+  `advanceRequestProgress` publication its first decode's admission would make,
+  through `CacheCompletedBlocks`, made earlier. Scheduled stream order is
+  enough (the FIFO data plane runs any hitter's forward after the writer's),
+  so the result need not have landed. The first decode then usually consumes
+  its reserve in place.
+- **A new prompt does not compute what this round computes**
+  (`waitsForComputedPrefix`). Admission records the hashes of the pages each
+  grant that completes a local prompt computes
+  (`AdmissionFeedback::computed_prefix_pages`). A first chunk whose prefix
+  probe leaves one of them among the pages it would compute, past its hit and
+  within what a probe may claim, declines and waits for the next round, where
+  the first rule has published them and the probe hits them. The test reuses
+  the candidate hashes the probe already computed, and since it starts past the
+  hit, a page the writer recomputes although it is cached (a page-aligned
+  prompt's last page) makes no one wait. Page hashes chain, so a shared hash
+  means the whole prefix before it is shared too. Waiting is not an admission
+  failure: it blocks nothing behind it and asks for no retraction. It is also
+  bounded, since each round publishes what the previous one recorded.
+
+What is recorded is what the next round can hit. When every matched group is
+prefix-closed, any published page can end a hit, so every computed page
+counts. A sliding-window or state group matches only where a publication left
+its lookback or a materialized checkpoint, which is the writer's newest
+boundary; there only the last computed page is recorded, so only a prompt that
+shares the writer's whole prefix waits. An incomplete chunk records nothing:
+it holds the line (1.1), so no new prompt follows it in its round. Nor does
+the P role's completed prompt, which awaits its result in
+`PrefillAwaitingResult` and publishes only once that lands, too late for the
+next round. Without prefix reuse (`disable_prefix_cache`) nothing waits.
+
+Letting the second prompt read the pages the first one writes inside the same
+forward, as a cache that registers blocks at allocation time does, is
+deliberately not done. It would require every attention backend, and the state
+and replay groups, to order writes and reads of shared pages within one batch,
+and only the forward boundary guarantees that today.
 
 ## 2. Retraction: when admission fails
 
@@ -645,6 +694,10 @@ no victim and nothing could free that page.
   sources are granted away in the same round — and only such an op may be
   fenced ahead of the plan's page reuse by the runtime. A new store site
   chooses its guard explicitly (`StartPendingStores` has no default).
+- A completed prefill's pages are published by the next plan build, whether
+  or not its first decode runs there (1.5). A new prompt waits only for pages
+  its round computes and the next round publishes, never on an admission
+  failure, so it never waits twice for the same pages.
 - Only computed tokens are published as a prefix, and exactly those.
   `Request::NumComputedTokens()` is the one frontier for prefix hashing and
   retention on admission and retraction: the scheduled window end while

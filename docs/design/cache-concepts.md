@@ -603,8 +603,10 @@ Its responsibilities:
   retention reclaims the slots it publishes, and victim planning sees the
   pre-publication state so a request's own expired, still-unpublished tail
   can fund the same admission. `CacheCompletedBlocks` takes the same
-  `RequestProgress` for finish, retraction and remote completion, which
-  publish without admitting.
+  `RequestProgress` for finish, retraction, remote completion and a completed
+  prefill at the start of the next round
+  ([Scheduler §1.5](scheduler.md#15-in-flight-prefix-sharing)), which publish
+  without admitting.
 * **Prefix publication.** `CacheFullBlocks` / `CacheCompletedBlocks` register
   computed blocks into the prefix indexes for later requests. Prefix-closed
   groups match first; non-closed groups (SWA, Mamba) match only within the
@@ -633,13 +635,13 @@ Its responsibilities:
   acquire/contains/pin queries. During prefill, each completed scheduling
   boundary queues all newly published full-attention pages and any published
   Endpoint/Promoted state checkpoints; the candidates are merged into a batched
-  writeback. The first decode admission from `PrefillDone` applies the same
-  policy to the final prompt boundary. Ordinary decode publishes history-cache
-  Device entries but no state entries; full-attention pages do not stream to
-  Host during decode. At finish or retraction, eligible non-state Device pages
-  and the newest existing prefill checkpoint per state group are queued
-  before request ownership is released. Ordinary sliding-window entries
-  always stream when published. The queue is drained by
+  writeback. A `PrefillDone` request applies the same policy to the final
+  prompt boundary when the next round starts. Ordinary decode publishes
+  history-cache Device entries but no state entries; full-attention pages do
+  not stream to Host during decode. At finish or retraction, eligible
+  non-state Device pages and the newest existing prefill checkpoint per state
+  group are queued before request ownership is released. Ordinary
+  sliding-window entries always stream when published. The queue is drained by
   `TierTransferManager::StartPendingStores(guard)`: every store but a
   retraction's snapshot pins its Device sources until the ACK; the snapshot
   store is stream-ordered instead, because its sources are re-granted in the
