@@ -493,6 +493,12 @@ Constraints that follow from the architecture:
   dequantized to BF16 while loading; an E4M3 value times a power of two is
   exact in BF16, so this matches a weight-only MXFP8 GEMM up to accumulation
   order.
+* Startup rejects what HY V4 cannot load or route: quantization other than
+  ModelOpt MXFP8 (such as `--quantization fp8`, block-scaled or W8A8 FP8
+  checkpoints), speculative algorithms other than MTP (speculative decoding
+  uses the checkpoint's MTP layer), and expert placements other than the
+  checkpoint's own order (EPLB, redundant experts, an
+  `--init-expert-location` file).
 * Prefill and mixed batches up to `--prefill-graph-max-tokens` (default:
   the smaller of 2048 and the chunked-prefill size) replay breakable CUDA
   graphs. Only the sparse attention core (cache writes, the indexer top-k and

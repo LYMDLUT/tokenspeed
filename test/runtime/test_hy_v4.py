@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import unittest
 from types import SimpleNamespace
@@ -47,13 +48,21 @@ from tokenspeed.runtime.configs.model_config import (
     _resolve_attention_family,
     configure_dsa_attention,
 )
+from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config, Mxfp8Config
+from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
 from tokenspeed.runtime.layers.quantization.modelopt_mxfp8 import ModelOptMxfp8Config
-from tokenspeed.runtime.models import hy_v4_nextn
+from tokenspeed.runtime.layers.quantization.w8a8_fp8 import W8A8Fp8Config
+from tokenspeed.runtime.models import hy_v4, hy_v4_nextn
 from tokenspeed.runtime.models.hy_v4 import (
+    HYV4Attention,
+    HYV4ForCausalLM,
+    HYV4Model,
+    check_hyv4_quant_config,
+    check_hyv4_speculative_algorithm,
     load_hyv4_weights,
     normalize_hyv4_checkpoint_name,
 )
-from tokenspeed.runtime.models.hy_v4_nextn import HYV4ForCausalLMNextN
+from tokenspeed.runtime.models.hy_v4_nextn import HYV4ForCausalLMNextN, HYV4ModelNextN
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 # Per-layer vectors of the released ``tencent/Hy4-preview`` checkpoint.
@@ -132,6 +141,59 @@ class HYV4ConfigTests(unittest.TestCase):
     def test_rejects_yarn(self):
         with self.assertRaises(ValueError):
             HYV4Config(rope_parameters={"rope_theta": 1e7, "rope_type": "yarn"})
+
+    def test_dense_layers_must_lead_the_stack(self):
+        for mlp_layer_types in (
+            ["dense", "sparse", "dense"],
+            ["sparse", "dense", "dense"],
+            ["dense", "moe", "sparse"],
+        ):
+            with self.subTest(mlp_layer_types=mlp_layer_types):
+                with self.assertRaisesRegex(ValueError, "mlp_layer_types"):
+                    HYV4Config(num_hidden_layers=3, mlp_layer_types=mlp_layer_types)
+        config = HYV4Config(num_hidden_layers=3, mlp_layer_types=["sparse"] * 3)
+        self.assertEqual(config.first_k_dense_replace, 0)
+
+    def test_legacy_rope_scaling_must_be_plain_rope(self):
+        for rope_scaling in (
+            {"type": "yarn", "factor": 4.0},
+            {"rope_type": "linear", "factor": 2.0},
+        ):
+            with self.subTest(rope_scaling=rope_scaling):
+                with self.assertRaisesRegex(ValueError, "plain RoPE"):
+                    HYV4Config(rope_scaling=rope_scaling)
+
+    def test_legacy_rope_scaling_folds_into_rope_parameters(self):
+        config = HYV4Config(rope_scaling={"type": "default", "rope_theta": 5e6})
+        self.assertEqual(config.rope_theta, 5e6)
+        self.assertEqual(config.rope_parameters["rope_type"], "default")
+        self.assertIsNone(config.rope_scaling)
+        for rope_scaling in (None, {}):
+            with self.subTest(rope_scaling=rope_scaling):
+                self.assertEqual(HYV4Config(rope_scaling=rope_scaling).rope_theta, 1e7)
+
+    def test_rope_scaling_must_agree_with_rope_parameters(self):
+        rope_parameters = {"rope_theta": 1e7, "rope_type": "default"}
+        with self.assertRaisesRegex(ValueError, "disagree"):
+            HYV4Config(
+                rope_parameters=rope_parameters, rope_scaling={"rope_theta": 5e6}
+            )
+        config = HYV4Config(
+            rope_parameters=rope_parameters,
+            rope_scaling={"type": "default", "rope_theta": 10000000},
+        )
+        self.assertEqual(config.rope_theta, 1e7)
+
+    def test_explicit_head_dim_must_be_the_rope_slice(self):
+        self.assertEqual(HYV4Config(head_dim=64).head_dim, 64)
+        with self.assertRaisesRegex(ValueError, "head_dim"):
+            HYV4Config(head_dim=128)
+
+    def test_serialized_config_parses_again(self):
+        config = HYV4Config.from_dict(HYV4Config().to_dict())
+        self.assertEqual(config.head_dim, 64)
+        self.assertEqual(config.rope_theta, 1e7)
+        self.assertEqual(config.first_k_dense_replace, 1)
 
     def test_runtime_attention_config_is_dsa(self):
         config = HYV4Config()
@@ -321,6 +383,17 @@ class HYV4WeightLoaderTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "hc_attn_layer.hc_fn"):
             self._load(owner, self._CHECKPOINT[:-2])
 
+    def test_fused_parameter_missing_a_shard_raises(self):
+        qkv_a, indexer, gate_up = self._PARAMS[:3]
+        for dropped, fused in zip(
+            self._CHECKPOINT[:6], (qkv_a, qkv_a, indexer, indexer, gate_up, gate_up)
+        ):
+            with self.subTest(dropped=dropped):
+                owner, _ = _owner_with_params(self._PARAMS)
+                checkpoint = [name for name in self._CHECKPOINT if name != dropped]
+                with self.assertRaisesRegex(RuntimeError, re.escape(fused)):
+                    self._load(owner, checkpoint)
+
     def test_shared_parameters_may_stay_unloaded(self):
         owner, _ = _owner_with_params(self._PARAMS + ["lm_head.weight"])
         self._load(owner, self._CHECKPOINT, shared_params=("lm_head.",))
@@ -418,6 +491,126 @@ class HYV4WeightLoaderTests(unittest.TestCase):
         self.assertEqual(
             captured["kwargs"]["shared_params"], ("model.embed_tokens.", "lm_head.")
         )
+
+
+class HYV4QuantizationTests(unittest.TestCase):
+    def test_quantization_other_than_modelopt_mxfp8_is_rejected(self):
+        for label, quant_config in (
+            (
+                "block-scale",
+                Fp8Config(
+                    is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128]
+                ),
+            ),
+            ("per-tensor", Fp8Config(is_checkpoint_fp8_serialized=True)),
+            ("online", Fp8Config()),
+            (
+                "mxfp8",
+                Mxfp8Config(
+                    is_checkpoint_fp8_serialized=True, weight_block_size=[1, 32]
+                ),
+            ),
+            ("w8a8-fp8", W8A8Fp8Config(is_checkpoint_fp8_serialized=True)),
+            (
+                "modelopt-mixed",
+                ModelOptMixedConfig(quantized_layers={"model.layers.1.mlp": "FP8"}),
+            ),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(ValueError, "BF16 and ModelOpt MXFP8"):
+                    check_hyv4_quant_config(quant_config)
+
+    def test_bf16_and_modelopt_mxfp8_are_accepted(self):
+        check_hyv4_quant_config(None)
+        check_hyv4_quant_config(
+            ModelOptMxfp8Config.from_config(
+                {"quant_method": "modelopt", "quantization": {"quant_algo": "MXFP8"}}
+            )
+        )
+
+    def test_models_reject_fp8_before_building_layers(self):
+        fp8 = Fp8Config(is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128])
+        for model_cls in (HYV4Model, HYV4ModelNextN):
+            with self.subTest(model=model_cls.__name__):
+                with self.assertRaisesRegex(ValueError, "'fp8' quantization"):
+                    model_cls(HYV4Config(), mapping=SimpleNamespace(), quant_config=fp8)
+
+
+class HYV4SpeculativeAlgorithmTests(unittest.TestCase):
+    def test_drafts_other_than_mtp_are_rejected(self):
+        for algorithm in ("EAGLE3", "DFLASH", "DSPARK"):
+            with self.subTest(algorithm=algorithm):
+                with mock.patch.dict(
+                    hy_v4.global_server_args_dict,
+                    {"speculative_algorithm": algorithm},
+                ):
+                    with self.assertRaisesRegex(
+                        ValueError, f"MTP speculative decoding only.*got {algorithm}"
+                    ):
+                        check_hyv4_speculative_algorithm()
+
+    def test_mtp_and_no_speculation_are_accepted(self):
+        for algorithm in (None, "MTP"):
+            with self.subTest(algorithm=algorithm):
+                with mock.patch.dict(
+                    hy_v4.global_server_args_dict,
+                    {"speculative_algorithm": algorithm},
+                ):
+                    check_hyv4_speculative_algorithm()
+
+    def test_model_rejects_eagle3_before_building_layers(self):
+        with mock.patch.dict(
+            hy_v4.global_server_args_dict, {"speculative_algorithm": "EAGLE3"}
+        ):
+            with self.assertRaisesRegex(ValueError, "MTP speculative decoding only"):
+                HYV4Model(HYV4Config(), mapping=SimpleNamespace())
+
+
+class HYV4SpeculativeCaptureTests(unittest.TestCase):
+    def test_eagle3_and_dflash_capture_are_rejected(self):
+        for setter in (
+            HYV4ForCausalLM.set_eagle3_layers_to_capture,
+            HYV4ForCausalLM.set_dflash_layers_to_capture,
+        ):
+            with self.subTest(setter=setter.__name__):
+                with self.assertRaisesRegex(ValueError, "speculative-algorithm MTP"):
+                    setter(SimpleNamespace(), [1])
+
+
+class HYV4OutputGateTests(unittest.TestCase):
+    @staticmethod
+    def _attention(gate: torch.Tensor, gate_size_per_head: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            linear_gate=lambda _hidden_states: (gate,),
+            gate_size_per_head=gate_size_per_head,
+            v_head_dim=4,
+        )
+
+    def test_elementwise_gate_runs_the_fused_kernel_in_place(self):
+        attn_output, gate = torch.randn(3, 8), torch.randn(3, 8)
+        expected = attn_output * torch.sigmoid(gate)
+        with mock.patch.object(
+            hy_v4, "sigmoid_mul", side_effect=lambda x, g: x.mul_(torch.sigmoid(g))
+        ) as fused:
+            out = HYV4Attention._apply_output_gate(
+                self._attention(gate, 4), attn_output, torch.empty(3, 16)
+            )
+        fused.assert_called_once()
+        (x, g), _ = fused.call_args
+        self.assertIs(x, attn_output)
+        self.assertIs(g, gate)
+        self.assertIs(out, attn_output)
+        torch.testing.assert_close(out, expected)
+
+    def test_headwise_gate_scales_each_head(self):
+        attn_output, gate = torch.randn(3, 8), torch.randn(3, 2)
+        expected = (
+            attn_output.view(3, 2, 4) * torch.sigmoid(gate).unsqueeze(-1)
+        ).reshape(3, 8)
+        out = HYV4Attention._apply_output_gate(
+            self._attention(gate, 1), attn_output, torch.empty(3, 16)
+        )
+        torch.testing.assert_close(out, expected)
 
 
 if __name__ == "__main__":

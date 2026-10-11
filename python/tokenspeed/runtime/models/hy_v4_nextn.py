@@ -40,9 +40,6 @@ from tokenspeed.runtime.execution.context import (
     ForwardContext,
     report_collective_sizing,
 )
-from tokenspeed.runtime.layers.attention.dsa.utils import (
-    _prepare_dsa_topk_for_mtp_decode,
-)
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
@@ -54,6 +51,7 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (
 from tokenspeed.runtime.models.hy_v4 import (
     HYV4DecoderLayer,
     HYV4ForCausalLM,
+    check_hyv4_quant_config,
     finalize_hyv4_attention,
     load_hyv4_weights,
 )
@@ -74,6 +72,7 @@ class HYV4ModelNextN(nn.Module):
         quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
+        check_hyv4_quant_config(quant_config)
         self.config = config
         self.mapping = mapping
         self.vocab_size = config.vocab_size
@@ -139,8 +138,6 @@ class HYV4ModelNextN(nn.Module):
 class HYV4ForCausalLMNextN(HYV4ForCausalLM):
     """HY V4 MTP draft model sharing the target's embedding and LM head."""
 
-    compute_dsa_topk_first_step = True
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -151,6 +148,8 @@ class HYV4ForCausalLMNextN(HYV4ForCausalLM):
         self.config = config
         self.mapping = mapping
         self.quant_config = quant_config
+        # The MTP layer runs its own indexer at every draft step rather than
+        # reusing the target's or the previous step's top-k.
         self.index_share_for_mtp_iteration = False
         if config.num_nextn_predict_layers != 1:
             raise ValueError(
@@ -183,8 +182,6 @@ class HYV4ForCausalLMNextN(HYV4ForCausalLM):
             tp_group=mapping.attn.tp_group,
             dp_lm_head_tp=False,
         )
-
-    prepare_dsa_topk_for_mtp_decode = staticmethod(_prepare_dsa_topk_for_mtp_decode)
 
     @torch.no_grad()
     def forward(
@@ -235,7 +232,7 @@ class HYV4ForCausalLMNextN(HYV4ForCausalLM):
         self.post_load_weights()
 
     def post_load_weights(self) -> None:
-        finalize_hyv4_attention(self.model.decoder.self_attn, self.quant_config)
+        finalize_hyv4_attention(self.model.decoder.self_attn)
 
 
 EntryClass = [HYV4ForCausalLMNextN]
