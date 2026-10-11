@@ -635,7 +635,12 @@ def test_pd_derives_ordinary_transfer_metadata_from_physical_plan(
             kv_cache_dim=8,
         )
     if family == "dsa":
-        extras.update(index_topk=4, index_head_dim=128, index_n_heads=1)
+        extras.update(
+            index_topk=4,
+            index_head_dim=128,
+            index_n_heads=1,
+            padded_prefill_replay=False,
+        )
     spec = classes[family](
         **common,
         **extras,
