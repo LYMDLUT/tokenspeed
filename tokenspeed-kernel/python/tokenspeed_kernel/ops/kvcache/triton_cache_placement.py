@@ -140,6 +140,122 @@ def virtual_slots_to_local(
 
 
 @triton.jit
+def _pack_owned_slots(
+    Source,
+    Lengths,
+    Out,
+    Counts,
+    source_stride,
+    out_stride,
+    COLS: tl.constexpr,
+    HAS_LENGTHS: tl.constexpr,
+    ROWS: tl.constexpr,
+    VIRTUAL_COUNT: tl.constexpr,
+    DEGREE: tl.constexpr,
+    RANK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    col = tl.arange(0, BLOCK)
+    inside = col < COLS
+    raw = tl.load(Source + row * source_stride + col, mask=inside, other=-1)
+    raw = raw.to(tl.int64)
+    selected = inside
+    if HAS_LENGTHS:
+        selected = selected & (col < tl.load(Lengths + row))
+    safe = tl.maximum(raw, 0)
+    local, owner = virtual_block_to_local(safe // ROWS, DEGREE, RANK)
+    owner = owner & selected & (raw >= ROWS) & (raw < VIRTUAL_COUNT * ROWS)
+    dest = tl.cumsum(owner.to(tl.int32), axis=0) - 1
+    count = tl.sum(owner.to(tl.int32), axis=0)
+    # The owned slots land on [0, count) and the -1 fill covers [count, COLS),
+    # so the two stores never touch the same column.
+    tl.store(Out + row * out_stride + dest, local * ROWS + safe % ROWS, mask=owner)
+    tl.store(Out + row * out_stride + col, -1, mask=inside & (col >= count))
+    tl.store(Counts + row, count)
+
+
+def pack_owned_slots(
+    slots: torch.Tensor,
+    lengths: torch.Tensor | None,
+    *,
+    rows_per_page: int,
+    virtual_block_count: int,
+    degree: int,
+    rank: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Translate every row's virtual slots and pack the owned ones first.
+
+    A sparse attention kernel's cost follows each row's selected width, so
+    masking the slots that other context ranks own still pays for them.
+    Packing a row's owned slots in front and returning their count as its
+    selected width lets the kernel skip the rest.
+
+    Args:
+        slots: Integer virtual slots [rows, width]; negative entries are
+            invalid.
+        lengths: Valid leading entries per row [rows], or None when every
+            column is selected.
+        rows_per_page: Unchanged physical rows per owned cache block.
+        virtual_block_count: Scheduler capacity including null block 0.
+        degree: Number of owners.
+        rank: Owner index in [0, degree).
+
+    Returns:
+        Local slots with the dtype and shape of ``slots``, each row holding its
+        owned slots in their selected order followed by -1, and the int32
+        owned count of every row.
+    """
+    if rows_per_page <= 0 or virtual_block_count <= 1 or degree <= 0:
+        raise ValueError(
+            "virtual slot geometry must be positive and include usable pages"
+        )
+    if not 0 <= rank < degree:
+        raise ValueError("virtual slot owner rank is out of range")
+    if slots.dtype not in (torch.int32, torch.int64) or slots.dim() != 2:
+        raise TypeError("packed virtual slots must be a 2-D int32 or int64 tensor")
+    rows, width = slots.shape
+    if lengths is not None and lengths.shape != (rows,):
+        raise ValueError("packed slot lengths must hold one entry per row")
+    out = torch.empty_like(slots, memory_format=torch.contiguous_format)
+    counts = torch.empty(rows, dtype=torch.int32, device=slots.device)
+    if slots.numel() == 0:
+        return out.fill_(-1), counts.zero_()
+    if slots.is_cuda:
+        source = slots if slots.stride(1) == 1 else slots.contiguous()
+        _pack_owned_slots[(rows,)](
+            source,
+            None if lengths is None else lengths.to(torch.int32).contiguous(),
+            out,
+            counts,
+            source.stride(0),
+            out.stride(0),
+            COLS=width,
+            HAS_LENGTHS=lengths is not None,
+            ROWS=rows_per_page,
+            VIRTUAL_COUNT=virtual_block_count,
+            DEGREE=degree,
+            RANK=rank,
+            BLOCK=triton.next_power_of_2(width),
+        )
+        return out, counts
+    local, owned = virtual_slots_to_local(
+        slots.contiguous(),
+        rows_per_page=rows_per_page,
+        virtual_block_count=virtual_block_count,
+        degree=degree,
+        rank=rank,
+    )
+    if lengths is not None:
+        columns = torch.arange(width, device=slots.device)
+        owned &= columns < lengths.to(slots.device).unsqueeze(1)
+    order = torch.argsort((~owned).to(torch.int8), dim=1, stable=True)
+    out.copy_(torch.where(owned, local, -1).gather(1, order))
+    counts.copy_(owned.sum(dim=1))
+    return out, counts
+
+
+@triton.jit
 def _compact_owned_pages(
     Table,
     Lens,

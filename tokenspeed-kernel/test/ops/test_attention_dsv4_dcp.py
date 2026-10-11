@@ -40,7 +40,10 @@ from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import (
 from tokenspeed_kernel.ops.attention.dsv4.triton import (
     dsv4_fused_sparse_compress_cache_insert,
 )
-from tokenspeed_kernel.ops.kvcache.triton_cache_placement import virtual_slots_to_local
+from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
+    pack_owned_slots,
+    virtual_slots_to_local,
+)
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
 
@@ -173,6 +176,98 @@ def test_virtual_slot_translation_rejects_invalid_geometry():
     with pytest.raises(TypeError):
         virtual_slots_to_local(
             slots.float(), rows_per_page=1, virtual_block_count=9, degree=1, rank=0
+        )
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=requires_cuda)])
+@pytest.mark.parametrize("degree", [1, 2, 8])
+@pytest.mark.parametrize("with_lengths", [False, True])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("column_step", [1, 2])
+def test_packed_owned_slots_keep_the_selection_order(
+    device, degree, with_lengths, dtype, column_step
+):
+    rows, width, page_rows = 37, 2051, 64
+    virtual_count = 1 + 16 * degree
+    generator = torch.Generator().manual_seed(degree)
+    # A wider buffer sliced to the selected width, as a padded top-k workspace
+    # is; a column step of two leaves the slots without a unit column stride.
+    slots = torch.randint(
+        -3,
+        virtual_count * page_rows + 5,
+        (rows, (width + 13) * column_step),
+        dtype=dtype,
+        generator=generator,
+    )[:, : width * column_step : column_step]
+    lengths = (
+        torch.randint(0, width + 1, (rows,), dtype=dtype, generator=generator)
+        if with_lengths
+        else None
+    )
+    selected = torch.ones(rows, width, dtype=torch.bool)
+    if lengths is not None:
+        selected = torch.arange(width) < lengths.long().unsqueeze(1)
+    valid = selected & (slots >= page_rows) & (slots < virtual_count * page_rows)
+    total = torch.zeros(rows, dtype=torch.int64)
+    for rank in range(degree):
+        packed, counts = pack_owned_slots(
+            slots.to(device),
+            None if lengths is None else lengths.to(device),
+            rows_per_page=page_rows,
+            virtual_block_count=virtual_count,
+            degree=degree,
+            rank=rank,
+        )
+        assert packed.dtype == slots.dtype and counts.dtype == torch.int32
+        local, owned = _reference_translation(
+            slots.long(), page_rows, virtual_count, degree, rank
+        )
+        owned &= selected
+        packed, counts = packed.cpu().long(), counts.cpu().long()
+        for row in range(rows):
+            expected = local[row][owned[row]]
+            count = expected.numel()
+            assert counts[row] == count
+            assert torch.equal(packed[row, :count], expected)
+            assert (packed[row, count:] == -1).all()
+        total += counts
+    # The ranks' packed rows partition the valid selected slots.
+    assert torch.equal(total, valid.sum(dim=1))
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=requires_cuda)])
+def test_packed_owned_slots_without_columns_count_zero(device):
+    slots = torch.empty((3, 0), dtype=torch.int32, device=device)
+    packed, counts = pack_owned_slots(
+        slots, None, rows_per_page=1, virtual_block_count=17, degree=2, rank=0
+    )
+    assert packed.shape == (3, 0)
+    assert torch.equal(counts.cpu(), torch.zeros(3, dtype=torch.int32))
+
+
+def test_packed_owned_slots_reject_invalid_inputs():
+    slots = torch.arange(16, dtype=torch.int32).view(2, 8)
+    with pytest.raises(ValueError, match="owner rank"):
+        pack_owned_slots(
+            slots, None, rows_per_page=1, virtual_block_count=17, degree=2, rank=2
+        )
+    with pytest.raises(TypeError):
+        pack_owned_slots(
+            slots.view(-1),
+            None,
+            rows_per_page=1,
+            virtual_block_count=17,
+            degree=1,
+            rank=0,
+        )
+    with pytest.raises(ValueError, match="one entry per row"):
+        pack_owned_slots(
+            slots,
+            torch.ones(3, dtype=torch.int32),
+            rows_per_page=1,
+            virtual_block_count=17,
+            degree=1,
+            rank=0,
         )
 
 
