@@ -224,7 +224,8 @@ def moe_wna16_marlin_gemm(
     Args:
         a: bf16 activations ``[size_m, size_k]``.
         c: Optional output ``[size_m * top_k, size_n]``; allocated when None.
-            Must be zero-filled by the caller if experts can be masked (EP).
+            Rows of routes to expert ``-1`` stay unwritten, with or without
+            EP, so a caller that reads them must zero-fill ``c``.
         b_q_weight: Marlin-repacked weights ``[E, size_k/16, size_n*bits/2]``
             int32.
         b_scales: Marlin-permuted scales ``[E, size_k/32, size_n]``
@@ -239,7 +240,10 @@ def moe_wna16_marlin_gemm(
         moe_block_size: Token block size used by the alignment step (8-64).
         top_k: Routes per token.
         mul_topk_weights: Scale outputs by ``topk_weights`` (GEMM2 finalize).
-        is_ep: Expert-parallel mode; out-of-range expert ids are skipped.
+        is_ep: Skip blocks of expert id -1, the alignment's lane for ids
+            outside its expert range (``-1`` slots included). Must be true
+            whenever such routes can occur, EP or not: false reads expert
+            -1's weights.
         size_m/size_n/size_k: GEMM problem shape.
         use_fp32_reduce: Reduce partial tiles in fp32 scratch (recommended).
 

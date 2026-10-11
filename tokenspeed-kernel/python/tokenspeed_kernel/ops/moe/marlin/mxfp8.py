@@ -40,6 +40,8 @@ GEMM; the dequant is exact, so only the accumulation order changes.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.moe.marlin.mxfp4 import _swiglu_limit
@@ -96,6 +98,15 @@ def _dense_scratch(
             ),
         )
     return _DENSE_SCRATCH[key]
+
+
+@dataclass(frozen=True)
+class _MarlinMxfp8State:
+    expert_start: int
+    hidden_size: int
+    ispp: int
+    cutlass_swiglu_limit: torch.Tensor | None
+    dense_prefill: bool
 
 
 @triton.jit
@@ -272,15 +283,13 @@ def marlin_mxfp8_moe_weights(plan: dict, w: torch.nn.Module) -> None:
     float8_e4m3fn and ``w13_weight_scale_inv`` / ``w2_weight_scale_inv`` raw
     E8M0 bytes as uint8 ``[E, N, K//32]``. Output: Marlin-repacked int32
     weights and permuted float8_e8m0fnu scales written back under the same
-    names, plus the global id of the first local expert.
+    names, and the expert geometry in ``w._moe_backend_state``, which must be
+    None until then.
     """
-    names = ("w13_weight", "w13_weight_scale_inv", "w2_weight", "w2_weight_scale_inv")
-    if any(not hasattr(w, name) for name in names):
-        raise ValueError("MXFP8 MoE weights are incomplete for Marlin repack")
-    if getattr(w, "_marlin_repacked", False):
+    if isinstance(w._moe_backend_state, _MarlinMxfp8State):
         return
 
-    activation = plan.get("activation") or getattr(w, "activation", "silu")
+    activation = plan["activation"] or w.activation
     if activation not in {"silu", "swiglu"}:
         raise ValueError(f"Marlin MXFP8 MoE does not support activation {activation!r}")
     _swiglu_limit(w)
@@ -362,26 +371,25 @@ def marlin_mxfp8_moe_weights(plan: dict, w: torch.nn.Module) -> None:
     w.w2_weight = torch.nn.Parameter(w2_marlin, requires_grad=False)
     w.w2_weight_scale_inv = torch.nn.Parameter(w2_scale_marlin, requires_grad=False)
 
-    # EP ranks own contiguous expert ranges. Routes to any other expert land in
-    # the align kernel's invalid lane, which the EP GEMM skips.
-    ep_size = int(getattr(w, "ep_size", 1))
-    w._marlin_expert_start = (
-        int(getattr(w, "ep_rank", 0)) * num_experts if ep_size > 1 else 0
-    )
-    w._marlin_hidden_size = hidden
-    w._marlin_ispp = ispp
     limit = _swiglu_limit(w)
-    w._cutlass_swiglu_limit = (
-        None
-        if limit is None
-        else torch.full((num_experts,), limit, dtype=torch.float32, device=device)
-    )
     # hidden is already a multiple of the dequant K width (_HIDDEN_ALIGNMENT).
-    w._marlin_dense_prefill = ispp % (_DEQUANT_K_TILES * _TILE_K) == 0
-    if w._marlin_dense_prefill:
+    dense_prefill = ispp % (_DEQUANT_K_TILES * _TILE_K) == 0
+    if dense_prefill:
         # Allocated with the weights so KV sizing sees it and no graph pool owns it.
         _dense_scratch(device, num_experts, hidden, ispp)
-    w._marlin_repacked = True
+    w._moe_backend_state = _MarlinMxfp8State(
+        # EP ranks own contiguous expert ranges. Routes to any other expert
+        # land in the align kernel's invalid lane, which the GEMMs skip.
+        expert_start=w.ep_rank * num_experts,
+        hidden_size=hidden,
+        ispp=ispp,
+        cutlass_swiglu_limit=(
+            None
+            if limit is None
+            else torch.full((num_experts,), limit, dtype=torch.float32, device=device)
+        ),
+        dense_prefill=dense_prefill,
+    )
 
 
 @register_kernel(
@@ -401,6 +409,9 @@ def marlin_mxfp8_moe_weights(plan: dict, w: torch.nn.Module) -> None:
         "activation": frozenset({"silu", "swiglu"}),
         # silu_and_mul has no alpha/beta (see _swiglu_limit): standard form only.
         "swiglu_form": frozenset({"standard"}),
+        # Large batches run FlashInfer CUTLASS, whose permutation needs
+        # distinct expert ids per token.
+        "expert_id_repeats": frozenset({False}),
         "routing_mode": frozenset({"precomputed_topk"}),
         "supports_deferred_finalize": frozenset({False}),
         "deterministic_finalize": frozenset({False, True}),
@@ -434,14 +445,16 @@ def marlin_mxfp8_precomputed_moe_apply(
             ``deterministic_finalize`` selects the stable route alignment on
             the Marlin path and the unfused top-k reduction on the dense one.
         x: bf16 hidden states ``[tokens, hidden]``.
-        w: Module holding the Marlin-repacked ``w13_weight``/``w2_weight``
-            (int32) and permuted ``w13_weight_scale_inv``/``w2_weight_scale_inv``
-            (float8_e8m0fnu) from :func:`marlin_mxfp8_moe_weights`, plus
-            ``num_local_experts``/``ep_size`` for EP.
+        w: MoE layer processed by :func:`marlin_mxfp8_moe_weights`: the
+            Marlin-repacked ``w13_weight``/``w2_weight`` (int32), permuted
+            ``w13_weight_scale_inv``/``w2_weight_scale_inv`` (float8_e8m0fnu)
+            and ``_moe_backend_state``, plus the layer's ``ep_size``/``ep_rank``
+            and ``tp_size``/``tp_rank``.
         router_logits: Unused; routing is precomputed.
         topk_weights: Route weights ``[tokens, top_k]``.
-        topk_ids: Global expert ids ``[tokens, top_k]``. Ids outside this
-            rank's expert range (and ``-1`` slots) contribute zero.
+        topk_ids: Global expert ids ``[tokens, top_k]``; a token's valid ids
+            are distinct. Ids outside this rank's expert range, ``-1``
+            included, contribute zero.
         num_tokens_global: Unused; distributed EP dispatch is not owned here.
         max_num_tokens_per_gpu: Unused capacity hint.
         do_finalize: Must be true (no deferred finalize).
@@ -459,29 +472,28 @@ def marlin_mxfp8_precomputed_moe_apply(
     if x.dtype != torch.bfloat16:
         raise TypeError(f"Marlin MXFP8 MoE requires bf16 activations, got {x.dtype}")
 
-    activation = plan.get("activation") or getattr(w, "activation", "silu")
+    activation = plan["activation"] or w.activation
     if activation not in {"silu", "swiglu"}:
         raise ValueError(f"Marlin MXFP8 MoE does not support activation {activation!r}")
-    hidden = int(w._marlin_hidden_size)
-    ispp = int(w._marlin_ispp)
+    state = w._moe_backend_state
+    if not isinstance(state, _MarlinMxfp8State):
+        raise TypeError("invalid Marlin MXFP8 MoE state")
+    hidden = state.hidden_size
+    ispp = state.ispp
     num_local_experts = int(w.w13_weight.shape[0])
-    ep_size = int(getattr(w, "ep_size", 1))
-    is_ep = ep_size > 1
 
     topk_ids = topk_ids.to(torch.int32)
     num_tokens, top_k = topk_ids.shape
     # Size blocks by the routes each expert receives across all ranks: in EP
     # only 1/ep_size of the routes land on this rank's experts.
-    routes_per_expert = num_tokens * top_k / (num_local_experts * ep_size)
-    if w._marlin_dense_prefill and routes_per_expert >= _DENSE_MIN_ROUTES_PER_EXPERT:
-        return _dense_bf16_apply(
-            plan, x, w, topk_weights, topk_ids, hidden, ispp, enable_pdl
-        )
+    routes_per_expert = num_tokens * top_k / (num_local_experts * w.ep_size)
+    if state.dense_prefill and routes_per_expert >= _DENSE_MIN_ROUTES_PER_EXPERT:
+        return _dense_bf16_apply(plan, x, w, state, topk_weights, topk_ids, enable_pdl)
 
     # Ids stay global: the align kernel and the two Triton kernels below test
     # them against this rank's range instead of a separately remapped copy.
     topk_ids = topk_ids.contiguous()
-    expert_start = int(w._marlin_expert_start)
+    expert_start = state.expert_start
     topk_weights = topk_weights.to(torch.float32)
 
     block_m = _block_size_m(routes_per_expert)
@@ -496,7 +508,9 @@ def marlin_mxfp8_precomputed_moe_apply(
 
     # GEMMs only touch local routes (1/ep_size of the rows), so the outputs are
     # left uninitialized and the activation and the finalize skip the rest
-    # instead of streaming all T * top_k rows.
+    # instead of streaming all T * top_k rows. The other routes, -1 included,
+    # fill blocks of expert id -1 with or without EP; only the EP
+    # specialization skips them instead of reading expert -1's weights.
     num_routes = num_tokens * top_k
     gemm1_n = 2 * ispp
     intermediate1 = moe_wna16_marlin_gemm(
@@ -513,7 +527,7 @@ def marlin_mxfp8_precomputed_moe_apply(
         moe_block_size=block_m,
         top_k=top_k,
         mul_topk_weights=False,
-        is_ep=is_ep,
+        is_ep=True,
         size_m=num_tokens,
         size_n=gemm1_n,
         size_k=hidden,
@@ -551,7 +565,7 @@ def marlin_mxfp8_precomputed_moe_apply(
         moe_block_size=block_m,
         top_k=1,
         mul_topk_weights=True,
-        is_ep=is_ep,
+        is_ep=True,
         size_m=num_routes,
         size_n=hidden,
         size_k=ispp,
@@ -576,17 +590,16 @@ def _dense_bf16_apply(
     plan: dict,
     x: torch.Tensor,
     w: torch.nn.Module,
+    state: _MarlinMxfp8State,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    hidden: int,
-    ispp: int,
     enable_pdl: bool,
 ) -> torch.Tensor:
     num_local_experts = int(w.w13_weight.shape[0])
-    w13, w2 = _dense_scratch(x.device, num_local_experts, hidden, ispp)
+    w13, w2 = _dense_scratch(x.device, num_local_experts, state.hidden_size, state.ispp)
     dequantize_marlin_mxfp8(w.w13_weight, w.w13_weight_scale_inv, w13, swap_halves=True)
     dequantize_marlin_mxfp8(w.w2_weight, w.w2_weight_scale_inv, w2, swap_halves=False)
-    limit = w._cutlass_swiglu_limit
+    limit = state.cutlass_swiglu_limit
     return cutlass_fused_moe(
         input=x,
         token_selected_experts=topk_ids,
@@ -598,10 +611,10 @@ def _dense_bf16_apply(
         swiglu_alpha=None,
         swiglu_beta=None,
         swiglu_limit=limit,
-        ep_size=int(getattr(w, "ep_size", 1)),
-        ep_rank=int(getattr(w, "ep_rank", 0)),
-        tp_size=int(getattr(w, "tp_size", 1)),
-        tp_rank=int(getattr(w, "tp_rank", 0)),
+        ep_size=w.ep_size,
+        ep_rank=w.ep_rank,
+        tp_size=w.tp_size,
+        tp_rank=w.tp_rank,
         tune_max_num_tokens=get_autotune_max_num_tokens(),
         activation_type=(
             ActivationType.Swiglu if limit is None else ActivationType.SwigluBias

@@ -107,9 +107,12 @@ class _Experts(torch.nn.Module):
         self.num_local_experts = raw["w13_weight"].shape[0]
         self.ep_size = ep_size
         self.ep_rank = ep_rank
+        self.tp_size = 1
+        self.tp_rank = 0
         self.activation = "swiglu"
         self.swiglu_arg = SimpleNamespace(alpha=None, limit=limit)
         self.swiglu_beta = None
+        self._moe_backend_state = None
 
 
 def _routing(num_tokens, num_experts, top_k, generator):
@@ -174,6 +177,31 @@ def test_marlin_mxfp8_honors_swiglu_clamp(ep_size: int):
     assert (expected - unclamped).abs().max() > 0.5 * expected.abs().max()
     actual = _run(raw, x, topk_ids, topk_weights, ep_size, limit)
     _assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("num_tokens", [5, 300])
+def test_marlin_mxfp8_without_ep_skips_invalid_and_repeated_ids(num_tokens: int):
+    """Without EP, ``-1`` slots contribute zero and a repeated id counts once
+    per slot. 300 tokens (1200 routes) outgrow the small-batch alignment
+    kernel; both batches stay below the dense threshold, so the Marlin GEMMs
+    see the -1 blocks."""
+    _requires_sm90()
+    generator = torch.Generator(device="cuda").manual_seed(37)
+    num_experts, top_k, hidden, ispp = 8, 4, 512, 256
+    assert num_tokens * top_k / num_experts < mxfp8._DENSE_MIN_ROUTES_PER_EXPERT
+    raw = _make_weights(num_experts, hidden, ispp, generator)
+    x = torch.randn(num_tokens, hidden, generator=generator, device="cuda").to(
+        torch.bfloat16
+    )
+    topk_ids, topk_weights = _routing(num_tokens, num_experts, top_k, generator)
+    topk_ids[:, 1] = topk_ids[:, 0]
+    topk_ids[::2, 2] = -1
+    topk_ids[1] = -1
+
+    expected = _reference(x, raw, topk_ids, topk_weights, limit=None)
+    actual = _run(raw, x, topk_ids, topk_weights, ep_size=1, limit=None)
+    _assert_close(actual, expected)
+    assert torch.count_nonzero(actual[1]) == 0
 
 
 @pytest.mark.parametrize("num_experts,ep_size", [(16, 1), (300, 1), (64, 8), (1100, 1)])
@@ -314,7 +342,7 @@ def test_dense_prefill_path_matches_reference(
     ep_size: int, limit: float | None, monkeypatch
 ):
     """Prefill-sized batches take the dequant + CUTLASS bf16 path; it must match
-    the reference and the Marlin path it replaces."""
+    the reference and the Marlin path it replaces, ``-1`` slots included."""
     _requires_sm90()
     generator = torch.Generator(device="cuda").manual_seed(29)
     num_experts, top_k, hidden, ispp, num_tokens = 16, 4, 512, 256, 1024
@@ -324,6 +352,7 @@ def test_dense_prefill_path_matches_reference(
         torch.bfloat16
     )
     topk_ids, topk_weights = _routing(num_tokens, num_experts, top_k, generator)
+    topk_ids[::3, 1] = -1
 
     expected = _reference(x, raw, topk_ids, topk_weights, limit)
     dense = _run(raw, x, topk_ids, topk_weights, ep_size, limit)
@@ -344,7 +373,7 @@ def test_prefill_stays_on_marlin_when_dequant_cannot_tile_ispp():
     w = _Experts({k: v.clone() for k, v in raw.items()}, 1, 0, None)
     plan = {"activation": "swiglu", "deterministic_finalize": True}
     marlin_mxfp8_moe_weights(plan, w)
-    assert not w._marlin_dense_prefill
+    assert not w._moe_backend_state.dense_prefill
     x = torch.randn(num_tokens, hidden, generator=generator, device="cuda").to(
         torch.bfloat16
     )
