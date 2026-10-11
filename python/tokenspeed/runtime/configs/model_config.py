@@ -231,11 +231,11 @@ def configure_glm_attention(model_config) -> None:
     model_config.index_kpool = getattr(mla_config, "index_kpool", None)
     model_config.index_topk_pattern = getattr(mla_config, "index_topk_pattern", None)
     # HY V4's attention break holds every read of the live metadata and slices
-    # off the padded rows; its MTP draft has not been validated under prefill
-    # graphs yet.
-    model_config.dsa_padded_prefill_replay = (
-        resolve_architecture(model_config.hf_config) == "HYV4ForCausalLM"
-    )
+    # off the padded rows. The MTP draft shares that attention and replays no
+    # prefill graph of its own, so it leaves the target's prefill graph on.
+    model_config.dsa_padded_prefill_replay = resolve_architecture(
+        model_config.hf_config
+    ) in ("HYV4ForCausalLM", "HYV4ForCausalLMNextN")
 
     model_config.scaling = 1 / math.sqrt(
         model_config.qk_nope_head_dim + model_config.qk_rope_head_dim

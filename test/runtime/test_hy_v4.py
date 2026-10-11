@@ -142,10 +142,11 @@ class HYV4ConfigTests(unittest.TestCase):
         self.assertEqual(model_config.index_topk, 2048)
         self.assertAlmostEqual(model_config.scaling, 256**-0.5)
 
-    def test_only_the_target_replays_padded_prefill_graphs(self):
+    def test_target_and_draft_declare_padded_prefill_replay(self):
         for arch, expected in (
             ("HYV4ForCausalLM", True),
-            ("HYV4ForCausalLMNextN", False),
+            ("HYV4ForCausalLMNextN", True),
+            ("GlmMoeDsaForCausalLM", False),
         ):
             config = HYV4Config(architectures=[arch])
             model_config = SimpleNamespace(hf_text_config=config, hf_config=config)
