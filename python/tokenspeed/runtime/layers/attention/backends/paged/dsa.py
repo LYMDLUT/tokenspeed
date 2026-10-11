@@ -623,7 +623,7 @@ class DSABackend(PagedAttentionBackend):
                 local_lse,
                 group=self.dcp_group,
                 rank=self.dcp_rank,
-                sink=None if layer.attn_sink is None else layer.attn_sink,
+                sink=layer.attn_sink,
             )
         # GLM's sparse-prefill path writes both the latent KV and index_k before
         # entering this method, but bypasses the backend's forward and its
@@ -795,7 +795,7 @@ class DSABackend(PagedAttentionBackend):
                 local_lse,
                 group=self.dcp_group,
                 rank=self.dcp_rank,
-                sink=None if layer.attn_sink is None else layer.attn_sink,
+                sink=layer.attn_sink,
             ).to(
                 torch.bfloat16 if q_view.dtype == torch.float8_e4m3fn else q_view.dtype
             )

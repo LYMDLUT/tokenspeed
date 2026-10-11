@@ -658,9 +658,10 @@ class HYV4DecoderLayer(nn.Module):
     RMSNorm before each sub-block is fused into the iHC reduce pass.
 
     iHC requires the attention and MLP to see full token rows: the boundary
-    reduces and re-scatters every channel of a token at once, so this layer is
-    built for attention data parallelism (``attn_tp_size == 1``) and rejects a
-    reduce-scatter attention layout at construction time.
+    reduces and re-scatters every channel of a token at once. Attention data
+    parallelism (``attn_tp_size == 1``) or a layout where both the dense and
+    the MoE layers all-reduce provides them; a reduce-scatter layout is
+    rejected at construction time.
     """
 
     def __init__(
@@ -1011,7 +1012,7 @@ class HYV4ForCausalLM(GlmMoeDsaForCausalLM):
             (
                 (name, tensor)
                 for name, tensor in weights
-                if not name.startswith("model.mtp_layers.")
+                if self.checkpoint_weight_name_filter(name)
             ),
             module_prefix="model",
             checkpoint_prefix="model",
