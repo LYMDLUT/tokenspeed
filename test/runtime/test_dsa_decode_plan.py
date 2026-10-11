@@ -113,3 +113,24 @@ def test_mixed_round_plans_only_its_decode_rows(monkeypatch):
 
     _mixed_round(backend, 3, _seq_lens(41, 301, 501))
     assert planned[-1] == [41, 41, 301, 301, 501, 501]
+
+
+def test_draft_mixed_refresh_plans_only_its_decode_rows(monkeypatch):
+    # A mixed round's draft first step gets its decode metadata from the
+    # refresh, which still carries the round's extend requests; its decode
+    # top-k scores only the rows past them, so the plan must start there too.
+    planned = []
+    backend = _backend(monkeypatch, planned, spec_num_tokens=2)
+    backend.is_draft = True
+    seq_lens = _seq_lens(40, 300, 500)
+    _mixed_round(backend, 1, seq_lens)
+    assert planned == []
+
+    page_table = torch.zeros(3, 8, dtype=torch.int32)
+    backend.refresh_decode_metadata(3, 3, seq_lens, page_table, num_extends=1)
+    view = backend.forward_decode_metadata
+    assert view._dsa_seq_lens_2d.flatten().tolist() == [40, 40, 300, 300, 500, 500]
+    assert planned == [[300, 300, 500, 500]]
+
+    backend.refresh_decode_metadata(3, 3, _seq_lens(41, 301, 501), page_table)
+    assert planned[-1] == [41, 41, 301, 301, 501, 501]

@@ -264,10 +264,10 @@ class DSABackend(PagedAttentionBackend):
     # ------------------------------------------------------------------
 
     def _refresh_decode_plan(
-        self, bs: int, seq_lens: torch.Tensor, *, plan_from_row: int
+        self, bs: int, seq_lens: torch.Tensor, *, num_extends: int
     ) -> None:
-        """Write this round's per-token decode lengths, and their paged-MQA-
-        logits plan from row ``plan_from_row`` on, into the buffers of ``bs``.
+        """Write this round's per-token decode lengths, and the paged-MQA-
+        logits plan of its decode rows, into the buffers of ``bs``.
 
         The paged-MQA-logits kernel only supports next_n == 1, so each verify
         token is its own row (``bs * spec_num_tokens`` rows); the per-token
@@ -277,7 +277,14 @@ class DSABackend(PagedAttentionBackend):
         and a mixed round reuses, so every refresh writes them in place.
         Rebinding them would leave the graph replaying a stale plan against
         live lengths, which the kernel's scheduler can run past forever.
+
+        The decode top-k scores only the rows past the ``num_extends`` leading
+        extend requests of a mixed round (the target's, or the draft's first
+        step after it), so the plan covers exactly those: a plan over the
+        extend rows too schedules the kernel past the rows it is given. A
+        round without decode rows never reads the plan; it covers every row.
         """
+        plan_from_row = num_extends * self.spec_num_tokens if num_extends < bs else 0
         seq_lens_2d = (
             seq_lens[:bs].unsqueeze(1).expand(-1, self.spec_num_tokens).reshape(-1, 1)
         )
@@ -318,7 +325,7 @@ class DSABackend(PagedAttentionBackend):
             num_extends=num_extends,
             for_graph_replay=for_graph_replay,
         )
-        self._refresh_decode_plan(bs, seq_lens, plan_from_row=0)
+        self._refresh_decode_plan(bs, seq_lens, num_extends=num_extends)
 
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
         metadata = self.forward_decode_metadata
@@ -369,15 +376,7 @@ class DSABackend(PagedAttentionBackend):
         # A draft's plan is rebuilt by the wrapper's refresh_decode_metadata
         # after this init (the unified draft contract).
         if forward_mode.is_mixed() and not self.is_draft:
-            # Plan the decode rows only, past the extend requests' per-token
-            # block; without decode rows the plan is unused and covers all.
-            self._refresh_decode_plan(
-                bs,
-                seq_lens,
-                plan_from_row=(
-                    num_extends * self.spec_num_tokens if num_extends < bs else 0
-                ),
-            )
+            self._refresh_decode_plan(bs, seq_lens, num_extends=num_extends)
 
         self._prefill_page_table = None
         if num_extends > 0 and forward_mode.is_extend_or_mixed():
