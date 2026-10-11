@@ -69,7 +69,6 @@ if platform.is_hopper_plus:
     )
 
 _decode_sched_meta_cache: dict[tuple, object] = {}
-_query_workspace_cache: dict[tuple, torch.Tensor] = {}
 _sm_counts: dict[int, int] = {}
 
 # FlashMLA's sparse prefill kernel walks a row's columns in pairs of 64-column
@@ -87,20 +86,25 @@ def _sm_count(device: torch.device) -> int:
     return count
 
 
-def _flashmla_sparse_column_splits(rows: int, width: int, device: torch.device) -> int:
+def _flashmla_sparse_column_splits(
+    rows: int, padded_heads: int, width: int, device: torch.device
+) -> int:
     """Column splits per query row for a FlashMLA sparse prefill launch.
 
-    The kernel attends each query row in one CTA that walks the row's selected
-    columns serially, so a launch with fewer rows than SMs (decode, verify,
-    short prompts) is bound by one CTA's walk while most SMs idle. Slicing the
+    The kernel attends every ``_flashmla_sparse_prefill_head_multiple()``
+    heads of a query row in one CTA that walks the row's selected columns
+    serially, so a launch with fewer CTAs than SMs (decode, verify, short
+    prompts) is bound by one CTA's walk while most SMs idle. Slicing the
     columns into independent rows, merged afterwards by their LSE, spreads
-    that walk over the idle SMs; it stops while the split launch still fits
-    one wave, past which splitting adds work without shortening the launch.
+    that walk over the idle SMs. Splitting stops while the split launch,
+    ``rows * ctas_per_row * splits`` CTAs, still fits one wave, past which it
+    adds work without shortening the launch.
     """
     sms = _sm_count(device)
+    ctas_per_row = padded_heads // _flashmla_sparse_prefill_head_multiple()
     splits = 1
     while (
-        rows * splits * 2 <= sms
+        rows * ctas_per_row * splits * 2 <= sms
         and width % (splits * 2 * _FLASHMLA_SPARSE_TOPK_ALIGN) == 0
     ):
         splits *= 2
@@ -125,18 +129,15 @@ def _flashmla_sparse_decode_padded_heads(num_heads: int) -> int:
     return num_heads
 
 
-def _get_query_workspace(
-    *,
-    q: torch.Tensor,
-    shape: tuple[int, ...],
-) -> torch.Tensor:
-    key = (q.device, q.dtype, shape)
-    workspace = _query_workspace_cache.get(key)
-    if workspace is None:
-        workspace = torch.empty(shape, dtype=q.dtype, device=q.device)
-        workspace.zero_()
-        _query_workspace_cache[key] = workspace
-    return workspace
+def _pad_query_heads(q: torch.Tensor, padded_heads: int) -> torch.Tensor:
+    # Token counts vary per batch, so a per-shape workspace cache would grow
+    # without bound; the caching allocator (or the graph pool under capture)
+    # recycles these instead.
+    actual_heads = q.shape[-2]
+    q_padded = q.new_empty((*q.shape[:-2], padded_heads, q.shape[-1]))
+    q_padded[..., :actual_heads, :].copy_(q)
+    q_padded[..., actual_heads:, :].zero_()
+    return q_padded
 
 
 def _pad_prefill_query(q: torch.Tensor) -> tuple[torch.Tensor, int]:
@@ -145,13 +146,7 @@ def _pad_prefill_query(q: torch.Tensor) -> tuple[torch.Tensor, int]:
     padded_heads = _flashmla_sparse_prefill_padded_heads(actual_heads)
     if padded_heads == actual_heads:
         return q, actual_heads
-    # Token counts vary per batch, so a per-shape workspace cache would grow
-    # without bound; the caching allocator (or the graph pool under capture)
-    # recycles these instead.
-    q_padded = q.new_empty((q.shape[0], padded_heads, q.shape[2]))
-    q_padded[:, :actual_heads, :].copy_(q)
-    q_padded[:, actual_heads:, :].zero_()
-    return q_padded, actual_heads
+    return _pad_query_heads(q, padded_heads), actual_heads
 
 
 def _pad_decode_query(q: torch.Tensor, q_len_per_req: int) -> tuple[torch.Tensor, int]:
@@ -167,13 +162,7 @@ def _pad_decode_query(q: torch.Tensor, q_len_per_req: int) -> tuple[torch.Tensor
     padded_heads = _flashmla_sparse_decode_padded_heads(actual_heads)
     if padded_heads == actual_heads:
         return q, actual_heads
-    q_padded = _get_query_workspace(
-        q=q,
-        shape=(q.shape[0], q.shape[1], padded_heads, q.shape[3]),
-    )
-    q_padded[:, :, :actual_heads, :].copy_(q)
-    q_padded[:, :, actual_heads:, :].zero_()
-    return q_padded, actual_heads
+    return _pad_query_heads(q, padded_heads), actual_heads
 
 
 def _flatten_regular_kv_cache(kv_cache: torch.Tensor, page_size: int) -> torch.Tensor:
@@ -329,7 +318,17 @@ def _finish_sparse_attention(
     result.masked_fill_(empty[:, None, None], 0)
     lse = lse.contiguous().masked_fill(empty[:, None], -float("inf"))
     if out is not None:
-        out.reshape_as(result).copy_(result)
+        if (
+            out.numel() != result.numel()
+            or out.dtype != result.dtype
+            or not out.is_contiguous()
+        ):
+            raise ValueError(
+                "FlashMLA sparse attention output buffer must be a contiguous "
+                f"{result.dtype} tensor of {result.numel()} elements, got "
+                f"{out.dtype} {tuple(out.shape)} with strides {out.stride()}"
+            )
+        out.view(result.shape).copy_(result)
         result = out
     return (result, lse) if return_lse else result
 
@@ -481,6 +480,10 @@ if platform.is_nvidia and platform.is_hopper_plus:
         else:
             result = result[:, :actual_heads, :]
         lse = lse[:, :actual_heads, :].transpose(1, 2).reshape(-1, actual_heads)
+        if return_lse and attn_sink is not None:
+            # flash_mla_with_kvcache, like flash_mla_sparse_fwd, folds the sink
+            # into the output normalization but not into the returned LSE.
+            lse = torch.logaddexp(lse, attn_sink[:actual_heads].to(lse.dtype))
         return _finish_sparse_attention(result, lse, slots, out, return_lse)
 
 
@@ -542,7 +545,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         kv = _flatten_regular_kv_cache(kv_cache, page_size)
         slots = _mask_sparse_slots(topk_slots, topk_lens)
         splits = _flashmla_sparse_column_splits(
-            q_kernel.shape[0], slots.shape[-1], q_kernel.device
+            q_kernel.shape[0], q_kernel.shape[1], slots.shape[-1], q_kernel.device
         )
         if splits > 1:
             return _flashmla_sparse_prefill_split(
@@ -609,8 +612,9 @@ if platform.is_nvidia and platform.is_hopper_plus:
             "topk_layout": frozenset({"global_slots"}),
             "logit_cap": frozenset({False}),
             "return_lse": frozenset({False, True}),
-            # Sinkless dense-KV decode keeps its existing kernel choice; this
-            # path pads heads to the prefill tile, which costs small-head models.
+            # Sinkless dense-KV decode without LSE stays on Triton (Hopper) and
+            # FlashInfer TRT-LLM (Blackwell); this path pads every row's heads
+            # to the prefill tile.
             "sinks": frozenset({True}),
         },
         priority=Priority.PERFORMANT,
@@ -618,4 +622,37 @@ if platform.is_nvidia and platform.is_hopper_plus:
     def flashmla_dense_dsa_decode(**kwargs):
         # Dense BF16 KV: every query row carries its own global top-k slots, so
         # decode rows go through the same token-parallel sparse kernel as prefill.
+        return flashmla_dsa_prefill(**kwargs)
+
+    @register_kernel(
+        "attention",
+        "dsa_decode",
+        name="flashmla_dense_dsa_partial_decode",
+        solution="flashmla",
+        # Measured against Triton on Hopper only; Blackwell keeps Triton.
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 0),
+            max_arch_version=ArchVersion(9, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),
+        traits={
+            "q_len": frozenset({1, 2, 3, 4, 5, 6}),
+            "qk_nope_head_dim": frozenset({128, 192}),
+            "kv_lora_rank": frozenset({512}),
+            "qk_rope_head_dim": frozenset({64}),
+            "page_size": frozenset({64}),
+            "topk": frozenset({512, 1024, 2048}),
+            "has_kv_cache": frozenset({True}),
+            "has_sparse_kv_cache": frozenset({False}),
+            "topk_layout": frozenset({"global_slots"}),
+            "logit_cap": frozenset({False}),
+            # Context-parallel ranks return sinkless partials and apply the
+            # sink once, after merging them by their LSE.
+            "return_lse": frozenset({True}),
+            "sinks": frozenset({False}),
+        },
+        priority=Priority.PERFORMANT,
+    )
+    def flashmla_dense_dsa_partial_decode(**kwargs):
         return flashmla_dsa_prefill(**kwargs)
