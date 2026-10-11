@@ -77,6 +77,9 @@ def test_wrapper_never_enables_pdl(monkeypatch) -> None:
         SimpleNamespace(
             w13_weight=torch.zeros(4, 16, 8, dtype=torch.bfloat16, device="cuda"),
             w2_weight=torch.zeros(4, 8, 8, dtype=torch.bfloat16, device="cuda"),
+            swiglu_alpha_t=None,
+            swiglu_beta_t=None,
+            swiglu_limit_t=None,
         ),
         None,
         topk_weights=torch.ones(2, 1, device="cuda"),
@@ -115,6 +118,9 @@ def test_wrapper_passes_one_persistent_zeroed_workspace(monkeypatch) -> None:
         ep_rank=1,
         tp_size=1,
         tp_rank=0,
+        swiglu_alpha_t=None,
+        swiglu_beta_t=None,
+        swiglu_limit_t=None,
     )
 
     def apply(tokens: int) -> None:
@@ -221,6 +227,7 @@ def test_ep_rank_with_repeated_placeholder_experts(ep_rank: int) -> None:
         ep_rank=ep_rank,
         tp_size=1,
         tp_rank=0,
+        swiglu_arg=None,
     )
     kernel_moe_process_weights(plan, layer)
     expected = _reference(

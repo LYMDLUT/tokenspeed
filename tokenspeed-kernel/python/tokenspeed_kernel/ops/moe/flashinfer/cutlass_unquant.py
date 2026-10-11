@@ -49,7 +49,7 @@ if platform.is_nvidia:
         # ``swiglu_limit``), a non-unit alpha or a non-zero beta must reach the
         # SwigluBias epilogue instead of being silently dropped.
         w.swiglu_alpha_t = w.swiglu_beta_t = w.swiglu_limit_t = None
-        swiglu_arg = getattr(w, "swiglu_arg", None)
+        swiglu_arg = w.swiglu_arg
         if swiglu_arg is not None:
             num_experts = w.w13_weight.shape[0]
             device = w.w13_weight.device
@@ -65,7 +65,7 @@ if platform.is_nvidia:
             alpha = swiglu_arg.alpha
             if alpha is not None and float(alpha) != 1.0:
                 w.swiglu_alpha_t = _per_expert(alpha)
-            beta = getattr(w, "swiglu_beta", None)
+            beta = w.swiglu_beta
             if beta is not None and float(beta) != 0.0:
                 w.swiglu_beta_t = _per_expert(beta)
             if swiglu_arg.limit is not None:
@@ -207,9 +207,9 @@ if platform.is_nvidia:
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
         # flashinfer>=0.7 requires fp32 final scales.
         topk_weights = topk_weights.to(torch.float32)
-        swiglu_alpha = getattr(w, "swiglu_alpha_t", None)
-        swiglu_beta = getattr(w, "swiglu_beta_t", None)
-        swiglu_limit = getattr(w, "swiglu_limit_t", None)
+        swiglu_alpha = w.swiglu_alpha_t
+        swiglu_beta = w.swiglu_beta_t
+        swiglu_limit = w.swiglu_limit_t
         if swiglu_alpha is None and swiglu_beta is None and swiglu_limit is None:
             activation_type = ActivationType.Swiglu
         else:
