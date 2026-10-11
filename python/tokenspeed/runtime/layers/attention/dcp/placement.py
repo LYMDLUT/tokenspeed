@@ -23,7 +23,10 @@
 from dataclasses import dataclass
 
 import torch
-from tokenspeed_kernel.ops.kvcache.triton_cache_placement import virtual_slots_to_local
+from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
+    pack_owned_slots,
+    virtual_slots_to_local,
+)
 
 
 @dataclass(frozen=True)
@@ -55,6 +58,27 @@ def resolve_cache_slots(
         return loc, None
     return virtual_slots_to_local(
         loc,
+        rows_per_page=placement.block_granularity,
+        virtual_block_count=placement.virtual_block_count,
+        degree=len(placement.group),
+        rank=placement.rank,
+    )
+
+
+def resolve_owned_topk(
+    topk_slots: torch.Tensor,
+    topk_lens: torch.Tensor | None,
+    placement: CachePlacement,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return local top-k slots with the owned ones packed first, and their counts.
+
+    A rank attends only the selected slots it owns. Used as the rows' top-k
+    lengths, the counts let sparse kernels skip the other ranks' slots, which
+    cost as much as owned ones when they are only masked.
+    """
+    return pack_owned_slots(
+        topk_slots,
+        topk_lens,
         rows_per_page=placement.block_granularity,
         virtual_block_count=placement.virtual_block_count,
         degree=len(placement.group),

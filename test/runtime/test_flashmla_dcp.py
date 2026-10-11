@@ -720,9 +720,14 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(monkeypatch,
 
     def decode(**kwargs):
         assert kwargs["return_lse"] is True
+        # Each rank owns one of the four selected blocks: its slot is packed
+        # first, and the row's top-k length counts only that slot.
         expected = torch.full_like(slots, -1)
-        expected[0, rank] = 64
+        expected[0, 0] = 64
         torch.testing.assert_close(kwargs["topk_slots"], expected)
+        torch.testing.assert_close(
+            kwargs["topk_lens"], torch.ones(1, dtype=torch.int32)
+        )
         assert kwargs["q"].shape == (1, 8, 128)
         return torch.full((1, 8, 128), 7.0), torch.zeros(1, 8)
 
@@ -747,6 +752,86 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(monkeypatch,
         topk_lens=None,
     )
     assert out.shape == (1, 256)
+    assert (out == 7).all()
+
+
+@pytest.mark.parametrize("rank", range(4))
+def test_dsa_prefill_packs_owned_slots_within_topk_lens(monkeypatch, rank):
+    from types import SimpleNamespace
+
+    from tokenspeed.runtime.layers.attention.backends.paged import dsa
+
+    backend = object.__new__(dsa.DSABackend)
+    backend.kernel_page_size = 64
+    backend.data_type = torch.bfloat16
+    backend.kv_lora_rank = 128
+    backend.qk_nope_head_dim = 128
+    backend.qk_rope_head_dim = 0
+    backend.dcp_group = (0, 1, 2, 3)
+    backend.dcp_rank = rank
+    backend.dcp_block_granularity = 64
+    backend.dcp_virtual_block_count = 5
+    backend.token_parallel_group = (rank,)
+    backend.token_parallel_rank = 0
+    backend._spread_min_row_columns = None
+    backend.step_counter = None
+    query = torch.zeros(2, 2, 128, dtype=torch.bfloat16)
+    slots = torch.full((2, 512), -1, dtype=torch.int32)
+    slots[0, :4] = torch.tensor([64, 128, 192, 256])
+    # Row 1 selects only blocks 4 and 3 (ranks 3 and 2); the blocks of ranks
+    # 0 and 1 behind its top-k length must not count.
+    slots[1, :4] = torch.tensor([256, 192, 128, 64])
+    topk_lens = torch.tensor([4, 2], dtype=torch.int32)
+    owns_row_1 = rank in (2, 3)
+    pool = SimpleNamespace(
+        quant_method=None, get_key_buffer=lambda layer_id: torch.empty(320, 128)
+    )
+    layer = SimpleNamespace(
+        layer_id=0,
+        tp_q_head_num=2,
+        head_dim=128,
+        v_head_dim=128,
+        scaling=0.1,
+        logit_cap=0.0,
+        attn_sink=None,
+    )
+
+    def gather(q, group):
+        assert group == backend.dcp_group
+        return q.repeat(1, 4, 1)
+
+    def prefill(**kwargs):
+        assert kwargs["return_lse"] is True and kwargs["attn_sink"] is None
+        # Every rank's owned block is its local block 1, packed first.
+        expected = torch.full_like(slots, -1)
+        expected[0, 0] = 64
+        if owns_row_1:
+            expected[1, 0] = 64
+        torch.testing.assert_close(kwargs["topk_slots"], expected)
+        torch.testing.assert_close(
+            kwargs["topk_lens"], torch.tensor([1, int(owns_row_1)], dtype=torch.int32)
+        )
+        assert kwargs["q"].shape == (2, 8, 128)
+        return torch.full((2, 8, 128), 7.0), torch.zeros(2, 8)
+
+    def combine(out, lse, *, group, rank, sink):
+        assert sink is None and group == backend.dcp_group
+        assert lse.shape == out.shape[:-1]
+        return out[:, rank * 2 : (rank + 1) * 2]
+
+    monkeypatch.setattr(dsa, "gather_query_heads", gather)
+    monkeypatch.setattr(dsa, "dsa_prefill", prefill)
+    monkeypatch.setattr(dsa, "combine_attention_partials", combine)
+    out = backend.forward_sparse_prefill(
+        q=query,
+        layer=layer,
+        token_to_kv_pool=pool,
+        kv_seq_lens=None,
+        topk_slots=slots,
+        topk_lens=topk_lens,
+        max_seq_len=512,
+    )
+    assert out.shape == (2, 256)
     assert (out == 7).all()
 
 

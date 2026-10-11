@@ -51,6 +51,7 @@ from tokenspeed.runtime.layers.attention.dcp.comm import (
 from tokenspeed.runtime.layers.attention.dcp.placement import (
     CachePlacement,
     resolve_cache_slots,
+    resolve_owned_topk,
 )
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     DSA_SPARSE_PAGE_SIZE,
@@ -740,8 +741,9 @@ class DSABackend(PagedAttentionBackend):
             kv_seq_lens = kv_seq_lens.contiguous()
         use_dcp = len(self.dcp_group) > 1
         if use_dcp:
-            slots, owned = resolve_cache_slots(topk_slots, self.cache_placement(layer))
-            topk_slots = torch.where(owned, slots, -1)
+            topk_slots, topk_lens = resolve_owned_topk(
+                topk_slots, topk_lens, self.cache_placement(layer)
+            )
             q_view = gather_query_heads(q_view, self.dcp_group)
 
         attend = self._row_attention(layer, kv_cache, max_seq_len, k_scale, use_dcp)
@@ -903,8 +905,9 @@ class DSABackend(PagedAttentionBackend):
         use_dcp = len(self.dcp_group) > 1
         topk_slots = topk_indices.view(num_tokens, -1)
         if use_dcp:
-            slots, owned = resolve_cache_slots(topk_slots, self.cache_placement(layer))
-            topk_slots = torch.where(owned, slots, -1)
+            topk_slots, topk_lens = resolve_owned_topk(
+                topk_slots, topk_lens, self.cache_placement(layer)
+            )
             q_view = gather_query_heads(q_view, self.dcp_group)
         if self._spreads_rows(num_tokens, topk_slots.shape[1]):
             # A rank's share of spread rows need not hold whole requests, so it
