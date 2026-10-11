@@ -26,7 +26,9 @@ from tokenspeed.runtime.distributed.mapping import Mapping
 
 
 def _mapping(rank: int, world_size: int, pp_size: int, **kw) -> Mapping:
-    m = Mapping(world_size=world_size, pp_size=pp_size, **kw)
+    m = Mapping(
+        world_size=world_size, pp_size=pp_size, attn_token_parallel_size=1, **kw
+    )
     m.rank = rank
     return m
 
@@ -78,7 +80,7 @@ def test_pp_moe_ep_resolves_inside_stage():
 
 def test_pp_world_size_divisibility():
     with pytest.raises(AssertionError):
-        Mapping(world_size=6, pp_size=4, attn_tp_size=1)
+        Mapping(world_size=6, pp_size=4, attn_tp_size=1, attn_token_parallel_size=1)
 
 
 def test_narrow_to_layers_drops_other_stage_planes():
@@ -177,10 +179,14 @@ def test_pp_layer_partition_validation():
 
 def test_mapping_accepts_pp_layer_partition():
     m = Mapping(
-        world_size=8, pp_size=4, attn_tp_size=2, pp_layer_partition=[8, 11, 11, 8]
+        world_size=8,
+        pp_size=4,
+        attn_tp_size=2,
+        attn_token_parallel_size=1,
+        pp_layer_partition=[8, 11, 11, 8],
     )
     assert m.pp_layer_partition == (8, 11, 11, 8)
-    m2 = Mapping(world_size=8, pp_size=4, attn_tp_size=2)
+    m2 = Mapping(world_size=8, pp_size=4, attn_tp_size=2, attn_token_parallel_size=1)
     assert m2.pp_layer_partition is None
 
 

@@ -26,7 +26,9 @@ def test_resolved_dist_init_addr_moves_with_busy_control_port(monkeypatch):
 
 
 def test_distributed_config_uses_resolved_dist_init_addr():
-    mapping = Mapping(rank=0, world_size=1, nprocs_per_node=1)
+    mapping = Mapping(
+        rank=0, world_size=1, attn_token_parallel_size=1, nprocs_per_node=1
+    )
     args = SimpleNamespace(
         device="cuda",
         mapping=mapping,

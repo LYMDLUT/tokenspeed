@@ -159,6 +159,8 @@ def _backend_config(device: str, *, spec_tokens: int = 1):
         max_bs=8,
         is_draft=False,
         speculative_num_draft_tokens=spec_tokens,
+        token_parallel_rank=0,
+        token_parallel_group=(0,),
         components=(spec,),
     )
     return config, spec

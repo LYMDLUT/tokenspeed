@@ -64,6 +64,7 @@ def main():
         attn_cp_size=1,
         attn_dp_size=world,
         attn_dcp_size=1,
+        attn_token_parallel_size=1,
         dense_tp_size=1,
         dense_dp_size=world,
         moe_tp_size=1,

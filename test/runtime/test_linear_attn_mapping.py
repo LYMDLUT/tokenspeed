@@ -38,14 +38,20 @@ from tokenspeed.runtime.distributed.mapping import (
 
 class TestLinearAttnMappingDefaults(unittest.TestCase):
     def test_defaults_follow_attn_tp_tp8(self):
-        m = Mapping(rank=0, world_size=8, attn_tp_size=8)
+        m = Mapping(rank=0, world_size=8, attn_tp_size=8, attn_token_parallel_size=1)
         self.assertEqual(m.linear_attn.tp_size, m.attn.tp_size)
         self.assertEqual(m.linear_attn.tp_group, m.attn.tp_group)
         self.assertEqual(m.linear_attn.dp_size, 1)
 
     def test_defaults_follow_attn_tp_dp8(self):
         # attention-DP8: attn tp=1, so linear-attn defaults to tp=1 per rank.
-        m = Mapping(rank=3, world_size=8, attn_tp_size=1, attn_dp_size=8)
+        m = Mapping(
+            rank=3,
+            world_size=8,
+            attn_tp_size=1,
+            attn_dp_size=8,
+            attn_token_parallel_size=1,
+        )
         self.assertEqual(m.linear_attn.tp_size, 1)
         self.assertEqual(m.linear_attn.dp_size, 8)
         self.assertEqual(m.linear_attn.tp_rank, 0)
@@ -53,7 +59,12 @@ class TestLinearAttnMappingDefaults(unittest.TestCase):
     def test_hybrid_shape_linear_attn_tp_spans_dp_ranks(self):
         # The target hybrid: MLA-DP8 with KDA-TP8 over the same ranks.
         m = Mapping(
-            rank=3, world_size=8, attn_tp_size=1, attn_dp_size=8, linear_attn_tp_size=8
+            rank=3,
+            world_size=8,
+            attn_tp_size=1,
+            attn_dp_size=8,
+            attn_token_parallel_size=1,
+            linear_attn_tp_size=8,
         )
         self.assertEqual(m.linear_attn.tp_size, 8)
         self.assertEqual(m.linear_attn.tp_rank, 3)
@@ -63,13 +74,25 @@ class TestLinearAttnMappingDefaults(unittest.TestCase):
         self.assertEqual(m.attn.dp_size, 8)
 
     def test_rank_propagates_to_linear_attn(self):
-        m = Mapping(world_size=8, attn_tp_size=1, attn_dp_size=8, linear_attn_tp_size=8)
+        m = Mapping(
+            world_size=8,
+            attn_tp_size=1,
+            attn_dp_size=8,
+            attn_token_parallel_size=1,
+            linear_attn_tp_size=8,
+        )
         m.rank = 5
         self.assertEqual(m.linear_attn.tp_rank, 5)
 
     def test_pp_stage_world(self):
         # KDA mapping resolves inside one pipeline stage.
-        m = Mapping(rank=0, world_size=16, attn_tp_size=8, pp_size=2)
+        m = Mapping(
+            rank=0,
+            world_size=16,
+            attn_tp_size=8,
+            attn_token_parallel_size=1,
+            pp_size=2,
+        )
         self.assertEqual(m.linear_attn.tp_size, 8)
         self.assertEqual(m.linear_attn.dp_size, 1)
 

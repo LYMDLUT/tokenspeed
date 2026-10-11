@@ -919,6 +919,7 @@ class TestDeepseekV4Config(unittest.TestCase):
             world_size=4,
             attn_tp_size=1,
             attn_dp_size=4,
+            attn_token_parallel_size=1,
             dense_tp_size=1,
             dense_dp_size=4,
             moe_tp_size=1,

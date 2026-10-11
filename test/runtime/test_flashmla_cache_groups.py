@@ -95,6 +95,8 @@ def _make_flashmla_backend(
         kv_cache_quant_method="",
         speculative_num_draft_tokens=speculative_num_draft_tokens,
         is_draft=is_draft,
+        token_parallel_rank=0,
+        token_parallel_group=(0,),
         components=(spec,),
     )
     backend = FlashMLABackend(config, spec, kernel_page_size=_KERNEL_PAGE)

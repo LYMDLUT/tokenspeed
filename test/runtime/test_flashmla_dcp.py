@@ -690,6 +690,9 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(monkeypatch,
     backend.dcp_rank = rank
     backend.dcp_block_granularity = 64
     backend.dcp_virtual_block_count = 5
+    backend.token_parallel_group = (rank,)
+    backend.token_parallel_rank = 0
+    backend._spread_min_row_columns = None
     backend._dense_backend = SimpleNamespace(
         forward_decode_metadata=SimpleNamespace(
             num_extends=0, seq_lens_k=torch.tensor([128]), max_seq_len_k=128

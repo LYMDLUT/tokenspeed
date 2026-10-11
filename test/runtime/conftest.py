@@ -98,6 +98,8 @@ def kimi_recipe(
         context_len=context_len,
         pd_disaggregation_enabled=pd_enabled,
         speculative_num_draft_tokens=speculative_num_draft_tokens,
+        token_parallel_rank=0,
+        token_parallel_group=(0,),
         components=(mla, linear_attn),
     )
     # The real K3 draft is BF16 MLA over the FP8 target arena.

@@ -278,7 +278,7 @@ def test_distributed_initializer_gathers_fabric_after_groups(monkeypatch):
     import tokenspeed.runtime.execution.distributed_initializer as initializer
 
     events = []
-    mapping = Mapping(rank=0, world_size=1)
+    mapping = Mapping(rank=0, world_size=1, attn_token_parallel_size=1)
     config = SimpleNamespace(
         device="cuda",
         gpu_id=0,
@@ -383,7 +383,12 @@ def _setup_runtime_globals(rank, world_size):
     from tokenspeed.runtime.distributed.mapping import Mapping
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
-    mapping = Mapping(rank=rank, world_size=world_size, attn_tp_size=world_size)
+    mapping = Mapping(
+        rank=rank,
+        world_size=world_size,
+        attn_tp_size=world_size,
+        attn_token_parallel_size=1,
+    )
     global_server_args_dict["mapping"] = mapping
     global_server_args_dict["chunked_prefill_size"] = 8192
     global_server_args_dict["max_prefill_tokens"] = 8192

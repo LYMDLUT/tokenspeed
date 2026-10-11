@@ -498,6 +498,16 @@ ts serve tencent/Hy4-preview \
 # nodes 1-3: the same command with --node-rank 1, 2, 3
 ```
 
+With attention TP32 each rank holds two of the 64 query heads, while the
+FlashMLA sparse kernels pad every launch to 64 heads on Hopper. Adding
+`--attn-token-parallel-size 8` regroups each node's eight ranks so that every
+rank attends an eighth of the rows with the node's 16 heads; launches with too
+few rows to fill the GPU, such as single-request decoding, keep their local
+heads. On four 8x H20 nodes this cut the time to first token of a 32K-token
+prompt from 11.1 s to 6.3 s and raised the output throughput at 64 concurrent
+1K-token requests by 17%, with unchanged GSM8K, HumanEval and MATH-500 scores.
+It cannot be combined with decode context parallelism.
+
 MTP drafts from the checkpoint's own MTP layer; add to every node's command:
 
 ```bash

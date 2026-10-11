@@ -94,6 +94,8 @@ def _attn_config(family: str, pd_enabled: bool):
         kernel_page_size=_P,
         kv_cache_quant_method="",
         pd_disaggregation_enabled=pd_enabled,
+        token_parallel_rank=0,
+        token_parallel_group=(0,),
         components=(spec,),
     )
 

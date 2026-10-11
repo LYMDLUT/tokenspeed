@@ -69,6 +69,7 @@ def _item_dp_mapping(rank: int = 5) -> Mapping:
         rank=rank,
         world_size=8,
         attn_tp_size=8,
+        attn_token_parallel_size=1,
         vision_tp_size=1,
         vision_dp_size=8,
     )
@@ -78,7 +79,7 @@ def _build_model(monkeypatch, mapping: Mapping | None = None):
     monkeypatch.setattr(kimi_k3, "KimiLinearForCausalLM", _FakeLanguageModel)
     return KimiK3ForConditionalGeneration(
         _tiny_config(),
-        mapping=mapping or Mapping(rank=0, world_size=1),
+        mapping=mapping or Mapping(rank=0, world_size=1, attn_token_parallel_size=1),
         mm_attention_backend="triton_attn",
     )
 
@@ -197,7 +198,7 @@ def test_kimi_k3_encoder_only_skips_language_model(monkeypatch):
     )
     model = KimiK3ForConditionalGeneration(
         config,
-        mapping=Mapping(rank=0, world_size=1),
+        mapping=Mapping(rank=0, world_size=1, attn_token_parallel_size=1),
         mm_attention_backend="triton_attn",
     )
 
@@ -224,7 +225,7 @@ def test_kimi_k3_encoder_only_drains_stream_and_loads_all_vision_weights(
     )
     model = KimiK3ForConditionalGeneration(
         config,
-        mapping=Mapping(rank=0, world_size=1),
+        mapping=Mapping(rank=0, world_size=1, attn_token_parallel_size=1),
         mm_attention_backend="triton_attn",
     )
     vision_weights, expected = _vision_checkpoint_weights(model)

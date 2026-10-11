@@ -650,6 +650,8 @@ def test_pd_derives_ordinary_transfer_metadata_from_physical_plan(
         max_bs=4,
         kv_cache_quant_method="none",
         pd_disaggregation_enabled=True,
+        token_parallel_rank=0,
+        token_parallel_group=(0,),
         components=(spec,),
     )
 

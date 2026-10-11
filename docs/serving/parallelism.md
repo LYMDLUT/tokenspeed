@@ -32,6 +32,7 @@ tokenspeed serve <model> \
 | `--world-size` | Total worker processes across all nodes. |
 | `--nprocs-per-node` | Worker processes launched on each node. |
 | `--attn-tp-size` | Attention tensor parallel size. |
+| `--attn-token-parallel-size` | DSA sparse attention only: attend query rows token-parallel across groups of this many attention TP ranks (default 1, off). |
 | `--dense-tp-size` | Dense layer tensor parallel size. Defaults to the attention replica width (attn TP x CP): the full world without DP attention, one replica with it. |
 | `--moe-tp-size` | MoE layer tensor parallel size. |
 | `--data-parallel-size` | Replicated data-parallel groups. |
@@ -42,6 +43,22 @@ tokenspeed serve <model> \
 Kimi-K3 TP8 deployments must combine `--tensor-parallel-size 8` with
 `--mm-encoder-tp-mode data`. This keeps the text model at TP8 while running the
 wide-QKV MoonViT encoder at TP1 with whole-item DP8.
+
+### Token-parallel sparse attention
+
+The FlashMLA sparse kernels pad every launch to a multiple of 64 query heads
+on Hopper and 128 on Blackwell, so a wide attention TP group whose ranks each
+hold a few heads spends most of its sparse attention on padding. `--attn-token-parallel-size G` regroups the queries of G
+consecutive attention TP ranks with two all-to-alls around the sparse kernel:
+each rank attends 1/G of the rows with all of the group's heads, then gets its
+own heads back. Launches with too few rows to fill the GPU keep their local
+heads, so single-request decoding is unchanged; the exchange is
+graph-capturable, so batched decoding spreads inside CUDA graphs.
+
+G must divide both the attention TP size and `--nprocs-per-node`, so every
+group stays inside one node, and the option requires the GPU DSA backend
+without decode context parallelism. See the HY V4 recipe in
+[Model Recipes](../recipes/models.md) for measured gains.
 
 ### Pinning a request to an attention-DP rank
 

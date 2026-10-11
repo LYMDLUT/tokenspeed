@@ -273,7 +273,9 @@ class TestDenseLayerMapping:
 class TestAttentionLayerMapping:
 
     def test_tp_only(self):
-        m = AttentionLayerMapping(rank=2, world_size=8, tp_size=8, cp_size=1, dp_size=1)
+        m = AttentionLayerMapping(
+            rank=2, world_size=8, tp_size=8, cp_size=1, dp_size=1, token_parallel_size=1
+        )
         assert m.tp_rank == 2
         assert m.cp_rank == 0
         assert m.dp_rank == 0
@@ -284,7 +286,9 @@ class TestAttentionLayerMapping:
     def test_tp_cp(self):
         # ws=8, tp=2, cp=4, dp=1
         # rank layout: rank = dp_rank*(tp*cp) + cp_rank*tp + tp_rank
-        m = AttentionLayerMapping(rank=5, world_size=8, tp_size=2, cp_size=4, dp_size=1)
+        m = AttentionLayerMapping(
+            rank=5, world_size=8, tp_size=2, cp_size=4, dp_size=1, token_parallel_size=1
+        )
         assert m.tp_rank == 1  # 5 % 2
         assert m.cp_rank == 2  # (5 // 2) % 4
         assert m.dp_rank == 0  # 5 // 8
@@ -294,7 +298,12 @@ class TestAttentionLayerMapping:
     def test_tp_cp_dp(self):
         # ws=16, tp=2, cp=2, dp=4
         m = AttentionLayerMapping(
-            rank=7, world_size=16, tp_size=2, cp_size=2, dp_size=4
+            rank=7,
+            world_size=16,
+            tp_size=2,
+            cp_size=2,
+            dp_size=4,
+            token_parallel_size=1,
         )
         assert m.tp_rank == 1  # 7 % 2
         assert m.cp_rank == 1  # (7 // 2) % 2
@@ -304,15 +313,21 @@ class TestAttentionLayerMapping:
         assert m.dp_group == (3, 7, 11, 15)
 
     def test_infer_cp(self):
-        m = AttentionLayerMapping(rank=0, world_size=16, tp_size=2, dp_size=4)
+        m = AttentionLayerMapping(
+            rank=0, world_size=16, tp_size=2, dp_size=4, token_parallel_size=1
+        )
         assert m.cp_size == 2
 
     def test_infer_dp(self):
-        m = AttentionLayerMapping(rank=0, world_size=16, tp_size=2, cp_size=4)
+        m = AttentionLayerMapping(
+            rank=0, world_size=16, tp_size=2, cp_size=4, token_parallel_size=1
+        )
         assert m.dp_size == 2
 
     def test_deferred_rank(self):
-        m = AttentionLayerMapping(world_size=16, tp_size=2, cp_size=2, dp_size=4)
+        m = AttentionLayerMapping(
+            world_size=16, tp_size=2, cp_size=2, dp_size=4, token_parallel_size=1
+        )
         assert m.tp_size == 2
         assert m.cp_size == 2
         assert m.dp_size == 4
@@ -330,7 +345,9 @@ class TestAttentionLayerMapping:
         ws = 8
         tp = 4
         for r in range(ws):
-            attn = AttentionLayerMapping(rank=r, world_size=ws, tp_size=tp, cp_size=1)
+            attn = AttentionLayerMapping(
+                rank=r, world_size=ws, tp_size=tp, cp_size=1, token_parallel_size=1
+            )
             dense = DenseLayerMapping(rank=r, world_size=ws, tp_size=tp)
             assert attn.tp_rank == dense.tp_rank
             assert attn.dp_rank == dense.dp_rank
@@ -343,7 +360,12 @@ class TestAttentionLayerMapping:
         tp, cp, dp = 2, 3, 4
         mappings = [
             AttentionLayerMapping(
-                rank=r, world_size=ws, tp_size=tp, cp_size=cp, dp_size=dp
+                rank=r,
+                world_size=ws,
+                tp_size=tp,
+                cp_size=cp,
+                dp_size=dp,
+                token_parallel_size=1,
             )
             for r in range(ws)
         ]
@@ -368,7 +390,12 @@ class TestAttentionLayerMapping:
         tp, cp, dp = 2, 3, 4
         for r in range(ws):
             m = AttentionLayerMapping(
-                rank=r, world_size=ws, tp_size=tp, cp_size=cp, dp_size=dp
+                rank=r,
+                world_size=ws,
+                tp_size=tp,
+                cp_size=cp,
+                dp_size=dp,
+                token_parallel_size=1,
             )
             reconstructed = m.dp_rank * (tp * cp) + m.cp_rank * tp + m.tp_rank
             assert reconstructed == r, f"rank={r}: reconstructed={reconstructed}"
@@ -376,8 +403,44 @@ class TestAttentionLayerMapping:
     def test_invalid_product_raises(self):
         with pytest.raises(AssertionError):
             AttentionLayerMapping(
-                rank=0, world_size=16, tp_size=2, cp_size=3, dp_size=4
+                rank=0,
+                world_size=16,
+                tp_size=2,
+                cp_size=3,
+                dp_size=4,
+                token_parallel_size=1,
             )
+
+    def test_token_parallel_groups_are_consecutive_tp_ranks(self):
+        groups = set()
+        for r in range(32):
+            m = AttentionLayerMapping(
+                rank=r, world_size=32, tp_size=32, token_parallel_size=8
+            )
+            assert m.has_token_parallel
+            assert m.token_parallel_group[m.token_parallel_rank] == r
+            groups.add(m.token_parallel_group)
+        assert groups == {tuple(range(b, b + 8)) for b in range(0, 32, 8)}
+
+    def test_token_parallel_size_one_keeps_one_rank(self):
+        m = AttentionLayerMapping(
+            rank=5, world_size=8, tp_size=8, token_parallel_size=1
+        )
+        assert not m.has_token_parallel
+        assert m.token_parallel_group == (5,)
+        assert m.token_parallel_rank == 0
+
+    @pytest.mark.parametrize(
+        "kwargs, message",
+        [
+            (dict(tp_size=8, token_parallel_size=3), "divisible"),
+            (dict(tp_size=8, token_parallel_size=0), "positive"),
+            (dict(tp_size=8, dcp_size=2, token_parallel_size=2), "DCP"),
+        ],
+    )
+    def test_token_parallel_validation(self, kwargs, message):
+        with pytest.raises(ValueError, match=message):
+            AttentionLayerMapping(rank=0, world_size=8, **kwargs)
 
 
 # =============================================================================
@@ -466,7 +529,12 @@ class TestMoeLayerMapping:
         tp, middle, dp = 2, 3, 4
         for r in range(ws):
             attn = AttentionLayerMapping(
-                rank=r, world_size=ws, tp_size=tp, cp_size=middle, dp_size=dp
+                rank=r,
+                world_size=ws,
+                tp_size=tp,
+                cp_size=middle,
+                dp_size=dp,
+                token_parallel_size=1,
             )
             moe = MoeLayerMapping(
                 rank=r, world_size=ws, tp_size=tp, ep_size=middle, dp_size=dp
@@ -529,6 +597,7 @@ class TestMapping:
             rank=3,
             world_size=8,
             attn_tp_size=4,
+            attn_token_parallel_size=1,
             dense_tp_size=8,
             moe_tp_size=2,
             moe_ep_size=4,
@@ -539,7 +608,7 @@ class TestMapping:
 
     def test_layer_mappings_use_global_rank(self):
         """Layer mappings should use the global rank so groups contain global ranks."""
-        m = Mapping(rank=10, world_size=16, dense_tp_size=4)
+        m = Mapping(rank=10, world_size=16, attn_token_parallel_size=1, dense_tp_size=4)
         # rank=10, world_size=16, dense tp=4, dp=4
         assert m.dense.tp_group == (8, 9, 10, 11)
         assert m.dense.dp_group == (2, 6, 10, 14)
@@ -548,34 +617,81 @@ class TestMapping:
         assert all(0 <= r < 16 for r in m.dense.dp_group)
 
     def test_nprocs_per_node_and_nnodes(self):
-        m = Mapping(rank=0, world_size=16, nprocs_per_node=8, nnodes=2)
+        m = Mapping(
+            rank=0,
+            world_size=16,
+            attn_token_parallel_size=1,
+            nprocs_per_node=8,
+            nnodes=2,
+        )
         assert m.nprocs_per_node == 8
         assert m.nnodes == 2
 
     def test_nprocs_per_node_infer_nnodes(self):
-        m = Mapping(rank=0, world_size=16, nprocs_per_node=8)
+        m = Mapping(
+            rank=0, world_size=16, attn_token_parallel_size=1, nprocs_per_node=8
+        )
         assert m.nprocs_per_node == 8
         assert m.nnodes == 2
 
     def test_nnodes_infer_nprocs(self):
-        m = Mapping(rank=0, world_size=16, nnodes=4)
+        m = Mapping(rank=0, world_size=16, attn_token_parallel_size=1, nnodes=4)
         assert m.nprocs_per_node == 4
         assert m.nnodes == 4
 
     def test_nprocs_default_single_node(self):
-        m = Mapping(rank=0, world_size=8)
+        m = Mapping(rank=0, world_size=8, attn_token_parallel_size=1)
         assert m.nprocs_per_node == 8
         assert m.nnodes == 1
 
     def test_nprocs_nnodes_mismatch_raises(self):
         with pytest.raises(AssertionError):
-            Mapping(rank=0, world_size=16, nprocs_per_node=3, nnodes=2)
+            Mapping(
+                rank=0,
+                world_size=16,
+                attn_token_parallel_size=1,
+                nprocs_per_node=3,
+                nnodes=2,
+            )
+
+    def test_token_parallel_groups_stay_inside_one_node(self):
+        for rank in range(32):
+            m = Mapping(
+                rank=rank,
+                world_size=32,
+                attn_tp_size=32,
+                attn_token_parallel_size=8,
+                nprocs_per_node=8,
+            )
+            assert {r // 8 for r in m.attn.token_parallel_group} == {rank // 8}
+
+    @pytest.mark.parametrize(
+        "world_size, nprocs_per_node, token_parallel_size",
+        # A group wider than a node, and groups straddling 12-rank nodes.
+        [(32, 8, 16), (24, 12, 8)],
+    )
+    def test_token_parallel_group_crossing_nodes_raises(
+        self, world_size, nprocs_per_node, token_parallel_size
+    ):
+        with pytest.raises(
+            ValueError,
+            match=f"token-parallel size {token_parallel_size} must divide the "
+            f"{nprocs_per_node} ranks per node",
+        ):
+            Mapping(
+                rank=0,
+                world_size=world_size,
+                attn_tp_size=world_size,
+                attn_token_parallel_size=token_parallel_size,
+                nprocs_per_node=nprocs_per_node,
+            )
 
     def test_deferred_rank(self):
         """Create Mapping without rank, set it later, verify propagation."""
         m = Mapping(
             world_size=8,
             attn_tp_size=4,
+            attn_token_parallel_size=1,
             dense_tp_size=8,
             moe_tp_size=2,
             moe_ep_size=4,
@@ -599,14 +715,14 @@ class TestMapping:
         assert m.moe.ep_rank == 1
 
     def test_deferred_rank_access_before_set_raises(self):
-        m = Mapping(world_size=8, dense_tp_size=4)
+        m = Mapping(world_size=8, attn_token_parallel_size=1, dense_tp_size=4)
         with pytest.raises(AssertionError, match="rank is not initialized"):
             _ = m.rank
         with pytest.raises(AssertionError, match="rank is not initialized"):
             _ = m.dense.tp_rank
 
     def test_deferred_rank_set_once_raises(self):
-        m = Mapping(world_size=8, dense_tp_size=4)
+        m = Mapping(world_size=8, attn_token_parallel_size=1, dense_tp_size=4)
         m.rank = 3
         with pytest.raises(AssertionError, match="rank is already initialized"):
             m.rank = 5

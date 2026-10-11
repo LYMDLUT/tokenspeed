@@ -435,12 +435,13 @@ class KimiK3RegistrationTests(unittest.TestCase):
         config = SimpleNamespace(
             num_hidden_layers=93, first_k_dense_replace=1, moe_layer_freq=1
         )
-        one = Mapping(rank=0, world_size=1, pp_size=1)
+        one = Mapping(rank=0, world_size=1, attn_token_parallel_size=1, pp_size=1)
         self.assertEqual(kimi_k3._k3_local_moe_blocks(config, one), 92)
         # 93 over three stages is 31 apiece; the first loses its dense layer.
         counts = [
             kimi_k3._k3_local_moe_blocks(
-                config, Mapping(rank=rank, world_size=3, pp_size=3)
+                config,
+                Mapping(rank=rank, world_size=3, attn_token_parallel_size=1, pp_size=3),
             )
             for rank in range(3)
         ]
@@ -459,7 +460,9 @@ class KimiK3RegistrationTests(unittest.TestCase):
             num_experts_per_token=2,
             num_shared_experts=1,
         )
-        mapping = Mapping(rank=0, world_size=8, pp_size=1, moe_tp_size=8)
+        mapping = Mapping(
+            rank=0, world_size=8, attn_token_parallel_size=1, pp_size=1, moe_tp_size=8
+        )
         with (
             mock.patch.object(
                 kimi_k3, "KimiLinearKDA", lambda *a, **kw: torch.nn.Module()
@@ -492,7 +495,9 @@ class KimiK3RegistrationTests(unittest.TestCase):
         # At PP1 the stage's blocks and the model's happen to be the same number,
         # so the handoff has to be pinned where they differ.
         recorded.clear()
-        staged = Mapping(rank=8, world_size=24, pp_size=3, moe_tp_size=8)
+        staged = Mapping(
+            rank=8, world_size=24, attn_token_parallel_size=1, pp_size=3, moe_tp_size=8
+        )
         with (
             mock.patch.object(
                 kimi_k3, "KimiLinearKDA", lambda *a, **kw: torch.nn.Module()

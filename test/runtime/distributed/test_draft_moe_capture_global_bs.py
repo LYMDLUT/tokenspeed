@@ -42,6 +42,7 @@ def _make_mapping(rank: int) -> Mapping:
         rank=rank,
         world_size=4,
         attn_dp_size=4,
+        attn_token_parallel_size=1,
         dense_tp_size=4,
         moe_tp_size=1,
         moe_ep_size=4,

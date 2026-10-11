@@ -659,7 +659,9 @@ def test_executor_input_capacity_covers_decode_capture(
         enable_nan_detection=False,
     )
     runner = SimpleNamespace(
-        mapping=Mapping(rank=0, world_size=pp_size, pp_size=pp_size),
+        mapping=Mapping(
+            rank=0, world_size=pp_size, attn_token_parallel_size=1, pp_size=pp_size
+        ),
         model_config=SimpleNamespace(
             hf_text_config=SimpleNamespace(engram_layer_ids=[1], ngram_context_len=3)
         ),

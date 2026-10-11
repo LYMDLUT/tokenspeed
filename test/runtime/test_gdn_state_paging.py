@@ -107,6 +107,8 @@ def _mamba_config_pair(
         context_len=4096,
         max_bs=max_bs,
         speculative_num_draft_tokens=spec_tokens,
+        token_parallel_rank=0,
+        token_parallel_group=(0,),
         components=(spec, linear),
     )
     return config, spec

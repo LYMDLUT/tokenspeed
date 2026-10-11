@@ -88,6 +88,8 @@ def _recipe(
         pd_disaggregation_enabled=pd_disaggregation_enabled,
         speculative_num_steps=2 if draft_layers else 0,
         speculative_num_draft_tokens=3 if draft_layers else 1,
+        token_parallel_rank=0,
+        token_parallel_group=(0,),
         components=(dsa, linear),
     )
     draft_attn_config = (

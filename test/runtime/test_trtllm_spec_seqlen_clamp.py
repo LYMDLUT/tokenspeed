@@ -59,6 +59,8 @@ def _make_backend(is_draft: bool = False) -> TRTLLMMHAAttnBackend:
         speculative_num_steps=3,
         speculative_num_draft_tokens=SPEC_NUM_TOKENS,
         is_draft=is_draft,
+        token_parallel_rank=0,
+        token_parallel_group=(0,),
         components=(spec,),
     )
     return TRTLLMMHAAttnBackend(cfg, spec, kernel_page_size=PAGE)

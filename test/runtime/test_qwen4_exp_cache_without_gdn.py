@@ -96,6 +96,8 @@ def _recipe(
         speculative_num_draft_tokens=width,
         is_draft=False,
         draft_block_decode=False,
+        token_parallel_rank=0,
+        token_parallel_group=(0,),
         components=(spec,),
     )
     draft_config = (

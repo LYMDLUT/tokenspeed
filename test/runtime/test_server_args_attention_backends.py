@@ -239,6 +239,8 @@ class TestAttentionBackendChoices(unittest.TestCase):
             context_len=65536,
             kernel_page_size=64,
             max_bs=8,
+            token_parallel_rank=0,
+            token_parallel_group=(0,),
             components=(spec,),
         )
 
@@ -335,7 +337,13 @@ class TestAttentionBackendChoices(unittest.TestCase):
             attn_tp_size=None,
             mapping=SimpleNamespace(
                 attn=SimpleNamespace(
-                    tp_size=2, dp_size=1, dcp_size=1, dcp_rank=0, dcp_group=(0,)
+                    tp_size=2,
+                    dp_size=1,
+                    dcp_size=1,
+                    dcp_rank=0,
+                    dcp_group=(0,),
+                    token_parallel_rank=0,
+                    token_parallel_group=(0,),
                 )
             ),
             kv_cache_dtype="auto",
@@ -396,6 +404,8 @@ class TestPagedRouterNameResolution(unittest.TestCase):
             context_len=256,
             max_bs=2,
             kv_cache_quant_method="none",
+            token_parallel_rank=0,
+            token_parallel_group=(0,),
             components=(spec,),
         )
 

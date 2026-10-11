@@ -46,7 +46,9 @@ def _build_model(config, quant_config=None, rank=0, world_size=1, **mapping_kw):
 
     # Same precomputed-topk backend the engine resolves for Inkling.
     moe_utils.MOE_BACKEND = moe_utils.MoeBackend.FLASHINFER_CUTLASS
-    mapping = Mapping(rank=rank, world_size=world_size, **mapping_kw)
+    mapping = Mapping(
+        rank=rank, world_size=world_size, attn_token_parallel_size=1, **mapping_kw
+    )
     global_server_args_dict["mapping"] = mapping
     global_server_args_dict["enable_prefix_caching"] = False
     with torch.device("cuda"):
@@ -354,7 +356,7 @@ class TestInklingMoeBlockDeferredFinalize(unittest.TestCase):
         saved_backend = moe_utils.MOE_BACKEND
         saved_torch_moe = os.environ.pop("INKLING_TORCH_MOE", None)
         moe_utils.MOE_BACKEND = moe_utils.MoeBackend.FLASHINFER_TRTLLM
-        mapping = Mapping(rank=0, world_size=1)
+        mapping = Mapping(rank=0, world_size=1, attn_token_parallel_size=1)
         global_server_args_dict["mapping"] = mapping
         global_server_args_dict["enable_prefix_caching"] = False
         try:

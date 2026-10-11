@@ -54,7 +54,7 @@ def main() -> None:
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
     global_server_args_dict.update(
-        mapping=Mapping(rank=rank, world_size=len(group)),
+        mapping=Mapping(rank=rank, world_size=len(group), attn_token_parallel_size=1),
         chunked_prefill_size=16,
         max_prefill_tokens=16,
         max_model_len=1024,

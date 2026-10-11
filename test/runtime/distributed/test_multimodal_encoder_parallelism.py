@@ -197,6 +197,7 @@ def _item_dp_worker(rank: int, world_size: int, port: int) -> None:
             rank=rank,
             world_size=world_size,
             attn_tp_size=world_size,
+            attn_token_parallel_size=1,
             vision_tp_size=1,
             vision_dp_size=world_size,
         )

@@ -499,6 +499,8 @@ def _qsa_config(*, kernel_page_size: int | None, max_bs: int, spec: int) -> Attn
         speculative_num_draft_tokens=spec,
         is_draft=False,
         draft_block_decode=False,
+        token_parallel_rank=0,
+        token_parallel_group=(0,),
         components=(component,),
     )
 
@@ -1847,6 +1849,8 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
         prefix_granularity=64,
         kernel_page_size=64,
         kv_cache_quant_method="none",
+        token_parallel_rank=0,
+        token_parallel_group=(0,),
         components=(softmax, linear),
     )
     server_args = SimpleNamespace(
@@ -3257,7 +3261,7 @@ def _ngram_embedding_pair(
         num_experts=None,
         eos_token_id=7,
     )
-    mapping = Mapping(rank=0, world_size=1)
+    mapping = Mapping(rank=0, world_size=1, attn_token_parallel_size=1)
     built = []
     for offload in (False, True):
         config = Qwen4ExpTextConfig(**kwargs, ple_offload_embedding=offload)
@@ -3389,7 +3393,11 @@ def test_ple_host_table_skips_device_allocation(
     before = torch.cuda.max_memory_allocated()
     with torch.device("cuda"):
         embedding = Qwen4ExpNGramEmbedding(
-            config, Mapping(rank=0, world_size=1), 64, 0, "ple_embedding"
+            config,
+            Mapping(rank=0, world_size=1, attn_token_parallel_size=1),
+            64,
+            0,
+            "ple_embedding",
         )
     growth = torch.cuda.max_memory_allocated() - before
 

@@ -332,6 +332,7 @@ class ServerArgs:
     nprocs_per_node: int | None = None
     world_size: int | None = None
     attn_tp_size: int | None = None
+    attn_token_parallel_size: int = 1
     dense_tp_size: int | None = None
     moe_tp_size: int | None = None
     mapping: Mapping | None = None
@@ -667,6 +668,7 @@ class ServerArgs:
             attn_cp_size=attn_cp_size,
             attn_dp_size=attn_dp_size,
             attn_dcp_size=self.decode_context_parallel_size,
+            attn_token_parallel_size=self.attn_token_parallel_size,
             dense_tp_size=dense_tp_size,
             dense_dp_size=dense_dp_size,
             moe_tp_size=moe_tp_size,
@@ -2091,6 +2093,16 @@ class ServerArgs:
             type=int,
             default=ServerArgs.decode_context_parallel_size,
             help="Shard DeepSeek V4 compressed KV over a subgroup of attention TP.",
+        )
+        parser.add_argument(
+            "--attn-token-parallel-size",
+            type=int,
+            default=ServerArgs.attn_token_parallel_size,
+            help="Split DSA sparse-attention query rows over consecutive groups of "
+            "this many attention TP ranks: each rank attends a slice of the rows "
+            "with the whole group's heads, which cuts the head padding of "
+            "kernels that pad few TP-local heads to a wide tile. Must divide "
+            "--nprocs-per-node so that every group stays inside one node.",
         )
         parser.add_argument(
             "--dense-tp-size",

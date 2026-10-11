@@ -428,7 +428,13 @@ def _draft_attn_config(algorithm: str, layer_types: tuple[str, ...]):
         attn_tp_size=4,
         mapping=SimpleNamespace(
             attn=SimpleNamespace(
-                tp_size=4, dp_size=1, dcp_size=1, dcp_rank=0, dcp_group=(0,)
+                tp_size=4,
+                dp_size=1,
+                dcp_size=1,
+                dcp_rank=0,
+                dcp_group=(0,),
+                token_parallel_rank=0,
+                token_parallel_group=(0,),
             )
         ),
     )

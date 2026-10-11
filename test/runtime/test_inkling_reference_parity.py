@@ -63,7 +63,7 @@ def _build_replica():
     from tokenspeed.runtime.models.inkling import InklingForConditionalGeneration
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
-    mapping = Mapping(rank=0, world_size=1)
+    mapping = Mapping(rank=0, world_size=1, attn_token_parallel_size=1)
     global_server_args_dict["mapping"] = mapping
     global_server_args_dict["enable_prefix_caching"] = False
     config = load_inkling_config(INKLING_BF16, num_experts=NUM_TEST_EXPERTS)

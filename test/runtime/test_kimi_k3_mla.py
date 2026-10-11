@@ -293,6 +293,8 @@ def backend_factory(cuda_env, gpu_pool):
             context_len=4 * gpu_pool.arena.prefix_granularity,
             max_bs=8,
             kv_cache_quant_method="",
+            token_parallel_rank=0,
+            token_parallel_group=(0,),
             components=(spec,),
         )
         backend = backend_cls(config, spec, kernel_page_size=_KERNEL_PAGE)

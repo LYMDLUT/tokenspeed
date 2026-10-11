@@ -208,6 +208,8 @@ class _Harness:
             context_len=1024,
             max_bs=4,
             kv_cache_quant_method="none",
+            token_parallel_rank=0,
+            token_parallel_group=(0,),
             components=(spec,),
         )
         # Production composition: the Inkling wrapper sits over a

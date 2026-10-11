@@ -112,6 +112,8 @@ def _config(device):
         speculative_num_draft_tokens=1,
         is_draft=False,
         draft_block_decode=False,
+        token_parallel_rank=0,
+        token_parallel_group=(0,),
         components=(spec,),
     )
 
@@ -935,7 +937,13 @@ def test_packed_config_and_recipe_capacity(verify_width, overlap_depth):
         data_parallel_size=2,
         mapping=SimpleNamespace(
             attn=SimpleNamespace(
-                tp_size=1, dp_size=2, dcp_size=1, dcp_rank=0, dcp_group=(0,)
+                tp_size=1,
+                dp_size=2,
+                dcp_size=1,
+                dcp_rank=0,
+                dcp_group=(0,),
+                token_parallel_rank=0,
+                token_parallel_group=(0,),
             )
         ),
         prefix_granularity=128,

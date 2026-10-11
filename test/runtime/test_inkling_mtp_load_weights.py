@@ -131,7 +131,7 @@ class TestInklingMTPLoadWeights(unittest.TestCase):
         )
         from tokenspeed.runtime.utils.env import global_server_args_dict
 
-        mapping = Mapping(rank=0, world_size=1)
+        mapping = Mapping(rank=0, world_size=1, attn_token_parallel_size=1)
         global_server_args_dict["mapping"] = mapping
         global_server_args_dict["enable_prefix_caching"] = False
         cls.config = _nextn_config()
@@ -250,7 +250,7 @@ class TestInklingMTPLoadWeights(unittest.TestCase):
             InklingForConditionalGenerationNextN,
         )
 
-        mapping = Mapping(rank=0, world_size=1)
+        mapping = Mapping(rank=0, world_size=1, attn_token_parallel_size=1)
         with torch.device("cuda"):
             torch.set_default_dtype(torch.bfloat16)
             try:
@@ -281,7 +281,7 @@ class TestInklingMTPLoadWeightsSWADepths(unittest.TestCase):
         )
         from tokenspeed.runtime.utils.env import global_server_args_dict
 
-        cls.mapping = Mapping(rank=0, world_size=1)
+        cls.mapping = Mapping(rank=0, world_size=1, attn_token_parallel_size=1)
         global_server_args_dict["mapping"] = cls.mapping
         global_server_args_dict["enable_prefix_caching"] = False
         cls.config = _nextn_config(cls.NUM_DEPTHS, cls.LOCAL_IDS)

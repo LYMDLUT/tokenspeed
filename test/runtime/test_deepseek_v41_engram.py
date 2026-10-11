@@ -112,6 +112,7 @@ def _mapping(rank, tp_size, world_size):
         attn_tp_size=tp_size,
         attn_cp_size=1,
         attn_dp_size=world_size // tp_size,
+        attn_token_parallel_size=1,
         dense_tp_size=world_size,
         dense_dp_size=1,
         moe_tp_size=1,

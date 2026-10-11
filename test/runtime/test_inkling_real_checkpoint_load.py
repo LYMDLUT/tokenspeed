@@ -162,7 +162,7 @@ class TestInklingRealCheckpointLoad(unittest.TestCase):
         # Same precomputed-topk backend the engine resolves for Inkling (the
         # standalone auto default plans its own routing, which Inkling rejects).
         moe_utils.MOE_BACKEND = moe_utils.MoeBackend.FLASHINFER_CUTLASS
-        mapping = Mapping(rank=0, world_size=1)
+        mapping = Mapping(rank=0, world_size=1, attn_token_parallel_size=1)
         global_server_args_dict["mapping"] = mapping
         global_server_args_dict["enable_prefix_caching"] = False
         config = get_config(ckpt, trust_remote_code=False, revision=None)

@@ -254,6 +254,7 @@ def test_iris_lamport_requires_attention_and_moe_tp8(
             rank=rank,
             world_size=world,
             attn_tp_size=attn_tp,
+            attn_token_parallel_size=1,
             moe_tp_size=moe_tp,
             moe_ep_size=moe_ep,
         )

@@ -256,22 +256,26 @@ class HYV4Attention(GlmMoeDsaAttention):
                 prefix=add_prefix("linear_gate", prefix),
             )
 
-        # This rank's slice of the per-head sink logits; the DSA backend reads
-        # it off ``attn_mqa`` once ``bind_learnable_sink`` publishes it.
+        # The sink logits of the heads this rank's sparse attention computes:
+        # its token-parallel group's heads, which are just the TP-local heads
+        # without token parallelism. The DSA backend reads them off
+        # ``attn_mqa`` once ``bind_learnable_sink`` publishes them.
         self.learnable_sink_param: nn.Parameter | None = None
         if config.learnable_sink:
+            num_sink_heads = self.num_local_heads * mapping.attn.token_parallel_size
             self.learnable_sink_param = nn.Parameter(
-                torch.empty(self.num_local_heads, dtype=torch.float32),
+                torch.empty(num_sink_heads, dtype=torch.float32),
                 requires_grad=False,
             )
-            head_start = mapping.attn.tp_rank * self.num_local_heads
-            num_local_heads = self.num_local_heads
+            head_start = (
+                mapping.attn.tp_rank // mapping.attn.token_parallel_size
+            ) * num_sink_heads
 
             def load_sink(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
-                local = loaded_weight.reshape(-1)[
-                    head_start : head_start + num_local_heads
+                heads = loaded_weight.reshape(-1)[
+                    head_start : head_start + num_sink_heads
                 ]
-                param.data.copy_(local.to(torch.float32))
+                param.data.copy_(heads.to(torch.float32))
 
             self.learnable_sink_param.weight_loader = load_sink
 

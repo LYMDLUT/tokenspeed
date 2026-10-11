@@ -374,7 +374,7 @@ class TestQwen3OmniModelHelpers(unittest.TestCase):
         tower = (
             Qwen3VLMoeVisionModel(
                 _shared_vision_config(config),
-                Mapping(rank=0, world_size=1),
+                Mapping(rank=0, world_size=1, attn_token_parallel_size=1),
                 prefix="visual",
             )
             .cuda()

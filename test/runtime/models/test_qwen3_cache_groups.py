@@ -6,7 +6,7 @@ from tokenspeed.runtime.models.qwen3 import Qwen3Attention
 def _attention(config: Qwen3Config, layer_id: int) -> Qwen3Attention:
     return Qwen3Attention(
         config=config,
-        mapping=Mapping(rank=0, world_size=1),
+        mapping=Mapping(rank=0, world_size=1, attn_token_parallel_size=1),
         hidden_size=config.hidden_size,
         num_heads=config.num_attention_heads,
         num_kv_heads=config.num_key_value_heads,

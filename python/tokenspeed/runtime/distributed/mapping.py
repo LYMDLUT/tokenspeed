@@ -57,6 +57,25 @@ def _resolve_dcp_size(tp_size: int, cp_size: int, dcp_size: int) -> int:
     return dcp_size
 
 
+def _resolve_token_parallel_size(
+    tp_size: int, dcp_size: int, token_parallel_size: int
+) -> int:
+    """Validate attention token parallelism within resolved attention TP."""
+    if (
+        isinstance(token_parallel_size, bool)
+        or not isinstance(token_parallel_size, int)
+        or token_parallel_size < 1
+    ):
+        raise ValueError("token_parallel_size must be a positive integer")
+    if tp_size % token_parallel_size:
+        raise ValueError(
+            "attention TP size must be divisible by the token-parallel size"
+        )
+    if token_parallel_size > 1 and dcp_size > 1:
+        raise ValueError("attention token parallelism does not yet combine with DCP")
+    return token_parallel_size
+
+
 def _make_parallelism_rank(rank: int, size: int, stride: int = 1) -> int:
     """Return the rank of given size and stride."""
     return (rank // stride) % size
@@ -149,16 +168,36 @@ class AttentionLayerMapping(MappingBase):
         cp_size: int | None = None,
         dp_size: int | None = None,
         dcp_size: int = 1,
+        *,
+        token_parallel_size: int,
     ):
         super().__init__(rank, world_size)
         self.tp_size, self.cp_size, self.dp_size = _resolve_parallelism_sizes(
             self.world_size, tp_size, cp_size, dp_size
         )
         self.dcp_size = _resolve_dcp_size(self.tp_size, self.cp_size, dcp_size)
+        self.token_parallel_size = _resolve_token_parallel_size(
+            self.tp_size, self.dcp_size, token_parallel_size
+        )
 
     @property
     def has_dcp(self) -> bool:
         return self.dcp_size > 1
+
+    @property
+    def has_token_parallel(self) -> bool:
+        return self.token_parallel_size > 1
+
+    @cached_property
+    def token_parallel_rank(self) -> int:
+        """Rank within the consecutive token-parallel subgroup of attention TP."""
+        return _make_parallelism_rank(self.rank, self.token_parallel_size, stride=1)
+
+    @cached_property
+    def token_parallel_group(self) -> Group:
+        """Consecutive attention-TP ranks that split sparse-attention query rows
+        among themselves, each attending its rows with all the group's heads."""
+        return _make_parallelism_group(self.rank, self.token_parallel_size, stride=1)
 
     @cached_property
     def dcp_rank(self) -> int:
@@ -399,6 +438,7 @@ class Mapping(MappingBase):
         attn_cp_size: int | None = None,
         attn_dp_size: int | None = None,
         attn_dcp_size: int = 1,
+        attn_token_parallel_size: int,
         dense_tp_size: int | None = None,
         dense_dp_size: int | None = None,
         moe_tp_size: int | None = None,
@@ -441,6 +481,7 @@ class Mapping(MappingBase):
             cp_size=attn_cp_size,
             dp_size=attn_dp_size,
             dcp_size=attn_dcp_size,
+            token_parallel_size=attn_token_parallel_size,
         )
         self.dense = DenseLayerMapping(
             rank=rank,
@@ -478,6 +519,13 @@ class Mapping(MappingBase):
         self.nprocs_per_node, self.nnodes = _resolve_parallelism_sizes(
             self.world_size, nprocs_per_node, nnodes
         )
+        if self.nprocs_per_node % self.attn.token_parallel_size:
+            raise ValueError(
+                "attention token-parallel size "
+                f"{self.attn.token_parallel_size} must divide the "
+                f"{self.nprocs_per_node} ranks per node, so that every "
+                "token-parallel group stays inside one node"
+            )
         assert base_gpu_id >= 0
         assert gpu_id_step > 0
         self.base_gpu_id = base_gpu_id
@@ -560,7 +608,7 @@ class Mapping(MappingBase):
             f"Mapping(rank={rank_str}, world_size={self.world_size})",
             f"  Cluster : {self.nnodes} node(s) x {self.nprocs_per_node} proc(s)",
             f"  Pipeline: pp={self.pp_size}",
-            f"  Attention: tp={self.attn.tp_size}  dcp={self.attn.dcp_size}  cp={self.attn.cp_size}  dp={self.attn.dp_size}",
+            f"  Attention: tp={self.attn.tp_size}  dcp={self.attn.dcp_size}  token_parallel={self.attn.token_parallel_size}  cp={self.attn.cp_size}  dp={self.attn.dp_size}",
             f"    Vision: tp={self.vision.tp_size}  item_dp={self.vision.dp_size}",
             f"  Dense   : tp={self.dense.tp_size}  dp={self.dense.dp_size}",
             f"  MoE     : tp={self.moe.tp_size}  ep={self.moe.ep_size}  dp={self.moe.dp_size}",

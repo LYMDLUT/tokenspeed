@@ -70,6 +70,8 @@ def _model_wide_kwargs(**overrides) -> dict:
         kernel_page_size=64,
         context_len=1024,
         max_bs=2,
+        token_parallel_rank=0,
+        token_parallel_group=(0,),
     )
     kwargs.update(overrides)
     return kwargs

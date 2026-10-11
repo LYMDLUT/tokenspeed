@@ -30,13 +30,15 @@ def _tiny_qwen3_moe_config() -> Qwen3MoeConfig:
 
 
 def _single_rank_mapping() -> Mapping:
-    mapping = Mapping(rank=0, world_size=1)
+    mapping = Mapping(rank=0, world_size=1, attn_token_parallel_size=1)
     global_server_args_dict["mapping"] = mapping
     return mapping
 
 
 def _ep_rank_mapping(rank: int) -> Mapping:
-    mapping = Mapping(rank=rank, world_size=4, moe_ep_size=4)
+    mapping = Mapping(
+        rank=rank, world_size=4, attn_token_parallel_size=1, moe_ep_size=4
+    )
     global_server_args_dict["mapping"] = mapping
     return mapping
 

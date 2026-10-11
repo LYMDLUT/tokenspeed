@@ -53,6 +53,8 @@ def _cfg() -> AttnConfig:
         speculative_num_steps=3,
         speculative_num_draft_tokens=4,
         is_draft=True,
+        token_parallel_rank=0,
+        token_parallel_group=(0,),
         components=(spec,),
     )
 
@@ -131,6 +133,8 @@ def _msa_backend() -> MSAAttnBackend:
         speculative_num_steps=3,
         speculative_num_draft_tokens=4,
         is_draft=True,
+        token_parallel_rank=0,
+        token_parallel_group=(0,),
         components=(spec,),
     )
     return MSAAttnBackend(config, spec, kernel_page_size=64)

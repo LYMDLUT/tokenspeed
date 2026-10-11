@@ -200,7 +200,7 @@ def test_tiny_asr_wrapper_loads_audio_and_language_roots():
     with torch.device("cuda"):
         model = Qwen3ASRForConditionalGeneration(
             config,
-            Mapping(rank=0, world_size=1),
+            Mapping(rank=0, world_size=1, attn_token_parallel_size=1),
             mm_attention_backend="triton_attn",
         ).eval()
 
@@ -233,7 +233,9 @@ def test_asr_wrapper_rejects_audio_text_dimension_mismatch():
     config = _tiny_asr_config()
     config.thinker_config.audio_config.output_dim = 8
     with pytest.raises(ValueError, match="output_dim"):
-        Qwen3ASRForConditionalGeneration(config, Mapping(rank=0, world_size=1))
+        Qwen3ASRForConditionalGeneration(
+            config, Mapping(rank=0, world_size=1, attn_token_parallel_size=1)
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="audio tower needs CUDA")
@@ -248,7 +250,7 @@ def test_tiny_audio_tower_matches_transformers_and_loads_fused_qkv():
     from tokenspeed.runtime.distributed.mapping import Mapping
 
     config = Qwen3OmniMoeAudioEncoderConfig(**vars(_tiny_config()))
-    mapping = Mapping(rank=0, world_size=1)
+    mapping = Mapping(rank=0, world_size=1, attn_token_parallel_size=1)
     torch.manual_seed(4)
     reference = HFAudioEncoder(config).cuda().eval()
     with torch.device("cuda"):

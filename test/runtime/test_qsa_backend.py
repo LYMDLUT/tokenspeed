@@ -133,6 +133,8 @@ def _qsa_config(*, max_bs: int, is_draft: bool, device: str) -> AttnConfig:
         speculative_num_draft_tokens=4,
         is_draft=is_draft,
         draft_block_decode=False,
+        token_parallel_rank=0,
+        token_parallel_group=(0,),
         components=(spec,),
     )
     return config

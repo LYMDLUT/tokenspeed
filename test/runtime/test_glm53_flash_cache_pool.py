@@ -92,6 +92,8 @@ def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
         prefix_granularity=GLM53_FLASH_LOGICAL_BLOCK_TOKENS,
         context_len=4096,
         max_bs=8,
+        token_parallel_rank=0,
+        token_parallel_group=(0,),
         components=(dsa, linear),
     )
     draft_attn_config = replace(

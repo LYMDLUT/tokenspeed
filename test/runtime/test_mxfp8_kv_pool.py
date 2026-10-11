@@ -329,6 +329,8 @@ def _make_config(prefix_granularity: int):
         context_len=4096,
         max_bs=8,
         kv_cache_quant_method="none",
+        token_parallel_rank=0,
+        token_parallel_group=(0,),
         components=(spec,),
     )
 

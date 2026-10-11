@@ -168,6 +168,7 @@ class TestLongcatMoePlan(unittest.TestCase):
             rank=0,
             world_size=4,
             attn_tp_size=4,
+            attn_token_parallel_size=1,
             moe_tp_size=1,
             moe_ep_size=4,
         )

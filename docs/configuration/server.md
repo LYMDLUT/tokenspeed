@@ -152,6 +152,7 @@ issue budget, while `--max-total-tokens` controls the global token pool.
 | --- | --- |
 | `--tensor-parallel-size`, `--tp` | Familiar alias for setting attention tensor parallel size. |
 | `--attn-tp-size` | Tensor parallel size for attention. |
+| `--attn-token-parallel-size` | DSA sparse attention only: split query rows over consecutive groups of this many attention TP ranks, each attending its rows with the whole group's heads (default 1, off). Cuts the head padding of sparse kernels when few heads are TP-local. Requires the GPU DSA backend on CUDA and no decode context parallelism, must divide the attention TP size and `--nprocs-per-node` (every group stays inside one node), and all ranks of a group must have the same SM count. A non-DSA draft model keeps attending on its own rank. |
 | `--dense-tp-size` | Tensor parallel size for dense layers. Defaults to the attention replica width (attn TP x CP): the full world without DP attention, one replica with it. |
 | `--moe-tp-size` | Tensor parallel size for MoE layers. |
 | `--data-parallel-size` | Number of data-parallel replicas. |

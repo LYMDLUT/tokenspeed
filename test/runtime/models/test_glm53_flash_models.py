@@ -242,7 +242,7 @@ def _build_model(monkeypatch) -> Glm53FlashForConditionalGeneration:
     monkeypatch.setattr(glm53_flash, "Glm53FlashForCausalLM", _FakeLanguageModel)
     return Glm53FlashForConditionalGeneration(
         _tiny_config(),
-        mapping=Mapping(rank=0, world_size=1),
+        mapping=Mapping(rank=0, world_size=1, attn_token_parallel_size=1),
     )
 
 
@@ -358,6 +358,7 @@ def test_kda_checkpoint_input_weights_load_into_one_projection(monkeypatch) -> N
         world_size=2,
         attn_tp_size=1,
         attn_dp_size=2,
+        attn_token_parallel_size=1,
         linear_attn_tp_size=2,
         dense_tp_size=2,
         moe_tp_size=2,
@@ -427,7 +428,7 @@ def test_kda_checkpoint_input_weights_load_into_one_projection(monkeypatch) -> N
 
 
 def test_text_and_nextn_model_hierarchies(monkeypatch) -> None:
-    mapping = Mapping(rank=0, world_size=1)
+    mapping = Mapping(rank=0, world_size=1, attn_token_parallel_size=1)
     monkeypatch.setitem(global_server_args_dict, "mapping", mapping)
     monkeypatch.setitem(global_server_args_dict, "attention_backend", "dsa")
     monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
@@ -450,7 +451,7 @@ def test_decode_topk_workspaces_reuse_storage_and_retain_grown_buffers() -> None
     with torch.device("meta"):
         attention = Glm53FlashAttention(
             _tiny_text_config(),
-            Mapping(rank=0, world_size=1),
+            Mapping(rank=0, world_size=1, attn_token_parallel_size=1),
             layer_id=3,
             quant_config=None,
             prefix="model.layers.3.self_attn",
@@ -488,7 +489,7 @@ def test_nextn_checkpoint_prefix_preserves_bf16_kv_b_projection() -> None:
     with torch.device("meta"):
         attention = Glm53FlashAttention(
             _tiny_text_config(),
-            Mapping(rank=0, world_size=1),
+            Mapping(rank=0, world_size=1, attn_token_parallel_size=1),
             layer_id=0,
             quant_config=quant_config,
             prefix="model.layers.4.self_attn",
