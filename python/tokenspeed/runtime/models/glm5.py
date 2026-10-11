@@ -96,6 +96,9 @@ class GlmDsaPrefillTopK:
 class GlmDsaDecodeTopK:
     topk_indices: torch.Tensor
     topk_lens: torch.Tensor
+    # Batch token row held by row 0: a selection over only the decode rows of
+    # a mixed batch starts past its extend rows.
+    row_offset: int
 
 
 @dataclass(frozen=True)
@@ -473,6 +476,13 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         start: int,
         end: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        start -= decode_topk.row_offset
+        end -= decode_topk.row_offset
+        if start < 0 or end > decode_topk.topk_indices.shape[0]:
+            raise RuntimeError(
+                "GLM DSA decode window is outside the selected top-k rows: "
+                f"rows [{start}, {end}) of {decode_topk.topk_indices.shape[0]}"
+            )
         return decode_topk.topk_indices[start:end], decode_topk.topk_lens[start:end]
 
     def _retire_decode_workspace(self, buffer: torch.Tensor) -> None:
@@ -533,7 +543,6 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             page_table=page_table,
             q_len_per_req=decode_window.q_len_per_req,
             decode_start=decode_window.start,
-            num_tokens=num_tokens,
             num_decode_tokens=decode_window.num_tokens,
             topk=topk,
         )
@@ -547,7 +556,6 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         page_table: torch.Tensor,
         q_len_per_req: int,
         decode_start: int,
-        num_tokens: int,
         num_decode_tokens: int,
         topk: int,
     ) -> GlmDsaDecodeTopK:
@@ -559,21 +567,17 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         if index_k_cache is None:
             raise RuntimeError("GLM DSA top-k requires an index-K cache.")
 
-        # The top-k kernels overwrite the whole workspace when they cover all
-        # rows; the sentinel pre-fills are only needed for mixed prefill,
-        # where leading rows stay unwritten but readable.
-        writes_full_workspace = decode_start == 0 and num_decode_tokens == num_tokens
+        # Only the decode rows, which the top-k kernels overwrite in full: a
+        # mixed batch's extend rows select through the prefill path. Sizing
+        # by the whole batch would grow every indexer layer's workspace, and
+        # the outgrown ones a captured decode graph keeps alive, to the
+        # chunked-prefill size.
         topk_indices = self._get_decode_topk_workspace(
-            num_tokens,
-            topk,
-            q.device,
-            fill_value=None if writes_full_workspace else -1,
+            num_decode_tokens, topk, q.device, fill_value=None
         )
-        topk_slice = topk_indices[decode_start : decode_start + num_decode_tokens]
         topk_lens = self._get_decode_topk_lens_workspace(
-            num_tokens, q.device, fill=not writes_full_workspace
+            num_decode_tokens, q.device, fill=False
         )
-        topk_lens_slice = topk_lens[decode_start : decode_start + num_decode_tokens]
 
         metadata = ctx.attn_backend.forward_decode_metadata
         # _dsa_seq_lens_2d is per-token ([bs * q_len_per_req, 1]); skip the extend
@@ -613,10 +617,10 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             pages = page_table[
                 requests.long().unsqueeze(1), offsets.clamp_min(0).long() // page_size
             ]
-            topk_slice.copy_(
+            topk_indices.copy_(
                 torch.where(offsets >= 0, pages * page_size + offsets % page_size, -1)
             )
-            topk_lens_slice.copy_(counts)
+            topk_lens.copy_(counts)
         else:
             dsa_decode_topk(
                 q,
@@ -631,13 +635,14 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 index_k_cache=index_k_cache,
                 seq_lens_2d=seq_lens_2d,
                 plan=metadata._dsa_plan,
-                out=topk_slice,
-                lens_out=topk_lens_slice,
+                out=topk_indices,
+                lens_out=topk_lens,
                 slot_order=global_server_args_dict["dsa_slot_order"],
             )
         return GlmDsaDecodeTopK(
             topk_indices=topk_indices,
             topk_lens=topk_lens,
+            row_offset=decode_start,
         )
 
     def _compute_prefill_topk_indices(
