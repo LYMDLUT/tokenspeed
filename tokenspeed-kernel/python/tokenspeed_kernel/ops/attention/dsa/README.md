@@ -46,6 +46,16 @@ output buffers retain their identity. Decode transposes the vendor's
 `[batch, heads, query]` LSE to token-major order. This does not reinterpret
 regular BF16 KV as packed FP8 or change its Triton decode selection.
 
+FlashMLA sparse prefill attends each query row in one CTA that walks the row's
+selected columns serially, so a launch with fewer rows than SMs (regular-KV
+decode and verify, short prompts) is bound by one row's walk while most SMs
+idle. Such launches split every row's columns into slices that keep the
+kernel's 128-column alignment, run the slices as independent rows and merge
+them by their LSE; the sink is applied once, to the merged softmax. Splitting
+stops while the split launch still fits one wave. The partials are rounded to
+BF16 before the FP32 merge, so results match a single launch to within that
+rounding.
+
 ## Sharded Index-K candidates
 
 `dsa_index_candidates` scores a bounded query tile against rank-local Index-K
