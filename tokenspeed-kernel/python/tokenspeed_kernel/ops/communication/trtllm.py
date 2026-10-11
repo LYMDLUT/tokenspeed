@@ -226,7 +226,7 @@ if current_platform().is_nvidia:
         that kills the next allocation. So this must be decided before trying,
         not caught afterwards.
         """
-        from tokenspeed_kernel.ops.communication.fabric import _host_identity
+        from tokenspeed_kernel.ops.communication.fabric import host_identity
 
         # Pods on different machines can share a hostname, and containers on
         # one machine without a shared IPC namespace cannot open each other's
@@ -242,9 +242,7 @@ if current_platform().is_nvidia:
                 else dist.get_world_size()
             )
             names = [None] * world
-            dist.all_gather_object(
-                names, (_host_identity(), ipc_namespace), group=group
-            )
+            dist.all_gather_object(names, (host_identity(), ipc_namespace), group=group)
             return len(set(names)) > 1
         except Exception:  # noqa: BLE001 -- no distributed context: single node
             return False
