@@ -172,18 +172,29 @@ def _gateway_args_with_default_reasoning_parser(gateway_args: list[str]) -> list
     return [*gateway_args, "--reasoning-parser", DEFAULT_REASONING_PARSER]
 
 
+def _operator_flag_value(gateway_args: list[str], flag: str) -> str | None:
+    """The operator's explicit ``flag`` value (last-wins), or None.
+
+    Reads both the ``flag value`` and the ``flag=value`` spelling, so the
+    defaults stay correct on argv that did not pass through ``split_argv``'s
+    normalization. Call before the matching ``_gateway_args_with_default_*``
+    helper injects a default.
+    """
+    value = None
+    for i, arg in enumerate(gateway_args):
+        if arg == flag and i + 1 < len(gateway_args):
+            value = gateway_args[i + 1]
+        elif arg.startswith(f"{flag}="):
+            value = arg.split("=", 1)[1]
+    return value
+
+
 def _operator_policy(gateway_args: list[str]) -> str | None:
     """The operator's explicit ``--policy`` value (last-wins), or None.
 
     Call before ``_gateway_args_with_default_policy`` injects a default.
     """
-    policy = None
-    for i, arg in enumerate(gateway_args):
-        if arg == "--policy" and i + 1 < len(gateway_args):
-            policy = gateway_args[i + 1]
-        elif arg.startswith("--policy="):
-            policy = arg.split("=", 1)[1]
-    return policy
+    return _operator_flag_value(gateway_args, "--policy")
 
 
 def _gateway_args_with_smg_disable_defaults(gateway_args: list[str]) -> list[str]:
@@ -280,7 +291,7 @@ def _gateway_args_with_default_health_check_timeout(
     a long-prefill backlog is marked unhealthy and, being the only worker, turns
     every request into a 503 until two probes pass again.
     """
-    if "--health-check-timeout-secs" in gateway_args:
+    if _operator_flag_value(gateway_args, "--health-check-timeout-secs") is not None:
         return gateway_args
     engine_timeout = envs.TOKENSPEED_HEALTH_CHECK_TIMEOUT.get()
     if engine_timeout <= 0:
