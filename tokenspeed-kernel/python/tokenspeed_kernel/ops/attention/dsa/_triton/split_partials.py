@@ -128,7 +128,8 @@ def merge_split_partials(
         splits: Splits per original row.
         heads: Leading heads to merge; padded heads past it are ignored.
         sink: FP32 sink logits covering ``heads``, or explicitly None.
-        out: Output buffer [rows, heads, dim] written in place, or None.
+        out: Contiguous output buffer of ``rows * heads * dim`` elements in
+            ``partial_out``'s dtype, written in place, or None.
         return_lse: Whether to also return the merged LSE.
 
     Returns:
@@ -155,8 +156,16 @@ def merge_split_partials(
     if out is None:
         result = partial_out.new_empty((rows, heads, dim))
     else:
-        if out.numel() != rows * heads * dim or out.dtype != partial_out.dtype:
-            raise ValueError("split partial output buffer does not match the merge")
+        if (
+            out.numel() != rows * heads * dim
+            or out.dtype != partial_out.dtype
+            or not out.is_contiguous()
+        ):
+            raise ValueError(
+                "split partial output buffer must be a contiguous "
+                f"{partial_out.dtype} tensor of {rows * heads * dim} elements, "
+                f"got {out.dtype} {tuple(out.shape)} with strides {out.stride()}"
+            )
         result = out.view(rows, heads, dim)
     lse = (
         torch.empty((rows, heads), dtype=torch.float32, device=partial_out.device)
