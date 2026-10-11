@@ -480,21 +480,30 @@ class DSABackend(PagedAttentionBackend):
             num_extends=num_extends,
             for_graph_replay=for_graph_replay,
         )
-        self._publish_k_row_indexer_rows(self.forward_decode_metadata, seq_lens, bs)
+        self._publish_k_row_indexer_rows(
+            self.forward_decode_metadata, seq_lens, bs, num_extends=num_extends
+        )
 
     def _publish_k_row_indexer_rows(
-        self, metadata, seq_lens: torch.Tensor, bs: int, *, plan_from_row: int = 0
+        self, metadata, seq_lens: torch.Tensor, bs: int, *, num_extends: int = 0
     ) -> None:
         """Rewrite the per-token indexer rows to ``seq_lens[:bs]`` (``k`` rows
-        per request) and refresh their plan from row ``plan_from_row`` on,
-        both in place: fixed shapes and storage, so a captured graph replays
-        the edit. The first publication at a bs allocates them on the dense
-        leaf's per-bs view, which the decode graph of that bs captures and a
-        mixed round of that bs reuses; rebinding them later would leave the
-        graph replaying a stale plan against live lengths, which the kernel's
-        scheduler can run past forever. The rows are a copy even for
-        ``k == 1``, so a later edit writes no caller's ``seq_lens``."""
+        per request) and refresh the plan of their decode rows, both in place:
+        fixed shapes and storage, so a captured graph replays the edit. The
+        first publication at a bs allocates them on the dense leaf's per-bs
+        view, which the decode graph of that bs captures and a mixed round of
+        that bs reuses; rebinding them later would leave the graph replaying a
+        stale plan against live lengths, which the kernel's scheduler can run
+        past forever. The rows are a copy even for ``k == 1``, so a later edit
+        writes no caller's ``seq_lens``.
+
+        The decode top-k scores only the rows past the ``num_extends`` leading
+        extend requests of a mixed round (the target's, or the draft's first
+        step after it), so the plan covers exactly those: a plan over the
+        extend rows too schedules the kernel past the rows it is given. A
+        round without decode rows never reads the plan; it covers every row."""
         k = self.spec_num_tokens
+        plan_from_row = num_extends * k if num_extends < bs else 0
         rows = metadata._dsa_seq_lens_2d
         if rows is None:
             with torch.inference_mode(False):
@@ -619,15 +628,8 @@ class DSABackend(PagedAttentionBackend):
         # A draft's plan is rebuilt by the wrapper's refresh_decode_metadata
         # after this init (the unified draft contract).
         if forward_mode.is_mixed() and not self.is_draft:
-            # Plan the decode rows only, past the extend requests' per-token
-            # block; without decode rows the plan is unused and covers all.
             self._publish_k_row_indexer_rows(
-                self.forward_decode_metadata,
-                seq_lens,
-                bs,
-                plan_from_row=(
-                    num_extends * self.spec_num_tokens if num_extends < bs else 0
-                ),
+                self.forward_decode_metadata, seq_lens, bs, num_extends=num_extends
             )
 
         self._prefill_page_table = None
