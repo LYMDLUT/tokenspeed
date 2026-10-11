@@ -691,13 +691,18 @@ TEST_F(StatePublicationSuite, PrefillDoneRetractionUsesActualPrefillEndWithSpecu
         const ForwardBatch* initial_batch = FindForwardBatch(prefill);
         ASSERT_NE(initial_batch, nullptr);
         ASSERT_EQ(initial_batch->request_ids, std::vector<std::string>{id});
+        AckWriteBacks(prefill);
         SendForwardDone(id, {id == "a" ? 41 : 141});
     }
 
     // The mixed-mode prefill reserve leaves too little token budget for a
     // decode, so the third request forces a retraction while both residents
-    // are still PrefillDone. All 8 prompt tokens are computed, even though
-    // TokenSize() - decode_input_tokens is only 9 - 5 = 4.
+    // are still PrefillDone. Each published its prompt when the round after
+    // its prefill started, at all 8 computed prompt tokens, even though
+    // TokenSize() - decode_input_tokens is only 9 - 5 = 4: a in the previous
+    // plan, so the victim's image finds its published pages on Host and its
+    // L2 leg copies none; b in this one, a live request's publication, pinned
+    // until its ACK.
     const ExecutionPlan retract = PlanOnce();
     const ForwardBatch* replacement = FindForwardBatch(retract);
     ASSERT_NE(replacement, nullptr);
@@ -708,14 +713,14 @@ TEST_F(StatePublicationSuite, PrefillDoneRetractionUsesActualPrefillEndWithSpecu
     for (const CacheOperation& operation : ExtractCacheOpsOfKind<WriteBackBatch>(retract)) {
         const auto& stores = std::get<WriteBackBatch>(operation);
         for (std::size_t i = 0; i < stores.op_ids.size(); ++i) {
-            EXPECT_FALSE(stores.source_pinned.at(i));
+            EXPECT_TRUE(stores.source_pinned.at(i));
             history_stores +=
                 static_cast<std::int32_t>(std::count(stores.group_ids.at(i).begin(), stores.group_ids.at(i).end(), 0u));
         }
     }
     EXPECT_EQ(history_stores, 2);
     AckImageStores(retract);
-    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 3);
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
     SendForwardDone("c", {241});
     for (const std::string& id : {"a", "b", "c"}) {
         SendAbortEvent(id);
