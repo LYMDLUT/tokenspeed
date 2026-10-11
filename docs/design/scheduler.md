@@ -413,12 +413,16 @@ and the runtime fences the **forward thread's stream** on the D2H copy's
 completion ahead of everything else the plan does to those pages — that
 stream carries the zeroing, fences the forwards, and gates a granted remote
 prefill's RDMA trigger (see `DeviceHandle.execute` and `event-loop.md`) — so
-the copy reads the old bytes whatever the scheduler does with the pages. This
-is the one store that pays for its ordering on the forward's critical path,
-and it has to: the pages are gone in the same round.
+the copy reads the old bytes whatever the scheduler does with the pages. The
+retraction drains the whole store queue under that guard, so candidates queued
+earlier in the round, such as the final prompt boundary of a `PrefillDone`
+request, are stream-ordered as well: always safe, only slower. These are the
+only stores that pay for their ordering on the forward's critical path, and
+the snapshot has to: its pages are gone in the same round.
 
-**Every other store pins its Device sources until the ack.** Boundary
-publications of a live request and the finish-time flush are issued with
+**Every store drained outside a retraction pins its Device sources until the
+ack.** Boundary publications drained after a plan's forward batch is built and
+the finish-time flush are issued with
 `StoreSourceGuard::kPinnedUntilAck`: the ticket holds a `CacheBlockRef` on
 each source, so the block stays cached and unevictable — the admission planner
 cannot take it, `ClearDeviceCache` refuses, `NumNewlyReleasableLcmBlocks` does

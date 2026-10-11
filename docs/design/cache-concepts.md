@@ -642,10 +642,14 @@ Its responsibilities:
   non-state Device pages and the newest existing prefill checkpoint per state
   group are queued before request ownership is released. Ordinary
   sliding-window entries always stream when published. The queue is drained by
-  `TierTransferManager::StartPendingStores(guard)`: every store but a
-  retraction's snapshot pins its Device sources until the ACK; the snapshot
-  store is stream-ordered instead, because its sources are re-granted in the
-  same round (`scheduler.md` §2).
+  `TierTransferManager::StartPendingStores(guard)`, and every candidate a drain
+  takes gets that drain's guard. The drain after a plan's forward batch is
+  built and the finish-time drain pin their Device sources until the ACK. A
+  retraction drains stream-ordered instead, because the victim's sources are
+  re-granted in the same round; that drain carries every other candidate still
+  queued too, such as the final prompt boundary a `PrefillDone` request queued
+  at round start, so those stores are stream-ordered as well
+  (`scheduler.md` §2).
 * **L3 under flat KV.** Host L2 is one compact pinned byte buffer indexed by
   CacheBlock IDs. Optional L3 (Mooncake Store) sits *below* that buffer, not
   beside GPU pages: after D2H, the runtime `batch_put_from`s each packed
