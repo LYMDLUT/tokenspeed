@@ -59,6 +59,9 @@ __all__ = [
 platform = current_platform()
 
 if platform.is_hopper_plus:
+    from tokenspeed_kernel.ops.attention.dsa._triton.split_partials import (
+        merge_split_partials,
+    )
     from tokenspeed_kernel.ops.attention.mla.cuda import (
         flash_mla_sparse_fwd,
         flash_mla_with_kvcache,
@@ -67,6 +70,41 @@ if platform.is_hopper_plus:
 
 _decode_sched_meta_cache: dict[tuple, object] = {}
 _query_workspace_cache: dict[tuple, torch.Tensor] = {}
+_sm_counts: dict[int, int] = {}
+
+# FlashMLA's sparse prefill kernel walks a row's columns in pairs of 64-column
+# blocks and asserts the row width is a whole number of pairs; a column split
+# must keep every slice at that alignment.
+_FLASHMLA_SPARSE_TOPK_ALIGN = 128
+
+
+def _sm_count(device: torch.device) -> int:
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    count = _sm_counts.get(index)
+    if count is None:
+        count = torch.cuda.get_device_properties(index).multi_processor_count
+        _sm_counts[index] = count
+    return count
+
+
+def _flashmla_sparse_column_splits(rows: int, width: int, device: torch.device) -> int:
+    """Column splits per query row for a FlashMLA sparse prefill launch.
+
+    The kernel attends each query row in one CTA that walks the row's selected
+    columns serially, so a launch with fewer rows than SMs (decode, verify,
+    short prompts) is bound by one CTA's walk while most SMs idle. Slicing the
+    columns into independent rows, merged afterwards by their LSE, spreads
+    that walk over the idle SMs; it stops while the split launch still fits
+    one wave, past which splitting adds work without shortening the launch.
+    """
+    sms = _sm_count(device)
+    splits = 1
+    while (
+        rows * splits * 2 <= sms
+        and width % (splits * 2 * _FLASHMLA_SPARSE_TOPK_ALIGN) == 0
+    ):
+        splits *= 2
+    return splits
 
 
 def _flashmla_sparse_prefill_head_multiple() -> int:
@@ -296,6 +334,63 @@ def _finish_sparse_attention(
     return (result, lse) if return_lse else result
 
 
+def _flashmla_sparse_prefill_split(
+    *,
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    slots: torch.Tensor,
+    topk_lens: torch.Tensor | None,
+    sm_scale: float,
+    d_v: int,
+    attn_sink: torch.Tensor | None,
+    actual_heads: int,
+    splits: int,
+    out: torch.Tensor | None,
+    return_lse: bool,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """FlashMLA sparse prefill with every row's columns split ``splits`` ways.
+
+    Split ``s`` of row ``r`` becomes kernel row ``r * splits + s`` over the
+    columns ``[s * width, (s + 1) * width)``. The kernel runs without the sink
+    (it would scale each partial by its own denominator); the merge applies it
+    once to the combined softmax.
+    """
+    rows, padded_heads, head_dim = q.shape
+    width = slots.shape[-1] // splits
+    q_split = (
+        q.unsqueeze(1)
+        .expand(rows, splits, padded_heads, head_dim)
+        .reshape(rows * splits, padded_heads, head_dim)
+    )
+    starts = torch.arange(splits, device=q.device, dtype=torch.int32) * width
+    if topk_lens is None:
+        lens = torch.full(
+            (rows, 1), slots.shape[-1], device=q.device, dtype=torch.int32
+        )
+    else:
+        lens = topk_lens.reshape(rows, 1).to(torch.int32)
+    split_lens = (lens - starts).clamp_(0, width).reshape(-1)
+    partial, _, partial_lse = flash_mla_sparse_fwd(
+        q=q_split,
+        kv=kv,
+        indices=slots.reshape(rows * splits, 1, width),
+        sm_scale=sm_scale,
+        d_v=d_v,
+        attn_sink=None,
+        topk_length=split_lens,
+    )
+    return merge_split_partials(
+        partial,
+        partial_lse,
+        split_lens,
+        splits=splits,
+        heads=actual_heads,
+        sink=None if attn_sink is None else attn_sink[:actual_heads].contiguous(),
+        out=out,
+        return_lse=return_lse,
+    )
+
+
 if platform.is_nvidia and platform.is_hopper_plus:
 
     @register_kernel(
@@ -446,6 +541,23 @@ if platform.is_nvidia and platform.is_hopper_plus:
         q_kernel, actual_heads = _pad_prefill_query(q)
         kv = _flatten_regular_kv_cache(kv_cache, page_size)
         slots = _mask_sparse_slots(topk_slots, topk_lens)
+        splits = _flashmla_sparse_column_splits(
+            q_kernel.shape[0], slots.shape[-1], q_kernel.device
+        )
+        if splits > 1:
+            return _flashmla_sparse_prefill_split(
+                q=q_kernel,
+                kv=kv,
+                slots=slots,
+                topk_lens=topk_lens,
+                sm_scale=float(softmax_scale) * float(k_scale),
+                d_v=int(kv_lora_rank),
+                attn_sink=attn_sink,
+                actual_heads=actual_heads,
+                splits=splits,
+                out=out,
+                return_lse=return_lse,
+            )
         sink = (
             None
             if attn_sink is None
