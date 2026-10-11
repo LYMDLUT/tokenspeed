@@ -497,8 +497,8 @@ Constraints that follow from the architecture:
   the smaller of 2048 and the chunked-prefill size) replay breakable CUDA
   graphs. Only the sparse attention core (cache writes, the indexer top-k and
   FlashMLA) runs eagerly between the graph segments, and it drops the padded
-  rows itself. With MTP the prefill stays eager: the draft model has not been
-  validated under prefill graphs.
+  rows itself. MTP keeps the target's prefill graphs; the draft's first step
+  after a prefill runs eagerly.
 * Validated so far: the BF16 and MXFP8 checkpoints on four 8x H20 (96 GB)
   nodes with attention TP32 and EP32, and the MXFP8 checkpoint on two such
   nodes with TP16 and EP16. Keep the KV cache in BF16 unless you have
