@@ -123,6 +123,11 @@ def _ihc_check_common(
             f"iHC projection must have shape {(gate_count, hc_mult * hidden_size)}, "
             f"got {tuple(fn.shape)}"
         )
+    if hc_scale.shape != (gate_count // hc_mult,):
+        raise ValueError(
+            f"iHC scale must have shape {(gate_count // hc_mult,)}, "
+            f"got {tuple(hc_scale.shape)}"
+        )
     if hc_base.shape != (gate_count,):
         raise ValueError(
             f"iHC bias must have shape {(gate_count,)}, got {tuple(hc_base.shape)}"
@@ -204,6 +209,7 @@ def torch_ihc_pre(
         raise ValueError("norm_weight and norm_eps must be provided together")
     hc_mult = int(residual.shape[-2])
     hidden_size = int(residual.shape[-1])
+    outer_shape = residual.shape[:-2]
     pre, post = _ihc_gates(
         residual,
         fn,
@@ -215,14 +221,20 @@ def torch_ihc_pre(
         magnitude=magnitude,
     )
     assert post is not None
-    layer_input = torch.sum(
+    reduced = torch.sum(
         pre.unsqueeze(-1) * residual.reshape(-1, hc_mult, hidden_size).float(), dim=1
-    ).to(residual.dtype)
+    )
+    # The norm reads the reduction rounded to the residual dtype and runs in
+    # FP32, so the output is rounded to BF16 once.
+    layer_input = reduced.to(residual.dtype).float()
     if norm_weight is not None:
         layer_input = torch.nn.functional.rms_norm(
-            layer_input, (hidden_size,), norm_weight.to(residual.dtype), norm_eps
+            layer_input, (hidden_size,), norm_weight.float(), norm_eps
         )
-    return layer_input.to(torch.bfloat16), post
+    return (
+        layer_input.to(torch.bfloat16).reshape(*outer_shape, hidden_size),
+        post.reshape(*outer_shape, hc_mult),
+    )
 
 
 @register_kernel(
@@ -299,6 +311,7 @@ def torch_ihc_head(
         gate_count=hc_mult,
         magnitude=None,
     )
-    return torch.sum(
+    merged = torch.sum(
         gates.unsqueeze(-1) * residual.reshape(-1, hc_mult, hidden_size).float(), dim=1
-    ).to(torch.bfloat16)
+    )
+    return merged.to(torch.bfloat16).reshape(*residual.shape[:-2], hidden_size)
