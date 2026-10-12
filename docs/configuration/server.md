@@ -96,11 +96,14 @@ switch an envelope folds is also available individually under `auto`.
 | `--model-update-engine-type` | SDK `EngineType` member name for this engine, resolved as `EngineType[value.upper()]`. Required with `--model-update-config`. |
 | `--model-update-draft-weights` | `retain` or `refresh`: whether a Mooncake update also streams the speculative draft model's weights. Required with `--model-update-config`. |
 
-The smg gateway health-probes the engine with a one-token generate. `ts serve`
-sets the gateway's `--health-check-timeout-secs` to
-`TOKENSPEED_HEALTH_CHECK_TIMEOUT` (20 s by default) plus 5 s, so a scheduler
-busy with a long prefill backlog is not marked unhealthy while the engine's own
-probe is still waiting. Pass `--health-check-timeout-secs` to override it.
+The smg gateway health-probes the engine with a one-token generate, which
+passes on any scheduler output within `TOKENSPEED_HEALTH_CHECK_TIMEOUT` (20 s
+by default). An idle scheduler runs the generate; one that already holds
+requests answers the probe as soon as its loop reaches the next round, since a
+probe queued behind a long prefill backlog would see no output for minutes.
+`ts serve` sets the gateway's `--health-check-timeout-secs` to that timeout
+plus 5 s, so the gateway does not give up while the engine's probe is still
+waiting. Pass `--health-check-timeout-secs` to override it.
 
 ### Weight version metadata
 
