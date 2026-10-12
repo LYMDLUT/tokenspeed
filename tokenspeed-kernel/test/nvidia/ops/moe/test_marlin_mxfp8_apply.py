@@ -369,6 +369,46 @@ def test_dense_prefill_path_matches_reference(
     _assert_close(dense, marlin)
 
 
+def test_dense_prefill_path_shares_the_bf16_cutlass_call(monkeypatch):
+    """The dense path calls CUTLASS as the BF16 CUTLASS apply does: PDL off
+    even when the caller asks for it, on that apply's persistent workspace."""
+    _requires_sm90()
+    from tokenspeed_kernel.ops.moe.flashinfer import cutlass_unquant
+
+    calls = []
+
+    def fake_cutlass_fused_moe(**kwargs):
+        calls.append(kwargs)
+        return [torch.zeros_like(kwargs["input"])]
+
+    monkeypatch.setattr(cutlass_unquant, "cutlass_fused_moe", fake_cutlass_fused_moe)
+    generator = torch.Generator(device="cuda").manual_seed(31)
+    num_experts, top_k, hidden, ispp, num_tokens = 16, 4, 512, 256, 1024
+    raw = _make_weights(num_experts, hidden, ispp, generator)
+    x = torch.randn(num_tokens, hidden, generator=generator, device="cuda").to(
+        torch.bfloat16
+    )
+    topk_ids, topk_weights = _routing(num_tokens, num_experts, top_k, generator)
+    plan = {"activation": "swiglu", "deterministic_finalize": False}
+    w = _Experts(raw, 1, 0, 3.0)
+    marlin_mxfp8_moe_weights(plan, w)
+    marlin_mxfp8_precomputed_moe_apply(
+        plan,
+        x,
+        w,
+        None,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        enable_pdl=True,
+    )
+
+    (call,) = calls
+    assert call["enable_pdl"] is False
+    assert call["workspace_buffer"] is cutlass_unquant._workspaces[x.device]
+    assert call["use_fused_finalize"] is True
+    assert call["swiglu_limit"] is w._moe_backend_state.cutlass_swiglu_limit
+
+
 @pytest.mark.parametrize("num_tokens", [1, 2])
 @pytest.mark.parametrize("ispp", [512, 192])
 def test_gemv_path_matches_reference_and_marlin(

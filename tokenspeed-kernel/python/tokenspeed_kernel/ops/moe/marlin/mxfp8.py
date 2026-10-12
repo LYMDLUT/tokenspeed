@@ -52,7 +52,6 @@ from dataclasses import dataclass
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.moe.marlin.mxfp4 import _swiglu_limit
-from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -71,7 +70,9 @@ from tokenspeed_kernel.thirdparty.cuda.marlin_moe import (
 )
 
 if current_platform().is_nvidia:
-    from flashinfer import ActivationType, cutlass_fused_moe
+    from tokenspeed_kernel.ops.moe.flashinfer.cutlass_unquant import (
+        cutlass_unquant_fused_moe,
+    )
 
 MXFP8_BLOCK = 32
 # GEMM1 writes 2 * ispp columns and GEMM2 reduces over ispp; Marlin tiles N in
@@ -805,13 +806,13 @@ def marlin_mxfp8_precomputed_moe_apply(
         num_tokens_global: Unused; distributed EP dispatch is not owned here.
         max_num_tokens_per_gpu: Unused capacity hint.
         do_finalize: Must be true (no deferred finalize).
-        enable_pdl: Launch hint for the dense CUTLASS path.
+        enable_pdl: Unused launch hint; the dense CUTLASS path keeps PDL off.
 
     Returns:
         This rank's expert contributions ``[tokens, hidden]`` in the dtype of
         ``x``, summed over the top-k routes in a fixed order.
     """
-    del router_logits, num_tokens_global, max_num_tokens_per_gpu
+    del router_logits, num_tokens_global, max_num_tokens_per_gpu, enable_pdl
     if not do_finalize:
         raise ValueError("Marlin MXFP8 MoE cannot defer finalization")
     if topk_weights is None or topk_ids is None:
@@ -835,7 +836,7 @@ def marlin_mxfp8_precomputed_moe_apply(
     # only 1/ep_size of the routes land on this rank's experts.
     routes_per_expert = num_tokens * top_k / (num_local_experts * w.ep_size)
     if state.dense_prefill and routes_per_expert >= _DENSE_MIN_ROUTES_PER_EXPERT:
-        return _dense_bf16_apply(plan, x, w, state, topk_weights, topk_ids, enable_pdl)
+        return _dense_bf16_apply(plan, x, w, state, topk_weights, topk_ids)
 
     # Ids stay global: the align kernel and the two Triton kernels below test
     # them against this rank's range instead of a separately remapped copy.
@@ -942,33 +943,23 @@ def _dense_bf16_apply(
     state: _MarlinMxfp8State,
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
-    enable_pdl: bool,
 ) -> torch.Tensor:
     num_local_experts = int(w.w13_weight.shape[0])
     w13, w2 = _dense_scratch(x.device, num_local_experts, state.hidden_size, state.ispp)
     dequantize_marlin_mxfp8(w.w13_weight, w.w13_weight_scale_inv, w13, swap_halves=True)
     dequantize_marlin_mxfp8(w.w2_weight, w.w2_weight_scale_inv, w2, swap_halves=False)
-    limit = state.cutlass_swiglu_limit
-    return cutlass_fused_moe(
-        input=x,
-        token_selected_experts=topk_ids,
-        token_final_scales=topk_weights.to(torch.float32),
-        fc1_expert_weights=w13,
-        fc2_expert_weights=w2,
-        output_dtype=x.dtype,
-        quant_scales=None,
+    return cutlass_unquant_fused_moe(
+        plan,
+        x,
+        w13,
+        w2,
+        topk_weights,
+        topk_ids,
         swiglu_alpha=None,
         swiglu_beta=None,
-        swiglu_limit=limit,
+        swiglu_limit=state.cutlass_swiglu_limit,
         ep_size=w.ep_size,
         ep_rank=w.ep_rank,
         tp_size=w.tp_size,
         tp_rank=w.tp_rank,
-        tune_max_num_tokens=get_autotune_max_num_tokens(),
-        activation_type=(
-            ActivationType.Swiglu if limit is None else ActivationType.SwigluBias
-        ),
-        enable_pdl=enable_pdl,
-        # The fused GEMM2 epilogue reduces the top-k outputs with atomics.
-        use_fused_finalize=not plan["deterministic_finalize"],
-    )[0]
+    )
