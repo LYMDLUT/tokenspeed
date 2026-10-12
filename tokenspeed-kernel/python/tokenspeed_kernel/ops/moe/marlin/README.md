@@ -56,4 +56,6 @@ geometry. It is allocated with the weights, so KV-cache sizing sees it and no
 CUDA-graph pool owns it, and every layer reuses it because MoE layers run one
 at a time on the compute stream. CUTLASS skips the ids outside the rank's
 range, `-1` included; `deterministic_finalize` selects its unfused top-k
-reduction. Its permutation assumes distinct expert ids per token.
+reduction. Its permutation assumes distinct expert ids per token. The path
+calls CUTLASS the way the BF16 CUTLASS apply does, with PDL off and that
+apply's persistent workspace.

@@ -154,6 +154,96 @@ if platform.is_nvidia:
             _workspaces[device] = workspace
         return workspace
 
+    def cutlass_unquant_fused_moe(
+        plan: dict,
+        x: torch.Tensor,
+        w13: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        *,
+        swiglu_alpha: torch.Tensor | None,
+        swiglu_beta: torch.Tensor | None,
+        swiglu_limit: torch.Tensor | None,
+        ep_size: int,
+        ep_rank: int,
+        tp_size: int,
+        tp_rank: int,
+    ) -> torch.Tensor:
+        """Run the CUTLASS fused-MoE chain over 16-bit experts.
+
+        Every 16-bit caller goes through here (this module's apply and the
+        Marlin MXFP8 dense prefill path), so all of them keep PDL off and run
+        on the persistent workspace.
+
+        Args:
+            plan: MoE plan; ``deterministic_finalize`` keeps the top-k reduction
+                out of GEMM2's epilogue.
+            x: Activations ``[tokens, hidden]``.
+            w13: This rank's gate/up experts ``[local, 2 * ispp, hidden]`` in
+                FlashInfer's order (up half first).
+            w2: This rank's down experts ``[local, hidden, ispp]``.
+            topk_weights: Route weights ``[tokens, top_k]``.
+            topk_ids: Global expert ids ``[tokens, top_k]``.
+            swiglu_alpha: Per-expert SwigluBias alpha, or None.
+            swiglu_beta: Per-expert SwigluBias beta, or None.
+            swiglu_limit: Per-expert SwigluBias clamp, or None.
+            ep_size: Expert-parallel width.
+            ep_rank: This rank's expert-parallel coordinate.
+            tp_size: MoE tensor-parallel width.
+            tp_rank: This rank's MoE tensor-parallel coordinate.
+
+        Returns:
+            This rank's expert contributions ``[tokens, hidden]`` in the dtype
+            of ``x``.
+        """
+        if swiglu_alpha is None and swiglu_beta is None and swiglu_limit is None:
+            activation_type = ActivationType.Swiglu
+        else:
+            activation_type = ActivationType.SwigluBias
+        workspace = cutlass_unquant_moe_workspace(
+            num_tokens=x.shape[0],
+            hidden_size=w2.shape[1],
+            intermediate_size=w2.shape[2],
+            num_experts_total=w13.shape[0] * ep_size,
+            top_k=topk_ids.shape[1],
+            x_dtype=x.dtype,
+            weight_dtype=w13.dtype,
+            activation_type=activation_type,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            device=x.device,
+        )
+        return cutlass_fused_moe(
+            input=x,
+            token_selected_experts=topk_ids.to(torch.int),
+            # flashinfer>=0.7 requires fp32 final scales.
+            token_final_scales=topk_weights.to(torch.float32),
+            fc1_expert_weights=w13,
+            fc2_expert_weights=w2,
+            output_dtype=x.dtype,
+            quant_scales=None,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            tune_max_num_tokens=get_autotune_max_num_tokens(),
+            activation_type=activation_type,
+            # PDL races inside this fused-MoE chain on SM90 at decode-sized
+            # batches: a routed GEMM row transiently reads NaN (rerunning the
+            # identical call is clean). Keep the chain fully serialized until
+            # the flashinfer kernels are fixed.
+            enable_pdl=False,
+            workspace_buffer=workspace,
+            # The fused GEMM2 epilogue reduces the top-k outputs with atomics.
+            use_fused_finalize=not plan["deterministic_finalize"],
+        )[0]
+
     @register_kernel(
         "moe",
         "apply",
@@ -205,57 +295,18 @@ if platform.is_nvidia:
                 scores, k=getattr(w, "top_k"), dim=-1, sorted=False
             )
             topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-        # flashinfer>=0.7 requires fp32 final scales.
-        topk_weights = topk_weights.to(torch.float32)
-        swiglu_alpha = w.swiglu_alpha_t
-        swiglu_beta = w.swiglu_beta_t
-        swiglu_limit = w.swiglu_limit_t
-        if swiglu_alpha is None and swiglu_beta is None and swiglu_limit is None:
-            activation_type = ActivationType.Swiglu
-        else:
-            activation_type = ActivationType.SwigluBias
-        ep_size = getattr(w, "ep_size", 1)
-        ep_rank = getattr(w, "ep_rank", 0)
-        tp_size = getattr(w, "tp_size", 1)
-        tp_rank = getattr(w, "tp_rank", 0)
-        workspace = cutlass_unquant_moe_workspace(
-            num_tokens=x.shape[0],
-            hidden_size=w.w2_weight.shape[1],
-            intermediate_size=w.w2_weight.shape[2],
-            num_experts_total=w.w13_weight.shape[0] * ep_size,
-            top_k=topk_ids.shape[1],
-            x_dtype=x.dtype,
-            weight_dtype=w.w13_weight.dtype,
-            activation_type=activation_type,
-            tp_size=tp_size,
-            tp_rank=tp_rank,
-            ep_size=ep_size,
-            ep_rank=ep_rank,
-            device=x.device,
+        return cutlass_unquant_fused_moe(
+            plan,
+            x,
+            w.w13_weight,
+            w.w2_weight,
+            topk_weights,
+            topk_ids,
+            swiglu_alpha=w.swiglu_alpha_t,
+            swiglu_beta=w.swiglu_beta_t,
+            swiglu_limit=w.swiglu_limit_t,
+            ep_size=getattr(w, "ep_size", 1),
+            ep_rank=getattr(w, "ep_rank", 0),
+            tp_size=getattr(w, "tp_size", 1),
+            tp_rank=getattr(w, "tp_rank", 0),
         )
-        return cutlass_fused_moe(
-            input=x,
-            token_selected_experts=topk_ids.to(torch.int),
-            token_final_scales=topk_weights,
-            fc1_expert_weights=w.w13_weight,
-            fc2_expert_weights=w.w2_weight,
-            output_dtype=x.dtype,
-            quant_scales=None,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
-            swiglu_limit=swiglu_limit,
-            ep_size=ep_size,
-            ep_rank=ep_rank,
-            tp_size=tp_size,
-            tp_rank=tp_rank,
-            tune_max_num_tokens=get_autotune_max_num_tokens(),
-            activation_type=activation_type,
-            # PDL races inside this fused-MoE chain on SM90 at decode-sized
-            # batches: a routed GEMM row transiently reads NaN (rerunning the
-            # identical call is clean). Keep the chain fully serialized until
-            # the flashinfer kernels are fixed.
-            enable_pdl=False,
-            workspace_buffer=workspace,
-            # The fused GEMM2 epilogue reduces the top-k outputs with atomics.
-            use_fused_finalize=not plan["deterministic_finalize"],
-        )[0]
