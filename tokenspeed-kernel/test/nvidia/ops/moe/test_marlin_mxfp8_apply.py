@@ -160,17 +160,21 @@ def test_marlin_mxfp8_matches_dequant_reference(num_tokens: int, ep_size: int):
     _assert_close(actual, expected)
 
 
+@pytest.mark.parametrize("num_tokens", [4, 32])
 @pytest.mark.parametrize("ep_size", [1, 2])
-def test_marlin_mxfp8_honors_swiglu_clamp(ep_size: int):
+def test_marlin_mxfp8_honors_swiglu_clamp(num_tokens: int, ep_size: int):
     """The clamp must change the answer by far more than the tolerance, so an
-    epilogue that drops it fails instead of passing by accident."""
+    epilogue that drops it fails instead of passing by accident. 4 tokens take
+    the GEMV kernels, 32 the Marlin GEMMs."""
     _requires_sm90()
     generator = torch.Generator(device="cuda").manual_seed(13)
     num_experts, top_k, hidden, ispp = 8, 2, 256, 128
     limit = 3.0
     raw = _make_weights(num_experts, hidden, ispp, generator, scale_range=(124, 126))
-    x = torch.randn(32, hidden, generator=generator, device="cuda").to(torch.bfloat16)
-    topk_ids, topk_weights = _routing(32, num_experts, top_k, generator)
+    x = torch.randn(num_tokens, hidden, generator=generator, device="cuda").to(
+        torch.bfloat16
+    )
+    topk_ids, topk_weights = _routing(num_tokens, num_experts, top_k, generator)
 
     expected = _reference(x, raw, topk_ids, topk_weights, limit)
     unclamped = _reference(x, raw, topk_ids, topk_weights, None)
@@ -179,12 +183,13 @@ def test_marlin_mxfp8_honors_swiglu_clamp(ep_size: int):
     _assert_close(actual, expected)
 
 
-@pytest.mark.parametrize("num_tokens", [5, 300])
+@pytest.mark.parametrize("num_tokens", [2, 300])
 def test_marlin_mxfp8_without_ep_skips_invalid_and_repeated_ids(num_tokens: int):
     """Without EP, ``-1`` slots contribute zero and a repeated id counts once
-    per slot. 300 tokens (1200 routes) outgrow the small-batch alignment
-    kernel; both batches stay below the dense threshold, so the Marlin GEMMs
-    see the -1 blocks."""
+    per slot. Two tokens fit the GEMV route budget but stay on Marlin without
+    EP. 300 tokens (1200 routes) outgrow the small-batch alignment kernel;
+    both batches stay below the dense threshold, so the Marlin GEMMs see the
+    -1 blocks."""
     _requires_sm90()
     generator = torch.Generator(device="cuda").manual_seed(37)
     num_experts, top_k, hidden, ispp = 8, 4, 512, 256
@@ -283,7 +288,9 @@ def test_marlin_mxfp8_is_bitwise_reproducible():
 @pytest.mark.parametrize("num_tokens", [4, 1024])
 def test_marlin_mxfp8_production_geometry(num_tokens: int):
     """hidden 6144 / ispp 2048 / top-8 over 256 experts, one EP32 rank's eight
-    local experts; routes to other ranks must contribute nothing."""
+    local experts; routes to other ranks must contribute nothing. 4 tokens
+    (32 routes) sit above the 16-route GEMV gate, so both sizes stay on
+    Marlin."""
     _requires_sm90()
     generator = torch.Generator(device="cuda").manual_seed(19)
     num_global, ep_size, top_k, hidden, ispp = 256, 32, 8, 6144, 2048
@@ -362,6 +369,40 @@ def test_dense_prefill_path_matches_reference(
     _assert_close(dense, marlin)
 
 
+@pytest.mark.parametrize("num_tokens", [1, 2])
+@pytest.mark.parametrize("ispp", [512, 192])
+def test_gemv_path_matches_reference_and_marlin(
+    num_tokens: int, ispp: int, monkeypatch
+):
+    """Decode-sized batches under EP take the GEMV kernels; they must match
+    the reference and the Marlin GEMMs they replace, with ``-1`` slots and
+    other ranks' experts. At ispp 192 the down projection's K holds three
+    GEMV steps, so it runs as a single K range."""
+    _requires_sm90()
+    generator = torch.Generator(device="cuda").manual_seed(41)
+    num_experts, top_k, hidden, limit = 16, 4, 1024, 7.0
+    assert num_tokens * top_k <= mxfp8._GEMV_MAX_ROUTES
+    raw = _make_weights(num_experts, hidden, ispp, generator, scale_range=(122, 126))
+    x = torch.randn(num_tokens, hidden, generator=generator, device="cuda").to(
+        torch.bfloat16
+    )
+    # Rank 0 owns [0, 8): one local route per token, the rest sit on rank 1.
+    topk_ids = torch.tensor(
+        [[0, 8, 9, -1], [1, 10, 11, 12]][:num_tokens],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    topk_weights = torch.rand((num_tokens, top_k), generator=generator, device="cuda")
+    topk_weights = topk_weights / topk_weights.sum(-1, keepdim=True)
+
+    expected = _reference(x, raw, topk_ids, topk_weights, limit)
+    gemv = _run(raw, x, topk_ids, topk_weights, 2, limit)
+    _assert_close(gemv, expected)
+    monkeypatch.setattr(mxfp8, "_GEMV_MAX_ROUTES", 0)
+    marlin = _run(raw, x, topk_ids, topk_weights, 2, limit)
+    _assert_close(gemv, marlin)
+
+
 def test_prefill_stays_on_marlin_when_dequant_cannot_tile_ispp():
     """ispp 192 meets Marlin's alignment but not the dequant's K width, so a
     prefill-sized batch must keep the Marlin GEMMs."""
@@ -382,6 +423,14 @@ def test_prefill_stays_on_marlin_when_dequant_cannot_tile_ispp():
         plan, x, w, None, topk_weights=topk_weights, topk_ids=topk_ids
     ).float()
     _assert_close(actual, _reference(x, raw, topk_ids, topk_weights, limit=None))
+
+
+def test_gemv_is_faster_is_host_only():
+    """No GPU read: decode CUDA graphs capture this apply."""
+    assert not mxfp8._gemv_is_faster(8, ep_size=1)
+    assert not mxfp8._gemv_is_faster(24, ep_size=32)
+    assert mxfp8._gemv_is_faster(8, ep_size=32)
+    assert mxfp8._gemv_is_faster(16, ep_size=32)
 
 
 def test_marlin_mxfp8_rejects_malformed_scales():

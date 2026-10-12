@@ -466,7 +466,11 @@ Constraints that follow from the architecture:
   with at least 192 routes per expert (prefill) instead dequantize the local
   experts into one BF16 scratch per GPU and use the CUTLASS grouped GEMM,
   since Marlin's mma.sync tiles leave Hopper tensor cores idle once the GEMM
-  is compute bound; the dequantization is exact. Dense projections are
+  is compute bound; the dequantization is exact. Decode batches of at most
+  16 routes with expert parallelism take a Triton GEMV over the same Marlin
+  layout instead: Marlin's split-K lock chain is bandwidth-starved at one
+  or two local routes, and counting those routes on the device would break
+  decode CUDA graphs. Dense projections are
   dequantized to BF16 while loading; an E4M3 value times a power of two is
   exact in BF16, so this matches a weight-only MXFP8 GEMM up to accumulation
   order.
