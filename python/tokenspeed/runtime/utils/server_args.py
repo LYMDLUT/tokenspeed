@@ -886,6 +886,21 @@ class ServerArgs:
                 f"{self.disaggregation_mode!s} instance has set enable_kvstore to "
                 "False!",
             )
+        elif self.decode_context_parallel_size > 1:
+            # DCP's page transfer has no Host L2 path yet, so DCP defaults to
+            # no KVStore instead of needing --disable-kvstore as well.
+            if self.kvstore_storage_backend is not None:
+                raise ValueError(
+                    "DCP cache transfer does not yet support KVStore; "
+                    "unset --kvstore-storage-backend or decode context "
+                    "parallelism."
+                )
+            if not self.disable_kvstore:
+                logger.warning(
+                    "DCP cache transfer does not yet support KVStore; "
+                    "running without Host L2."
+                )
+            self.enable_kvstore = False
         elif not self.disable_kvstore:
             self.enable_kvstore = True
 
@@ -898,11 +913,6 @@ class ServerArgs:
     def validate_cache_options(self):
         # Runs after _handle_kvstore() has applied the KVStore default, so the
         # check sees the effective setting rather than the pre-resolution flag.
-        if self.decode_context_parallel_size > 1 and self.enable_kvstore:
-            raise ValueError(
-                "DCP cache transfer does not yet support KVStore; "
-                "use --disable-kvstore."
-            )
         # Same-checkpoint DSpark's KVStore support depends on where the draft
         # keeps its context; the engine decides once the draft config resolves
         # (resolve_dspark_prefix_replay_tokens).

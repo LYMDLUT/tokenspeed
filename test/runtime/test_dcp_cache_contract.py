@@ -623,21 +623,28 @@ class ConfigurationTest(unittest.TestCase):
         ):
             self._config(dcp_size=1, dcp_group=(0,))
 
-    def test_dcp_rejects_kvstore_after_its_default_is_applied(self):
+    def test_dcp_defaults_kvstore_off(self):
         args = object.__new__(ServerArgs)
         args.disaggregation_mode = "null"
         args.decode_context_parallel_size = 2
         args.disable_kvstore = False
         args.enable_kvstore = False
         args.enable_prefix_caching = True
-        args._handle_kvstore()
-        self.assertTrue(args.enable_kvstore, "KVStore is on by default")
-        with self.assertRaisesRegex(ValueError, "KVStore"):
-            args.validate_cache_options()
-        args.disable_kvstore = True
-        args.enable_kvstore = False
+        args.kvstore_storage_backend = None
         args._handle_kvstore()
         args.validate_cache_options()
+        self.assertFalse(args.enable_kvstore)
+
+    def test_dcp_rejects_l3_storage(self):
+        args = object.__new__(ServerArgs)
+        args.disaggregation_mode = "null"
+        args.decode_context_parallel_size = 2
+        args.disable_kvstore = False
+        args.enable_kvstore = False
+        args.enable_prefix_caching = True
+        args.kvstore_storage_backend = "mooncake"
+        with self.assertRaisesRegex(ValueError, "KVStore"):
+            args._handle_kvstore()
 
 
 if __name__ == "__main__":
