@@ -1086,9 +1086,10 @@ def load_hyv4_weights(
             loaded_params.add(param_name)
         return complete
 
+    # Packed tensors only: each one fills its parameter for every local expert,
+    # so the parameter name alone tracks completeness.
     moe_loader = build_moe_checkpoint_loader(
         params_dict=params_dict,
-        expert_schema=ExpertCheckpointSchema(),
         fused_schema=ExpertCheckpointSchema(
             gate_up_fused_name="gate_up_proj",
             down_proj_name="down_proj",
@@ -1144,7 +1145,8 @@ def load_hyv4_weights(
                 name += "_inv"
             if moe_loader.matches(name):
                 loaded_params.add(moe_loader.load(name, loaded_weight))
-            # Experts owned by another EP rank are skipped here.
+            else:
+                unmatched.append(name)
             continue
 
         if ".q_a_proj." in name or ".kv_a_proj_with_mqa." in name:

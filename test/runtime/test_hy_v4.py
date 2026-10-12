@@ -354,6 +354,7 @@ class HYV4WeightLoaderTests(unittest.TestCase):
         "model.layers.0.hc_attn_layer.hc_pre.hc_fn",
         "model.layers.0.self_attn.rotary_emb.inv_freq",
     ]
+    _EXPERTS = "model.layers.0.mlp.experts."
 
     def _load(self, owner, names, weights=(), **kwargs):
         load_hyv4_weights(
@@ -408,6 +409,49 @@ class HYV4WeightLoaderTests(unittest.TestCase):
         with self.assertLogs("tokenspeed.runtime.models.hy_v4", "WARNING") as logs:
             self._load(owner, self._CHECKPOINT + ["model.layers.0.extra.weight"])
         self.assertIn("model.layers.0.extra.weight", logs.output[0])
+
+    def test_packed_experts_fill_every_local_expert(self):
+        owner, calls = _owner_with_params(
+            [self._EXPERTS + "w13_weight", self._EXPERTS + "w2_weight"]
+        )
+        packed = torch.zeros(2, 4, 8)
+        self._load(
+            owner,
+            [],
+            weights=[
+                (self._EXPERTS + "gate_up_proj", packed),
+                (self._EXPERTS + "down_proj", packed),
+            ],
+        )
+        self.assertEqual(
+            sorted(
+                (name, kwargs["shard_id"], kwargs["local_expert_id"])
+                for name, _, kwargs in calls
+            ),
+            sorted(
+                (self._EXPERTS + param, shard, expert)
+                for param, shards in (
+                    ("w13_weight", ("w1", "w3")),
+                    ("w2_weight", ("w2",)),
+                )
+                for shard in shards
+                for expert in range(2)
+            ),
+        )
+
+    def test_per_expert_tensors_leave_the_experts_unloaded(self):
+        owner, calls = _owner_with_params(
+            [self._EXPERTS + "w13_weight", self._EXPERTS + "w2_weight"]
+        )
+        per_expert = [
+            f"{self._EXPERTS}{expert}.{proj}.weight"
+            for expert in range(2)
+            for proj in ("gate_proj", "up_proj", "down_proj")
+        ]
+        with self.assertLogs("tokenspeed.runtime.models.hy_v4", "WARNING"):
+            with self.assertRaisesRegex(RuntimeError, re.escape("w13_weight")):
+                self._load(owner, per_expert)
+        self.assertEqual(calls, [])
 
     @unittest.skipUnless(torch.cuda.is_available(), "MXFP8 dequantizes on CUDA")
     def test_mxfp8_checkpoint_feeds_bf16_dense_and_fp8_experts(self):
