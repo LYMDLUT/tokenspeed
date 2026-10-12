@@ -622,6 +622,45 @@ carries no drafter tensors: `accept_lengths` and `draft_seq_lens_buf` are
 gone, the handle's presence is the step-0 discriminator, and no model
 computes or edits seq_lens.
 
+**Draft step 0 after a prefill is a draft-owned graph.** Two independent
+reasons the *target* graph never serves it, both intentional: the target
+`PrefillGraph._replay_bucket` declines a live context that carries
+`draft_narrowing` or a `capture_hidden_mode` other than the one baked at
+capture (Eagle step 0 sets both — narrowing present and
+`CaptureHiddenMode.LAST`, while the target dummy capture with a drafter
+attached bakes `FULL`); and Eagle / MTP draft forwards call
+`draft_model_runner.forward` directly, so they never enter
+`ModelExecutor._run_target_forward` and would not replay the target's
+graph even if the context matched. A draft-owned `PrefillGraph` constructed
+with `draft_first_step=True` inverts that admission (requires narrowing
+and the baked `LAST`) so the same owner can capture Eagle step 0 without
+relaxing the target graph. Decode-side draft steps already ride the
+decode graph.
+
+Eagle captures that owner after the target graph when the draft model is a
+`NarrowingPrefillModel`, and replays step 0 when the draft graph admits the
+context. It admits pure extends only: on a mixed round the replay's proposals
+disagreed with the eager draft's, so mixed rounds keep the eager step 0. The
+graph keeps the target hidden in a static buffer beside the
+input embeds and lands it per replay, refusing a hidden whose row count
+differs from the input ids (the target captures `FULL` when a drafter is
+attached): a short `LAST` tensor would leave the previous replay's rows in
+the graphed bucket. A captured segment must not publish the accepted
+prefix, since replay rebinds the live frontier only at eager breaks; the
+capture's dummy narrowing refuses to. Decode-only first steps
+(`num_extends == 0`) stay on the decode graph via
+`draft_model_runner.forward`; they are not a prefill-graph miss. The draft
+captures on the target's config, so its ladder, and every reason the target
+graph is off, carry over unchanged; a draft that reads request-token history
+stays eager as such a target does. A longer draft ladder would not pay: step
+0 is as long as the target forward, and both are compute-bound above the
+target ladder. The memory projection sizes the draft graph as one window
+(`prefill:drafter`, which `captures_prefill_graph` declares), so every
+capture, the probe's included, records the whole draft ladder inside it.
+Other Eagle drafts stay eager until they implement the same contract. Under
+attention DP the split graph stays off (rank-local narrowed rows), same as
+V4.1.
+
 Both steps run unconditionally — there is no per-drafter opt-out. What makes
 that safe is the slot discipline: init writes prefill-slot metadata, refresh
 writes decode-slot metadata, and forwards read the slot matching their mode
