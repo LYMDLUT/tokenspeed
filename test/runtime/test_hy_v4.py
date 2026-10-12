@@ -48,12 +48,14 @@ from tokenspeed.runtime.configs.model_config import (
     _resolve_attention_family,
     configure_dsa_attention,
 )
+from tokenspeed.runtime.execution.model_runner import ModelRunner
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config, Mxfp8Config
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
 from tokenspeed.runtime.layers.quantization.modelopt_mxfp8 import ModelOptMxfp8Config
 from tokenspeed.runtime.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from tokenspeed.runtime.model_loader import loader as model_loader
 from tokenspeed.runtime.models import hy_v4, hy_v4_nextn
+from tokenspeed.runtime.models.base.weight_update import weight_update_session
 from tokenspeed.runtime.models.hy_v4 import (
     HYV4Attention,
     HYV4ForCausalLM,
@@ -569,6 +571,29 @@ class HYV4QuantizationTests(unittest.TestCase):
             ValueError, "DenseModel does not support ModelOpt MXFP8"
         ):
             self._initialize_from_modelopt_mxfp8(DenseModel)
+
+
+class HYV4WeightUpdateTests(unittest.TestCase):
+    def test_update_group_is_refused_before_the_rendezvous(self):
+        runner = SimpleNamespace(model=object.__new__(HYV4ForCausalLM))
+        with mock.patch("torch.distributed.distributed_c10d.rendezvous") as rendezvous:
+            ok, message = ModelRunner.init_weights_update_group(
+                runner, SimpleNamespace()
+            )
+        self.assertFalse(ok)
+        self.assertIn("HYV4ForCausalLM does not support live weight updates", message)
+        rendezvous.assert_not_called()
+
+    def test_a_weight_update_session_is_refused(self):
+        for model_cls in (HYV4ForCausalLM, HYV4ForCausalLMNextN):
+            with self.subTest(model=model_cls.__name__):
+                model = object.__new__(model_cls)
+                with self.assertRaisesRegex(
+                    RuntimeError, "does not support live weight updates"
+                ):
+                    with weight_update_session([model]):
+                        pass
+                self.assertFalse(model._weight_update_active)
 
 
 class HYV4SpeculativeAlgorithmTests(unittest.TestCase):

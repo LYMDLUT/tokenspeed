@@ -499,6 +499,12 @@ Constraints that follow from the architecture:
   uses the checkpoint's MTP layer), and expert placements other than the
   checkpoint's own order (EPLB, redundant experts, an
   `--init-expert-location` file).
+* Live weight updates are refused: `init_weights_update_group` before the
+  trainer's update group forms, and every weight-update session
+  (`update_weights_from_distributed`, `update_weights_from_mooncake`).
+  Loading derives the absorbed MLA weights and the MoE kernels' weight
+  layouts from the checkpoint, and an in-place update would leave them stale;
+  restart the server to serve new weights.
 * Prefill and mixed batches up to `--prefill-graph-max-tokens` (default:
   the smaller of 2048 and the chunked-prefill size) replay breakable CUDA
   graphs. Only the sparse attention core (cache writes, the indexer top-k and

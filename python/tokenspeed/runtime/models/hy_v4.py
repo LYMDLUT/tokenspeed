@@ -947,6 +947,9 @@ class HYV4ForCausalLM(GlmMoeDsaForCausalLM):
     model_cls = HYV4Model
     # ``load_hyv4_weights`` dequantizes the dense ModelOpt MXFP8 weights.
     supports_modelopt_mxfp8 = True
+    # Loading derives tensors a live update would leave stale: the absorbed
+    # MLA weights and the MoE kernels' weight layouts.
+    supports_live_weight_updates = False
 
     def resolve_lm_head(
         self,
