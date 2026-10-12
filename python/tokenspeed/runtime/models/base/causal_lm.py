@@ -127,6 +127,11 @@ class BaseCausalLM(nn.Module):
     # refuses the placement flags for a model that does not, so a placement
     # is never installed only to be ignored.
     supports_expert_placement: ClassVar[bool] = False
+    # Whether the model's loader dequantizes the dense layers of a ModelOpt
+    # MXFP8 checkpoint, which those layers take unquantized. Model
+    # initialization refuses the checkpoint for a model that does not: its
+    # dense weights would load as E4M3 values without their scales.
+    supports_modelopt_mxfp8: ClassVar[bool] = False
 
     @property
     def routed_experts_weights_of_layer(self) -> dict[int, list[torch.Tensor]]:

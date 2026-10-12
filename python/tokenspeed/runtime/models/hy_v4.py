@@ -945,6 +945,8 @@ class HYV4ForCausalLM(GlmMoeDsaForCausalLM):
     """
 
     model_cls = HYV4Model
+    # ``load_hyv4_weights`` dequantizes the dense ModelOpt MXFP8 weights.
+    supports_modelopt_mxfp8 = True
 
     def resolve_lm_head(
         self,

@@ -52,6 +52,7 @@ from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config, Mxfp8Config
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
 from tokenspeed.runtime.layers.quantization.modelopt_mxfp8 import ModelOptMxfp8Config
 from tokenspeed.runtime.layers.quantization.w8a8_fp8 import W8A8Fp8Config
+from tokenspeed.runtime.model_loader import loader as model_loader
 from tokenspeed.runtime.models import hy_v4, hy_v4_nextn
 from tokenspeed.runtime.models.hy_v4 import (
     HYV4Attention,
@@ -534,6 +535,40 @@ class HYV4QuantizationTests(unittest.TestCase):
             with self.subTest(model=model_cls.__name__):
                 with self.assertRaisesRegex(ValueError, "'fp8' quantization"):
                     model_cls(HYV4Config(), mapping=SimpleNamespace(), quant_config=fp8)
+
+    def _initialize_from_modelopt_mxfp8(self, model_cls):
+        mxfp8 = ModelOptMxfp8Config.from_config(
+            {"quant_method": "modelopt", "quantization": {"quant_algo": "MXFP8"}}
+        )
+        model_config = SimpleNamespace(
+            hf_config=None, mapping=None, is_multimodal=False
+        )
+        with (
+            mock.patch.object(
+                model_loader, "get_model_architecture", return_value=(model_cls, "")
+            ),
+            mock.patch.object(
+                model_loader, "_get_quantization_config", return_value=mxfp8
+            ),
+        ):
+            return model_loader._initialize_model(model_config, load_config=None)
+
+    def test_loader_builds_hyv4_from_a_modelopt_mxfp8_checkpoint(self):
+        for model_cls in (HYV4ForCausalLM, HYV4ForCausalLMNextN):
+            with self.subTest(model=model_cls.__name__):
+                with mock.patch.object(model_cls, "__init__", return_value=None):
+                    model = self._initialize_from_modelopt_mxfp8(model_cls)
+                self.assertIsInstance(model, model_cls)
+
+    def test_loader_rejects_modelopt_mxfp8_for_models_that_keep_it_quantized(self):
+        class DenseModel:
+            def __init__(self, **kwargs):
+                pass
+
+        with self.assertRaisesRegex(
+            ValueError, "DenseModel does not support ModelOpt MXFP8"
+        ):
+            self._initialize_from_modelopt_mxfp8(DenseModel)
 
 
 class HYV4SpeculativeAlgorithmTests(unittest.TestCase):
