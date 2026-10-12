@@ -91,6 +91,26 @@ the sampled corner.
 python -m unittest test.hy_v4_parity.test_hy_v4_parity_harness
 ```
 
+## Draft step-0 graph check
+
+`draft_graph_check.py` checks the MTP draft's step-0 prefill graph against the
+eager step on real weights. It truncates the checkpoint (keeping the MTP
+block), serves one greedy MTP batch twice on one GPU, with the draft graph and
+with step 0 eager, and compares what the draft proposed at every served extend
+or mixed step:
+
+```bash
+python -m test.hy_v4_parity.draft_graph_check --source /path/to/hy_v4
+```
+
+Step 0 must propose the same ids, with top-2 logit gaps that agree to about
+BF16 rounding (`--min-match`, `--max-gap-delta`); the later steps, verification
+and the outputs are only reported. `--enable-mixed-batch` also lets prompt
+chunks share batches with decodes. Every engine process loads
+`draft_graph_sitecustomize.py` as its `sitecustomize`, which turns the draft
+graph on or off (`HY_V4_DRAFT_GRAPH`) and records its replays and the draft's
+proposals.
+
 ## Suggested order
 
 1. `gpu_kernel_check.py` on any CUDA GPU (no Hopper, no checkpoint needed).
