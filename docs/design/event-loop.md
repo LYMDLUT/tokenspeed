@@ -332,7 +332,10 @@ All hooks obey Principle 3: they return events or decisions; they never call
 For orientation, one iteration of `event_loop`:
 
 1. Receive and admit new requests (`_process_new_requests`), with the pause
-   and EPD admission hooks inline as single lines.
+   and EPD admission hooks inline as single lines. A health probe that
+   arrives while the scheduler holds requests is answered with
+   `HealthCheckOutput` here rather than admitted: reaching the round is the
+   liveness proof, and a probe queued behind a long prefill would time out.
 2. Poll completed L2 cache ops; **advance the scheduler (head call site)** so
    this round's plan sees them.
 3. Frozen (`PAUSED_ALL`)? Drain the in-flight queue and run the paused idle

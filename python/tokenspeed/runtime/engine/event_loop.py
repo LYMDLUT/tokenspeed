@@ -475,6 +475,7 @@ class EventLoop:
             send_func=self.send_to_tokenizer,
             clear_cache_fn=self.scheduler.clear_cache,
             can_clear_cache_fn=self.scheduler.can_clear_cache,
+            num_running_fn=self._num_running,
             architectures=self.model_config.hf_config.architectures,
             pause_controller=self._pause,
             memory_controller=self._memory,
