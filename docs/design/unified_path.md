@@ -661,6 +661,13 @@ Other Eagle drafts stay eager until they implement the same contract. Under
 attention DP the split graph stays off (rank-local narrowed rows), same as
 V4.1.
 
+HY V4 NextN is such a draft: the encoder is token-shaped (embed + `eh_proj`
++ attention through the output gate), `narrowing_forward` gathers the live
+rows from the live `gather_ids` (eager, so the gather is never baked), and
+the decoder is `o_proj` + MoE + final norm on one row per request
+(`max_decoder_rows_per_request = 1`). An 8K draft ladder cost it about 2 GB
+per GPU of pool scratch and per-bucket outputs.
+
 Both steps run unconditionally — there is no per-drafter opt-out. What makes
 that safe is the slot discipline: init writes prefill-slot metadata, refresh
 writes decode-slot metadata, and forwards read the slot matching their mode
