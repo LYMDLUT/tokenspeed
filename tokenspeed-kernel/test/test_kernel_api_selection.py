@@ -4699,8 +4699,21 @@ _CASES = [
         id_suffix="hy-v4",
     ),
     _case(
-        _is_hopper_plus_with_flashmla,
-        "hopper-plus",
+        _is_hopper,
+        "hopper",
+        "attention",
+        "dsa_decode",
+        "triton_dsa_split_decode",
+        partial(
+            _attention_dsa_hy_v4,
+            _attention_dsa_pkg.dsa_decode,
+            sink=True,
+        ),
+        id_suffix="hy-v4-sink",
+    ),
+    _case(
+        _is_blackwell_plus,
+        "blackwell-plus",
         "attention",
         "dsa_decode",
         "flashmla_dense_dsa_decode",

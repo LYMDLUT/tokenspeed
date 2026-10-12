@@ -911,10 +911,9 @@ class DSABackend(PagedAttentionBackend):
             q_view = gather_query_heads(q_view, self.dcp_group)
         if self._spreads_rows(num_tokens, topk_slots.shape[1]):
             # A rank's share of spread rows need not hold whole requests, so it
-            # attends through dsa_prefill, whose rows are independent. Dense-KV
-            # decode with a sink resolves to that kernel anyway; without a sink,
-            # decode switches from its dsa_decode kernel to dsa_prefill once a
-            # launch reaches the spread threshold.
+            # attends through dsa_prefill, whose rows are independent: decode
+            # switches to it from its dsa_decode kernel once a launch reaches
+            # the spread threshold.
             attend = self._row_attention(layer, kv_cache, max_seqlen_k, k_scale, False)
             out = self._attend_spread_rows(
                 q_view, topk_slots, topk_lens, kv_seq_lens, layer, attend

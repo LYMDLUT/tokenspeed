@@ -77,6 +77,19 @@ match a single launch to within that rounding. Because the split count follows
 the launch's row count, results are reproducible run to run but not
 batch-invariant.
 
+Sink decode over a regular BF16 KV cache with at most 16 heads per row runs
+`triton_dsa_split_decode` on Hopper instead. Even split, FlashMLA spends a
+64-head CTA on each row's few heads; the Triton kernel carries them through its
+MMAs padded to 16 in registers. Each row's columns are split as above, but the
+split count only bounds the launch (two programs per SM, at least 64 padded
+columns per split): every program divides the row's live columns
+(`topk_lens`) by that count, so a short context gathers no padding. The
+partials merge the same way, sink applied once to the merged softmax, with the
+same BF16 rounding and the same lack of batch invariance. On H20 at HY V4's
+TP32 decode shapes (2 heads, 1 to 128 rows, 300 to 2048 live columns) it runs
+2.2 to 3.9 times faster than split FlashMLA: one row with 2048 live columns
+takes 10.4 µs against 31.5 µs.
+
 ## Sharded Index-K candidates
 
 `dsa_index_candidates` scores a bounded query tile against rank-local Index-K
