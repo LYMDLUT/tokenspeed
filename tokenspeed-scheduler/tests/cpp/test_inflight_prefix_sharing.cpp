@@ -147,6 +147,18 @@ TEST_F(InflightPrefixSharingTest, PromptAlreadyHittingThePageAWriterRecomputesDo
     EXPECT_EQ(round.at("b").extend_prefix_len, 8);
 }
 
+TEST_F(InflightPrefixSharingTest, LaterPromptsOfASharedPrefixHitTogether) {
+    // C-Eval-shaped: many prompts share a 5-shot prefix. The first computes
+    // it; the rest wait this round and hit together on the next.
+    Submit({Prompt("a", PromptA()), Prompt("b", PromptB()), Prompt("c", Concat(SharedPrefix(), {300, 301, 302}))});
+    ASSERT_EQ(ScheduledPrefills(PlanOnce()).size(), 1u);
+
+    const auto second = ScheduledPrefills(PlanOnce());
+    ASSERT_EQ(second.size(), 2u);
+    EXPECT_EQ(second.at("b").extend_prefix_len, 6);
+    EXPECT_EQ(second.at("c").extend_prefix_len, 6);
+}
+
 TEST_F(InflightPrefixSharingTest, WaitingPromptDoesNotHoldBackUnrelatedPrompts) {
     Submit({Prompt("a", PromptA()), Prompt("b", PromptB()), Prompt("c", MakeTokens(9, 500))});
     const auto first = ScheduledPrefills(PlanOnce());
@@ -180,6 +192,83 @@ protected:
         return cfg;
     }
 };
+
+class InflightPrefixSharingMixedTest : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
+        cfg.enable_mixed_prefill_decode = true;
+        return cfg;
+    }
+};
+
+TEST_F(InflightPrefixSharingMixedTest, SameRoundPromptWaitsForTheSharedPrefixAndHitsIt) {
+    Submit({Prompt("a", PromptA()), Prompt("b", PromptB())});
+
+    const auto first = ScheduledPrefills(PlanOnce());
+    ASSERT_EQ(first.size(), 1u);
+    EXPECT_EQ(first.at("a").extend_prefix_len, 0);
+
+    const auto second = ScheduledPrefills(PlanOnce());
+    ASSERT_EQ(second.size(), 1u);
+    EXPECT_EQ(second.at("b").extend_prefix_len, 6);
+}
+
+TEST_F(InflightPrefixSharingMixedTest, PrefillHitJoinsTheWritersFirstDecode) {
+    Submit(Prompt("a", PromptA()));
+    ASSERT_EQ(ScheduledPrefills(PlanOnce()).size(), 1u);
+
+    Submit(Prompt("b", PromptB()));
+    const ExecutionPlan plan = PlanOnce();
+    const auto prefills = ScheduledPrefills(plan);
+    ASSERT_EQ(prefills.size(), 1u);
+    EXPECT_EQ(prefills.at("b").extend_prefix_len, 6);
+    const ForwardBatch* batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    EXPECT_EQ(batch->decode_input_ids.size(), 1u) << "a's first decode rides the same mixed plan";
+}
+
+class InflightPrefixSharingChunkedTest : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
+        // Four tokens leave a 9-token prompt incomplete; the writer holds the
+        // line, so the shared-prefix waiter cannot sneak into this round.
+        cfg.max_scheduled_tokens = 4;
+        return cfg;
+    }
+};
+
+TEST_F(InflightPrefixSharingChunkedTest, IncompleteChunkHoldsTheLineThenTheSharedPrefixHits) {
+    Submit({Prompt("a", PromptA()), Prompt("b", PromptB())});
+
+    const ExecutionPlan first = PlanOnce();
+    const auto first_prefills = ScheduledPrefills(first);
+    ASSERT_EQ(first_prefills.size(), 1u);
+    EXPECT_TRUE(first_prefills.contains("a"));
+    EXPECT_LT(first_prefills.at("a").input_length, 9);
+
+    // Incomplete chunks hold the line. The finishing chunk becomes PrefillDone
+    // in the same applyEvent, so HOL lifts and b joins that plan (1.1) and
+    // hits the pages a's Admit already published. There is no b-only prefill.
+    SendForwardDone("a");
+    std::map<std::string, ScheduledPrefill> later;
+    bool b_joined_finishing_chunk = false;
+    for (int step = 0; step < 8; ++step) {
+        later = ScheduledPrefills(PlanOnce());
+        if (later.contains("b")) {
+            ASSERT_TRUE(later.contains("a"));
+            ASSERT_EQ(later.size(), 2u);
+            EXPECT_EQ(later.at("b").extend_prefix_len, 6);
+            b_joined_finishing_chunk = true;
+            break;
+        }
+        ASSERT_EQ(later.size(), 1u);
+        ASSERT_TRUE(later.contains("a"));
+        SendForwardDone("a");
+    }
+    EXPECT_TRUE(b_joined_finishing_chunk);
+}
 
 TEST_F(InflightPrefixSharingStateCacheTest, OnlyAPromptSharingTheWritersCheckpointWaits) {
     // A state group resumes only where a checkpoint was published: a's
