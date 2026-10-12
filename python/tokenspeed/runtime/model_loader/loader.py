@@ -44,6 +44,7 @@ from tokenspeed.runtime.configs.device_config import DeviceConfig
 from tokenspeed.runtime.configs.load_config import LoadConfig, LoadFormat
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.modelopt_mxfp8 import ModelOptMxfp8Config
 from tokenspeed.runtime.model_loader.utils import (
     get_model_architecture,
     set_default_torch_dtype,
@@ -146,6 +147,14 @@ def _initialize_model(
     """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
     quant_config = _get_quantization_config(model_config, load_config)
+    if isinstance(quant_config, ModelOptMxfp8Config) and not getattr(
+        model_class, "supports_modelopt_mxfp8", False
+    ):
+        # Dense layers take ModelOpt MXFP8 weights unquantized: the model's
+        # loader must dequantize them, or they load without their scales.
+        raise ValueError(
+            f"{model_class.__name__} does not support ModelOpt MXFP8 checkpoints"
+        )
     if quant_config is not None:
         replacements = getattr(model_class, "quant_module_name_replacements", None)
         if replacements:
