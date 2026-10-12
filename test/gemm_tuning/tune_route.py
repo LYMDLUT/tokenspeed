@@ -30,7 +30,8 @@ calls, which is the state the serving path hands each shape.
 
 A backend earns a routing entry only by beating the incumbent (the kernel
 dispatch picks today) by at least MARGIN.
-Emits the MEASURED_ROUTE dict for ops/gemm/routed_gemv.py.
+Emits the route dict for ops/gemm/routed_gemv.py: MEASURED_ROUTE when run on
+sm100 and up, HOPPER_MEASURED_ROUTE on sm90.
 """
 
 from __future__ import annotations

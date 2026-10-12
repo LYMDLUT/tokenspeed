@@ -20,25 +20,28 @@
 
 """Measured decode-GEMV routing for the served models' projection shapes.
 
-Every entry in ``MEASURED_ROUTE`` was measured at the exact ``(M, N, K)`` the
-serving decode path hands ``decode_gemv``. The tuner cycles eight weight copies
-so the L2 never holds the operand between calls, matching serving where each
-layer streams a different weight. Hot-cache numbers ranked backends wrongly;
-cold-L2 reproduces serving per-shape times within ~5%.
-``test/gemm_tuning/tune_route.py`` reproduces the sweep.
+Every entry in ``MEASURED_ROUTE`` (sm100 and up) and ``HOPPER_MEASURED_ROUTE``
+(sm90) was measured at the exact ``(M, N, K)`` the serving decode path hands
+``decode_gemv``; :func:`measured_route` picks a device's table. The tuner
+cycles eight weight copies so the L2 never holds the operand between calls,
+matching serving where each layer streams a different weight. Hot-cache
+numbers ranked backends wrongly; cold-L2 reproduces serving per-shape times
+within ~5%. ``test/gemm_tuning/tune_route.py`` reproduces the sweep.
 
 A backend earns an entry only by beating the incumbent selection by at least
 4% -- above measurement noise, so a noise-level lead does not become a
 maintenance obligation. Shapes not listed keep the selection they had
-(rowcta at M == 1, torch.mm otherwise). The table is data, not policy:
-re-run the sweep on new hardware or after a kernel change and replace the
-literals wholesale.
+(rowcta at M == 1, torch.mm otherwise), and callers that check
+:func:`decode_gemv_routed` keep their vendor BLAS call. The tables are data,
+not policy: re-run the sweep on new hardware or after a kernel change and
+replace the literals wholesale.
 """
 
 from __future__ import annotations
 
 import functools
 import threading
+from collections.abc import Mapping
 from types import MappingProxyType
 
 import torch
@@ -616,6 +619,62 @@ MEASURED_ROUTE: MappingProxyType[tuple[int, int, int], str] = MappingProxyType(
     }
 )
 
+# H20 at HY V4's TP32 decode shapes (``tune_route.py hy_v4_tp32``). The tuner's
+# incumbent is the faster of cuBLAS and rowcta, so every entry also beats
+# cuBLAS, the selection these projections have on sm90, by the 4% rule. TGV and
+# the split-K kernel do not run on sm90.
+HOPPER_MEASURED_ROUTE: MappingProxyType[tuple[int, int, int], str] = MappingProxyType(
+    {
+        # fused_qkv_a  N=2624 K=6144; M == 1 10.10us vs cuBLAS 14.07
+        (1, 2624, 6144): "ll_bf16",
+        (2, 2624, 6144): "skinny",
+        # indexer wq_b  N=4096 K=2048
+        (1, 4096, 2048): "skinny",
+        # indexer wk + weights_proj  N=160 K=6144
+        (1, 160, 6144): "ll_bf16",
+        (2, 160, 6144): "ll_bf16",
+        (3, 160, 6144): "ll_bf16",
+        (4, 160, 6144): "ll_bf16",
+        (5, 160, 6144): "ll_bf16",
+        (6, 160, 6144): "ll_bf16",
+        (7, 160, 6144): "ll_bf16",
+        (8, 160, 6144): "ll_bf16",
+        # q_b  N=512 K=2048; M == 1 1.80us vs cuBLAS 6.78
+        (1, 512, 2048): "ll_bf16",
+        (2, 512, 2048): "ll_bf16",
+        (3, 512, 2048): "ll_bf16",
+        (4, 512, 2048): "skinny",
+        (5, 512, 2048): "skinny",
+        (6, 512, 2048): "ll_bf16",
+        (7, 512, 2048): "ll_bf16",
+        (8, 512, 2048): "ll_bf16",
+        # linear_gate (attention output gate)  N=512 K=6144
+        (1, 512, 6144): "ll_bf16",
+        (2, 512, 6144): "skinny",
+        (3, 512, 6144): "skinny",
+        (4, 512, 6144): "skinny",
+        (5, 512, 6144): "ll_bf16",
+        (6, 512, 6144): "ll_bf16",
+        (7, 512, 6144): "ll_bf16",
+        (8, 512, 6144): "ll_bf16",
+        # shared expert gate_up  N=128 K=6144
+        (1, 128, 6144): "ll_bf16",
+        (2, 128, 6144): "ll_bf16",
+        (3, 128, 6144): "ll_bf16",
+        (4, 128, 6144): "ll_bf16",
+        (5, 128, 6144): "skinny",
+        (6, 128, 6144): "skinny",
+        (7, 128, 6144): "skinny",
+        (8, 128, 6144): "ll_bf16",
+        # layer 0 dense MLP gate_up  N=1152 K=6144
+        (1, 1152, 6144): "ll_bf16",
+        (2, 1152, 6144): "ll_bf16",
+        (3, 1152, 6144): "skinny",
+        (4, 1152, 6144): "skinny",
+    }
+)
+_NO_ROUTE: MappingProxyType[tuple[int, int, int], str] = MappingProxyType({})
+
 _BF16_SIG = frozenset(
     {
         format_signature(
@@ -642,6 +701,35 @@ _CUTLASS_CAPABILITY = CapabilityRequirement(
     max_arch_version=ArchVersion(10, 7),
     vendors=frozenset({"nvidia"}),
 )
+_HOPPER_CAPABILITY = CapabilityRequirement(
+    min_arch_version=ArchVersion(9, 0),
+    max_arch_version=ArchVersion(9, 0),
+    vendors=frozenset({"nvidia"}),
+)
+
+
+@functools.lru_cache(maxsize=8)
+def measured_route(device_index: int) -> Mapping[tuple[int, int, int], str]:
+    """The measured route table of a device's architecture.
+
+    Args:
+        device_index: CUDA device the call runs on.
+
+    Returns:
+        :data:`MEASURED_ROUTE` on sm100 and up, :data:`HOPPER_MEASURED_ROUTE`
+        on sm90, an empty table elsewhere; the same floors the tables
+        register under.
+    """
+    from tokenspeed_kernel.platform import current_platform
+
+    if current_platform().vendor != "nvidia":
+        return _NO_ROUTE
+    capability = torch.cuda.get_device_capability(device_index)
+    if capability >= (10, 0):
+        return MEASURED_ROUTE
+    if capability == (9, 0):
+        return HOPPER_MEASURED_ROUTE
+    return _NO_ROUTE
 
 
 # Shapes an eager call has already compiled and allocated for. Capture must
@@ -756,7 +844,7 @@ def cute_dsl_skinny_gemv(
     dev = x.device.index or 0
     # Table shapes only; anything else would grow the compile cache unbounded.
     if (
-        MEASURED_ROUTE.get((m, n, k)) != "skinny"
+        measured_route(dev).get((m, n, k)) != "skinny"
         or x.dtype != torch.bfloat16
         or not _usable_in_capture("skinny", dev, m, n, k)
     ):
@@ -816,7 +904,7 @@ def flashinfer_tgv_gemv(
     n = weight.shape[0]
     dev = x.device.index or 0
     if (
-        MEASURED_ROUTE.get((m, n, k)) != "tgv"
+        measured_route(dev).get((m, n, k)) != "tgv"
         or x.dtype != torch.bfloat16
         or not _usable_in_capture("tgv", dev, m, n, k)
     ):
@@ -844,7 +932,7 @@ def flashinfer_cutlass_gemv(
     n = weight.shape[0]
     dev = x.device.index or 0
     if (
-        MEASURED_ROUTE.get((m, n, k)) != "tgv"
+        measured_route(dev).get((m, n, k)) != "tgv"
         or x.dtype != torch.bfloat16
         or not _usable_in_capture("cutlass", dev, m, n, k)
     ):
@@ -907,7 +995,7 @@ def cute_dsl_ll_bf16_gemv(
     n = weight.shape[0]
     dev = x.device.index or 0
     if (
-        MEASURED_ROUTE.get((m, n, k)) != "ll_bf16"
+        measured_route(dev).get((m, n, k)) != "ll_bf16"
         or x.dtype != torch.bfloat16
         or not _usable_in_capture("ll_bf16", dev, m, n, k)
         or not ll_bf16_mm_supported(x, weight)
@@ -935,7 +1023,8 @@ ADD3_ROUTE: MappingProxyType[tuple[int, int, int], tuple[int, int, int]] = (
 def decode_gemv_routed(x: torch.Tensor, weight: torch.Tensor) -> bool:
     """Whether a measured decode kernel covers this call on this platform.
 
-    NVIDIA answers from :data:`MEASURED_ROUTE`. CDNA5 has no such table, so it
+    NVIDIA answers from the device's :func:`measured_route` table. CDNA5 has no
+    such table, so it
     asks the registry, which holds the row-CTA and dense16 WMMA kernels and
     honors each spec's own capability gate -- the sm100+ backends above are
     filtered out there, so this cannot select a kernel ROCm does not have.
@@ -964,7 +1053,7 @@ def decode_gemv_routed(x: torch.Tensor, weight: torch.Tensor) -> bool:
 
     m, k = x.shape
     n = weight.shape[0]
-    if (m, n, k) in MEASURED_ROUTE and _is_routed_arch(x.device.index or 0):
+    if (m, n, k) in measured_route(x.device.index or 0):
         return True
 
     from tokenspeed_kernel.platform import current_platform
@@ -974,16 +1063,6 @@ def decode_gemv_routed(x: torch.Tensor, weight: torch.Tensor) -> bool:
     if not current_platform().is_cdna5 or k < 256:
         return False
     return _select(m, n, k, True) is not torch_decode_gemv
-
-
-@functools.lru_cache(maxsize=8)
-def _is_routed_arch(device_index: int) -> bool:
-    """MEASURED_ROUTE's arch floor: sm100 and up, matching its registration."""
-    from tokenspeed_kernel.platform import current_platform
-
-    if current_platform().vendor != "nvidia":
-        return False
-    return torch.cuda.get_device_capability(device_index) >= (10, 0)
 
 
 @functools.lru_cache(maxsize=8)
@@ -1075,6 +1154,24 @@ def skinny_gemv_add3(
     return result
 
 
+def _register(impl, capability, name: str, backend: str, m: int, n: int, k: int):
+    register_kernel(
+        "gemm",
+        "decode_gemv",
+        name=name,
+        solution=("flashinfer" if backend in ("tgv", "splitk") else "cute_dsl"),
+        capability=capability,
+        signatures=_BF16_SIG,
+        traits={
+            "m": frozenset({m}),
+            "n": frozenset({n}),
+            "k": frozenset({k}),
+        },
+        # Above the M == 1 rowcta spec so this route takes the shape.
+        priority=Priority.SPECIALIZED + 2,
+    )(impl)
+
+
 def _register_route() -> None:
     implementations = {
         "skinny": ((cute_dsl_skinny_gemv, _CAPABILITY),),
@@ -1087,21 +1184,16 @@ def _register_route() -> None:
     }
     for (m, n, k), backend in MEASURED_ROUTE.items():
         for impl, capability in implementations[backend]:
-            register_kernel(
-                "gemm",
-                "decode_gemv",
-                name=f"{impl.__name__}_m{m}_n{n}_k{k}",
-                solution=("flashinfer" if backend in ("tgv", "splitk") else "cute_dsl"),
-                capability=capability,
-                signatures=_BF16_SIG,
-                traits={
-                    "m": frozenset({m}),
-                    "n": frozenset({n}),
-                    "k": frozenset({k}),
-                },
-                # Above the M == 1 rowcta spec so this route takes the shape.
-                priority=Priority.SPECIALIZED + 2,
-            )(impl)
+            name = f"{impl.__name__}_m{m}_n{n}_k{k}"
+            _register(impl, capability, name, backend, m, n, k)
+    hopper_implementations = {
+        "skinny": cute_dsl_skinny_gemv,
+        "ll_bf16": cute_dsl_ll_bf16_gemv,
+    }
+    for (m, n, k), backend in HOPPER_MEASURED_ROUTE.items():
+        impl = hopper_implementations[backend]
+        name = f"{impl.__name__}_sm90_m{m}_n{n}_k{k}"
+        _register(impl, _HOPPER_CAPABILITY, name, backend, m, n, k)
 
 
 _register_route()

@@ -35,6 +35,7 @@ import pytest
 import tokenspeed_kernel.ops.gemm  # noqa: F401  (registration side effects)
 import torch
 from tokenspeed_kernel.ops.gemm.routed_gemv import (
+    HOPPER_MEASURED_ROUTE,
     MEASURED_ROUTE,
     decode_gemv_routed,
 )
@@ -49,6 +50,14 @@ def _is_routed_arch() -> bool:
     return (
         current_platform().vendor == "nvidia"
         and torch.cuda.get_device_capability() >= (10, 0)
+    )
+
+
+def _is_hopper() -> bool:
+    # Mirrors _HOPPER_CAPABILITY in routed_gemv: sm90 exactly.
+    return (
+        current_platform().vendor == "nvidia"
+        and torch.cuda.get_device_capability() == (9, 0)
     )
 
 
@@ -96,6 +105,32 @@ def test_routed_backend_matches_torch(shape, backend):
     got = decode_gemv(x, w).float()
     ref = (x @ w.t()).float()
     # Accumulation order differs per kernel; a couple of ulp at ~sqrt(K).
+    assert torch.allclose(got, ref, atol=0.5, rtol=2e-2), (
+        f"M={m} N={n} K={k} via {backend}: "
+        f"max abs err {(got - ref).abs().max().item():.4f}"
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not _is_hopper(),
+    reason="the Hopper route is registered for sm90",
+)
+@pytest.mark.parametrize("shape,backend", sorted(HOPPER_MEASURED_ROUTE.items()))
+def test_hopper_route_dispatches_and_matches_torch(shape, backend):
+    """On sm90 a table shape is routed, resolves to its measured backend, and
+    matches torch up to accumulation order."""
+    m, n, k = shape
+    _select.cache_clear()
+    impl = _select(m, n, k, True)
+    assert backend in getattr(
+        impl, "__name__", ""
+    ), f"M={m} N={n} K={k} resolved {impl} instead of the measured {backend}"
+    torch.manual_seed(0)
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    assert decode_gemv_routed(x, w)
+    got = decode_gemv(x, w).float()
+    ref = (x @ w.t()).float()
     assert torch.allclose(got, ref, atol=0.5, rtol=2e-2), (
         f"M={m} N={n} K={k} via {backend}: "
         f"max abs err {(got - ref).abs().max().item():.4f}"
@@ -339,25 +374,37 @@ def test_forced_torch_solution_is_not_routed():
     torch.cuda.synchronize()
 
 
-def test_route_predicate_admits_the_registered_arch_floor():
-    """MEASURED_ROUTE registers at sm100 and documents a GB200 re-sweep, so the
-    predicate must not gate on ADD3_ROUTE's stricter sm103 floor."""
+def test_route_predicate_follows_each_architecture_table():
+    """Each table answers at the floor it registers under: MEASURED_ROUTE from
+    sm100 (not ADD3_ROUTE's stricter sm103 floor, since it documents a GB200
+    re-sweep), HOPPER_MEASURED_ROUTE at sm90 exactly, and neither elsewhere."""
     from unittest.mock import patch
 
     from tokenspeed_kernel.ops.gemm import routed_gemv
 
-    x = torch.randn(1, 7168, device="cuda", dtype=torch.bfloat16)
-    w = torch.randn(3584, 7168, device="cuda", dtype=torch.bfloat16)
+    blackwell_x = torch.randn(1, 7168, device="cuda", dtype=torch.bfloat16)
+    blackwell_w = torch.randn(3584, 7168, device="cuda", dtype=torch.bfloat16)
+    hopper_x = torch.randn(1, 2048, device="cuda", dtype=torch.bfloat16)
+    hopper_w = torch.randn(512, 2048, device="cuda", dtype=torch.bfloat16)
+    assert (1, 3584, 7168) in MEASURED_ROUTE
+    assert (1, 3584, 7168) not in HOPPER_MEASURED_ROUTE
+    assert (1, 512, 2048) in HOPPER_MEASURED_ROUTE
+    assert (1, 512, 2048) not in MEASURED_ROUTE
     # The predicate also consults the CDNA arm once the route misses.
     nvidia = type("P", (), {"vendor": "nvidia", "is_cdna5": False})()
-    for capability, expected in (((10, 0), True), ((9, 0), False)):
-        routed_gemv._is_routed_arch.cache_clear()
+    for capability, blackwell, hopper in (
+        ((10, 0), True, False),
+        ((9, 0), False, True),
+        ((8, 9), False, False),
+    ):
+        routed_gemv.measured_route.cache_clear()
         with (
             patch("torch.cuda.get_device_capability", return_value=capability),
             patch("tokenspeed_kernel.platform.current_platform", return_value=nvidia),
         ):
-            assert routed_gemv.decode_gemv_routed(x, w) is expected
-    routed_gemv._is_routed_arch.cache_clear()
+            assert routed_gemv.decode_gemv_routed(blackwell_x, blackwell_w) is blackwell
+            assert routed_gemv.decode_gemv_routed(hopper_x, hopper_w) is hopper
+    routed_gemv.measured_route.cache_clear()
     torch.cuda.synchronize()
 
 
@@ -372,11 +419,18 @@ def test_measured_route_source_has_no_duplicate_keys():
     from tokenspeed_kernel.ops.gemm import routed_gemv
 
     src = inspect.getsource(routed_gemv)
-    keys = re.findall(r'\((\d+), (\d+), (\d+)\): "\w+"', src)
-    dupes = [k for k, n in collections.Counter(keys).items() if n > 1]
-    assert not dupes, f"duplicate MEASURED_ROUTE keys in source: {dupes}"
-    # Parsed size must match source count, else a duplicate collapsed.
-    assert len(routed_gemv.MEASURED_ROUTE) == len(keys)
+    # Scanned per table: each architecture's table is its own key space.
+    for name, table in (
+        ("MEASURED_ROUTE", routed_gemv.MEASURED_ROUTE),
+        ("HOPPER_MEASURED_ROUTE", routed_gemv.HOPPER_MEASURED_ROUTE),
+    ):
+        start = src.index(f"\n{name}: MappingProxyType")
+        span = src[start : src.index("}", start)]
+        keys = re.findall(r'\((\d+), (\d+), (\d+)\): "\w+"', span)
+        dupes = [k for k, n in collections.Counter(keys).items() if n > 1]
+        assert not dupes, f"duplicate {name} keys in source: {dupes}"
+        # Parsed size must match source count, else a duplicate collapsed.
+        assert len(table) == len(keys), name
     # Tuple-valued tables need their own pattern, scanned per table: the two
     # config tables are independent key spaces, so a shared key is legal.
     for name, table in (
@@ -393,6 +447,7 @@ def test_measured_route_source_has_no_duplicate_keys():
     # bound is the widest M any routed backend serves, which the split-K
     # tactics carry to 64; nothing above that has been swept.
     assert all(m <= 64 for m, _, _ in routed_gemv.MEASURED_ROUTE)
+    assert all(m <= 64 for m, _, _ in routed_gemv.HOPPER_MEASURED_ROUTE)
     for name, table in (
         ("SKINNY_CONFIG_ROUTE", routed_gemv.SKINNY_CONFIG_ROUTE),
         ("SPLITK_TACTIC_ROUTE", routed_gemv.SPLITK_TACTIC_ROUTE),

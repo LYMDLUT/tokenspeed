@@ -108,6 +108,25 @@ SHAPE_SETS = {
         ],
         list(range(1, 33)),
     ),
+    # HY V4 at attention and dense TP32, whose MXFP8 checkpoint's dense
+    # projections serve in BF16. Shapes read from the model code, not traced:
+    # 21 of the 78 layers run their own indexer, and only layer 0 has a dense
+    # MLP.
+    "hy_v4_tp32": (
+        [
+            (2624, 6144, 78, 1, "fused_qkv_a"),
+            (4096, 2048, 21, 1, "indexer_wq_b"),
+            (160, 6144, 21, 1, "indexer_wk_weights"),
+            (512, 2048, 78, 1, "q_b_proj"),
+            (512, 6144, 78, 1, "linear_gate"),
+            (6144, 512, 78, 1, "o_proj"),
+            (128, 6144, 77, 1, "shared_gate_up"),
+            (6144, 64, 77, 1, "shared_down"),
+            (1152, 6144, 1, 1, "dense_gate_up"),
+            (6144, 576, 1, 1, "dense_down"),
+        ],
+        list(range(1, 9)),
+    ),
 }
 
 #: Independent weight copies per backend, so the L2 never holds the operand
