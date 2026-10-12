@@ -248,7 +248,16 @@ class ModelRunner:
         the broadcast would deadlock. Build a standalone, non-default group (via
         the same private helper torch's own ``init_process_group`` uses) so it
         never collides with the engine's own world.
+
+        A model that sets ``supports_live_weight_updates = False`` is refused
+        here, before the rendezvous: once the group exists the trainer starts
+        broadcasting, and a worker that then rejects the update never receives
+        those broadcasts, which hangs the trainer.
         """
+        if not getattr(self.model, "supports_live_weight_updates", True):
+            return False, (
+                f"{type(self.model).__name__} does not support live weight updates"
+            )
         from packaging.version import parse as _parse_version
         from torch.distributed.distributed_c10d import (
             Backend,

@@ -49,6 +49,7 @@ from tokenspeed.runtime.configs.model_config import (
     AttentionArch,
     configure_glm_attention,
 )
+from tokenspeed.runtime.execution.model_runner import ModelRunner
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config, Mxfp8Config
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
 from tokenspeed.runtime.layers.quantization.modelopt_mxfp8 import ModelOptMxfp8Config
@@ -565,6 +566,18 @@ class HYV4QuantizationTests(unittest.TestCase):
             ValueError, "DenseModel does not support ModelOpt MXFP8"
         ):
             self._initialize_from_modelopt_mxfp8(DenseModel)
+
+
+class HYV4WeightUpdateTests(unittest.TestCase):
+    def test_update_group_is_refused_before_the_rendezvous(self):
+        runner = SimpleNamespace(model=object.__new__(HYV4ForCausalLM))
+        with mock.patch("torch.distributed.distributed_c10d.rendezvous") as rendezvous:
+            ok, message = ModelRunner.init_weights_update_group(
+                runner, SimpleNamespace()
+            )
+        self.assertFalse(ok)
+        self.assertIn("HYV4ForCausalLM does not support live weight updates", message)
+        rendezvous.assert_not_called()
 
 
 class HYV4ExpertPlacementTests(unittest.TestCase):
