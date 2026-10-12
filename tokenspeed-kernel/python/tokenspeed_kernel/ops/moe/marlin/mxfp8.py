@@ -36,6 +36,13 @@ once a batch is compute bound. Above ``_DENSE_MIN_ROUTES_PER_EXPERT`` routes
 per expert (prefill), the local experts are instead dequantized from the
 Marlin layout into one bf16 scratch per device and fed to the CUTLASS grouped
 GEMM; the dequant is exact, so only the accumulation order changes.
+
+At the other end, batches of at most ``_GEMV_MAX_ROUTES`` routes (decode)
+leave Marlin too. With a route or two per local expert, Marlin spreads one
+expert's K over most of the grid and sums the partial tiles in a serial lock
+chain, so the expert is read at a fraction of HBM bandwidth. GEMV kernels read
+the Marlin layout directly instead, split every route over output tiles and K
+ranges, sum the partials in a fixed order and round where Marlin does.
 """
 
 from __future__ import annotations
@@ -78,6 +85,17 @@ _TILE_N = 64
 _DENSE_MIN_ROUTES_PER_EXPERT = 192
 # Dequant program width along K: 8 Marlin k-tiles, 4 scale groups.
 _DEQUANT_K_TILES = 8
+# H20 crossover: two decode tokens at top-8. GEMV wins with one or two local
+# routes; one token with three already loses to Marlin (serial per-route
+# loop), and four tokens stay on Marlin.
+_GEMV_MAX_ROUTES = 16
+# Marlin k-tiles a GEMV program reads per step. Every K the GEMVs see (hidden,
+# ispp) is a multiple of _ISPP_ALIGNMENT, so steps never straddle the end.
+_GEMV_K_TILES = _ISPP_ALIGNMENT // _TILE_K
+# 16 programs/SM is the occupancy that beat Marlin at T=1 L=1 and T=1 L=2
+# on H20 (the default 8 only won L=1).
+_GEMV_PROGRAMS_PER_SM = 16
+_GEMV_NUM_WARPS = 4
 
 # One bf16 copy of a layer's local experts per (device, geometry). MoE layers
 # run one at a time on the compute stream, so every layer reuses it.
@@ -259,6 +277,334 @@ def _local_topk_sum_kernel(
                 tl.float32
             )
     tl.store(out_ptr + token * HIDDEN + cols, acc, mask=cmask)
+
+
+@triton.jit
+def _e4m3x4_to_f32(word):
+    """The four E4M3 bytes of every int32 in ``word`` as FP32, low byte first.
+
+    Two byte permutes pair the bytes for the hardware's two-wide E4M3 to FP16
+    conversion; FP16 holds every E4M3 value exactly.
+    """
+    return tl.inline_asm_elementwise(
+        asm="""
+        {
+        .reg .b32 lo, hi, f0, f1;
+        .reg .b16 l16, h16, pad, a0, a1, a2, a3;
+        prmt.b32 lo, $4, $4, 0x4420;
+        prmt.b32 hi, $4, $4, 0x4431;
+        mov.b32 {l16, pad}, lo;
+        mov.b32 {h16, pad}, hi;
+        cvt.rn.f16x2.e4m3x2 f0, l16;
+        cvt.rn.f16x2.e4m3x2 f1, h16;
+        mov.b32 {a0, a2}, f0;
+        mov.b32 {a1, a3}, f1;
+        cvt.f32.f16 $0, a0;
+        cvt.f32.f16 $1, a1;
+        cvt.f32.f16 $2, a2;
+        cvt.f32.f16 $3, a3;
+        }
+        """,
+        constraints="=r,=r,=r,=r,r",
+        args=[word],
+        dtype=(tl.float32, tl.float32, tl.float32, tl.float32),
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
+def _e4m3_tile_dot(q_ptrs, x_ptrs):
+    """Each word's four weights times their activations, summed in FP32.
+
+    Byte b of a Marlin word holds k = (b & 1) * 8 + t * 2 + (b >> 1) of its
+    16-row k-tile; ``x_ptrs`` points at each word's k = 2t.
+    """
+    w0, w1, w2, w3 = _e4m3x4_to_f32(tl.load(q_ptrs))
+    x0 = tl.load(x_ptrs).to(tl.float32)
+    x1 = tl.load(x_ptrs + 8).to(tl.float32)
+    x2 = tl.load(x_ptrs + 1).to(tl.float32)
+    x3 = tl.load(x_ptrs + 9).to(tl.float32)
+    return w0 * x0 + w1 * x1 + w2 * x2 + w3 * x3
+
+
+@triton.jit
+def _marlin_mxfp8_gemv_kernel(
+    x_ptr,
+    x_stride,
+    q_ptr,
+    s_ptr,
+    ids_ptr,
+    partial_ptr,
+    expert_start,
+    num_local_experts,
+    num_routes,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    ROUTES_PER_ROW: tl.constexpr,
+    SPLIT_K_TILES: tl.constexpr,
+    K_TILES: tl.constexpr,
+):
+    n_tile = tl.program_id(0)
+    split = tl.program_id(1)
+    # Word (c * 4 + t) * 8 + v of a Marlin tile holds in byte b the weight of
+    # n = (v >> 1) * 16 + (v & 1) * 8 + c and k = (b & 1) * 8 + t * 2 + (b >> 1)
+    # (see _marlin_mxfp8_to_bf16_kernel). A word's bytes share n, so tiles stay
+    # (c, t, v). One E8M0 scale covers two k-tiles: each scale block's tensors
+    # are small enough for Triton to load them in the weights' own layout
+    # instead of moving the products through shared memory.
+    c = tl.arange(0, 8)[:, None, None]
+    t = tl.arange(0, 4)[None, :, None]
+    v = tl.arange(0, 8)[None, None, :]
+    words = (c * 4 + t) * 8 + v
+    # The E8M0 byte of column n within its 64-wide scale block.
+    s_in_tile = c * 8 + (v >> 2 & 1) * 4 + (v & 1) * 2 + (v >> 1 & 1)
+    c_out = tl.arange(0, 8)[:, None]
+    v_out = tl.arange(0, 8)[None, :]
+    n_in_tile = (v_out >> 1) * 16 + (v_out & 1) * 8 + c_out
+    tile_words = N // 64 * 256
+    for route in range(num_routes):
+        expert = tl.load(ids_ptr + route) - expert_start
+        if (expert >= 0) & (expert < num_local_experts):
+            q_base = q_ptr + expert.to(tl.int64) * (N * K // 4) + n_tile * 256
+            s_base = s_ptr + expert.to(tl.int64) * (K // 32 * N) + n_tile * 64
+            x_base = x_ptr + (route // ROUTES_PER_ROW).to(tl.int64) * x_stride
+            acc = tl.zeros([8, 4, 8], dtype=tl.float32)
+            for step in range(SPLIT_K_TILES // K_TILES):
+                for i in tl.static_range(K_TILES // 2):
+                    kb = (split * SPLIT_K_TILES + step * K_TILES) // 2 + i
+                    q_ptrs = q_base + kb * 2 * tile_words + words
+                    x_ptrs = x_base + kb * 32 + t * 2
+                    pair = _e4m3_tile_dot(q_ptrs, x_ptrs) + _e4m3_tile_dot(
+                        q_ptrs + tile_words, x_ptrs + 16
+                    )
+                    s = tl.load(s_base + kb * N + s_in_tile)
+                    acc += pair * (s.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+            tl.store(
+                partial_ptr
+                + (split * num_routes + route).to(tl.int64) * N
+                + n_tile * 64
+                + n_in_tile,
+                tl.sum(acc, axis=1),
+            )
+
+
+@triton.jit
+def _gemv_silu_and_mul_kernel(
+    partial_ptr,
+    out_ptr,
+    ids_ptr,
+    expert_start,
+    num_local_experts,
+    num_routes,
+    ISPP: tl.constexpr,
+    SPLITS: tl.constexpr,
+    BLOCK: tl.constexpr,
+    limit,
+    HAS_LIMIT: tl.constexpr,
+):
+    route = tl.program_id(0)
+    expert = tl.load(ids_ptr + route) - expert_start
+    if (expert >= 0) & (expert < num_local_experts):
+        cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        cmask = cols < ISPP
+        gate = tl.zeros([BLOCK], dtype=tl.float32)
+        up = tl.zeros([BLOCK], dtype=tl.float32)
+        for split in tl.static_range(SPLITS):
+            row = partial_ptr + (split * num_routes + route).to(tl.int64) * (2 * ISPP)
+            gate += tl.load(row + cols, mask=cmask, other=0.0)
+            up += tl.load(row + ISPP + cols, mask=cmask, other=0.0)
+        # Marlin's GEMM1 writes bf16.
+        gate = gate.to(tl.bfloat16).to(tl.float32)
+        up = up.to(tl.bfloat16).to(tl.float32)
+        if HAS_LIMIT:
+            gate = tl.minimum(gate, limit)
+            up = tl.clamp(up, -limit, limit)
+        out = gate * tl.sigmoid(gate) * up
+        tl.store(out_ptr + route.to(tl.int64) * ISPP + cols, out, mask=cmask)
+
+
+@triton.jit
+def _gemv_topk_sum_kernel(
+    partial_ptr,
+    weights_ptr,
+    ids_ptr,
+    expert_start,
+    num_local_experts,
+    out_ptr,
+    num_routes,
+    HIDDEN: tl.constexpr,
+    TOP_K: tl.constexpr,
+    SPLITS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    token = tl.program_id(0)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    cmask = cols < HIDDEN
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for k in tl.static_range(TOP_K):
+        route = token * TOP_K + k
+        expert = tl.load(ids_ptr + route) - expert_start
+        if (expert >= 0) & (expert < num_local_experts):
+            y = tl.zeros([BLOCK], dtype=tl.float32)
+            for split in tl.static_range(SPLITS):
+                y += tl.load(
+                    partial_ptr
+                    + (split * num_routes + route).to(tl.int64) * HIDDEN
+                    + cols,
+                    mask=cmask,
+                    other=0.0,
+                )
+            # Marlin's GEMM2 writes each weighted route in bf16.
+            weighted = y * tl.load(weights_ptr + route)
+            acc += weighted.to(tl.bfloat16).to(tl.float32)
+    tl.store(out_ptr + token.to(tl.int64) * HIDDEN + cols, acc, mask=cmask)
+
+
+def _gemv_splits(size_n: int, size_k: int) -> int:
+    """Pick how many K ranges a GEMV over ``size_n`` outputs splits into.
+
+    Doubles the split while every range still holds whole steps and the grid
+    stays within ``_GEMV_PROGRAMS_PER_SM`` programs per SM.
+    """
+    tiles = size_n // _TILE_N
+    steps = size_k // (_TILE_K * _GEMV_K_TILES)
+    budget = current_platform().sm_count * _GEMV_PROGRAMS_PER_SM
+    splits = 1
+    while steps % (splits * 2) == 0 and tiles * splits * 2 <= budget:
+        splits *= 2
+    return splits
+
+
+def _marlin_mxfp8_gemv(
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    expert_start: int,
+    size_n: int,
+    size_k: int,
+    routes_per_row: int,
+) -> torch.Tensor:
+    """Multiply each route's activation row with its Marlin-layout expert.
+
+    Args:
+        x: bf16 activations ``[rows, size_k]``; route ``r`` reads row
+            ``r // routes_per_row``.
+        qweight: Marlin-repacked int32 experts ``[E, size_k/16, 4*size_n]``.
+        scales: Their permuted float8_e8m0fnu scales ``[E, size_k/32, size_n]``.
+        topk_ids: int32 global expert ids, one per route.
+        expert_start: Global id of ``qweight``'s first expert; routes outside
+            its experts are skipped.
+        size_n/size_k: GEMV shape.
+        routes_per_row: Routes sharing one row of ``x``.
+
+    Returns:
+        FP32 partial sums ``[splits, routes, size_n]`` over ``splits`` K
+        ranges; rows of skipped routes are left unwritten.
+    """
+    num_routes = topk_ids.numel()
+    splits = _gemv_splits(size_n, size_k)
+    partial = torch.empty(
+        (splits, num_routes, size_n), dtype=torch.float32, device=x.device
+    )
+    _marlin_mxfp8_gemv_kernel[(size_n // _TILE_N, splits)](
+        x,
+        x.stride(0),
+        qweight,
+        scales.view(torch.uint8),
+        topk_ids,
+        partial,
+        expert_start,
+        int(qweight.shape[0]),
+        num_routes,
+        N=size_n,
+        K=size_k,
+        ROUTES_PER_ROW=routes_per_row,
+        SPLIT_K_TILES=size_k // _TILE_K // splits,
+        K_TILES=_GEMV_K_TILES,
+        num_warps=_GEMV_NUM_WARPS,
+    )
+    return partial
+
+
+def _gemv_is_faster(num_routes: int, ep_size: int) -> bool:
+    """True when GEMV should run. Host-only: this apply is captured.
+
+    Without EP every route is local and GEMV loses at HY V4 top-8. With EP,
+    T·k ≤ 16 is the H20 window. Counting local routes would need ``.item()``
+    and break decode CUDA graphs; more than two local routes at EP32 is rare
+    and only slower, never wrong.
+    """
+    return num_routes <= _GEMV_MAX_ROUTES and ep_size > 1
+
+
+def _gemv_apply(
+    x: torch.Tensor,
+    w: torch.nn.Module,
+    state: _MarlinMxfp8State,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> torch.Tensor:
+    num_tokens, top_k = topk_ids.shape
+    num_routes = num_tokens * top_k
+    num_local_experts = int(w.w13_weight.shape[0])
+    ids = topk_ids.view(-1)
+    gate_up = _marlin_mxfp8_gemv(
+        x,
+        w.w13_weight,
+        w.w13_weight_scale_inv,
+        ids,
+        expert_start=state.expert_start,
+        size_n=2 * state.ispp,
+        size_k=state.hidden_size,
+        routes_per_row=top_k,
+    )
+    activated = torch.empty(num_routes, state.ispp, dtype=x.dtype, device=x.device)
+    limit = _swiglu_limit(w)
+    block = 256
+    _gemv_silu_and_mul_kernel[(num_routes, triton.cdiv(state.ispp, block))](
+        gate_up,
+        activated,
+        ids,
+        state.expert_start,
+        num_local_experts,
+        num_routes,
+        ISPP=state.ispp,
+        SPLITS=gate_up.shape[0],
+        BLOCK=block,
+        limit=0.0 if limit is None else limit,
+        HAS_LIMIT=limit is not None,
+        num_warps=4,
+    )
+    down = _marlin_mxfp8_gemv(
+        activated,
+        w.w2_weight,
+        w.w2_weight_scale_inv,
+        ids,
+        expert_start=state.expert_start,
+        size_n=state.hidden_size,
+        size_k=state.ispp,
+        routes_per_row=1,
+    )
+    out = torch.empty(num_tokens, state.hidden_size, dtype=x.dtype, device=x.device)
+    block = 1024
+    _gemv_topk_sum_kernel[(num_tokens, triton.cdiv(state.hidden_size, block))](
+        down,
+        topk_weights.reshape(-1),
+        ids,
+        state.expert_start,
+        num_local_experts,
+        out,
+        num_routes,
+        HIDDEN=state.hidden_size,
+        TOP_K=top_k,
+        SPLITS=down.shape[0],
+        BLOCK=block,
+        num_warps=4,
+    )
+    return out
 
 
 def _block_size_m(routes_per_expert: float) -> int:
@@ -443,7 +789,8 @@ def marlin_mxfp8_precomputed_moe_apply(
             ``silu(gate) * up`` clamped to ``w.swiglu_arg.limit`` when the
             checkpoint sets one (``gate`` from above, ``up`` on both sides).
             ``deterministic_finalize`` selects the stable route alignment on
-            the Marlin path and the unfused top-k reduction on the dense one.
+            the Marlin path and the unfused top-k reduction on the dense one;
+            the GEMV path is reproducible either way.
         x: bf16 hidden states ``[tokens, hidden]``.
         w: MoE layer processed by :func:`marlin_mxfp8_moe_weights`: the
             Marlin-repacked ``w13_weight``/``w2_weight`` (int32), permuted
@@ -495,6 +842,8 @@ def marlin_mxfp8_precomputed_moe_apply(
     topk_ids = topk_ids.contiguous()
     expert_start = state.expert_start
     topk_weights = topk_weights.to(torch.float32)
+    if _gemv_is_faster(num_tokens * top_k, w.ep_size):
+        return _gemv_apply(x, w, state, topk_weights, topk_ids)
 
     block_m = _block_size_m(routes_per_expert)
     sorted_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
