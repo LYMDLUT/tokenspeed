@@ -360,7 +360,10 @@ too. Two rules close both gaps:
   prompt's last page) makes no one wait. Page hashes chain, so a shared hash
   means the whole prefix before it is shared too. Waiting is not an admission
   failure: it blocks nothing behind it and asks for no retraction. It is also
-  bounded, since each round publishes what the previous one recorded.
+  bounded, since each round publishes what the previous one recorded. Mixed
+  mode still publishes at the start of the round, so a `PrefillDone` writer's
+  pages are visible to a new prompt that joins the writer's first decode in
+  the same plan.
 
 What is recorded is what the next round can hit. When every matched group is
 prefix-closed, any published page can end a hit, so every computed page
