@@ -449,6 +449,12 @@ ts serve zai-org/GLM-5.3 \
 
 ## HY V4 (Hy4-preview)
 
+HY V4 requires pipeline-parallel size 1 and checks its kernel capabilities
+before allocating layers. Model discovery imports the residual module rather
+than new iHC symbols, so an older kernel package does not prevent unrelated
+models from being discovered. Use a matching runtime/kernel source build or
+a release containing the required iHC and DSA sink APIs.
+
 `tencent/Hy4-preview` (`HYV4ForCausalLM`, 770B total / 49B active) runs on the
 GLM-DSA serving path with four additions: a gated MLA output, a per-head
 learnable attention sink, independent Hyper-Connections (iHC, four residual
