@@ -7702,3 +7702,26 @@ def test_kernel_api_selection(
         registry.clear_cache()
 
     assert calls == [case.expected]
+
+
+def test_moe_plan_legacy_call_preserves_finalize_behavior():
+    kwargs = dict(
+        input_dtype=torch.bfloat16,
+        activation="silu",
+        routing_mode="precomputed_topk",
+        ep_size=1,
+        ispp=128,
+        solution="triton",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
+        combine_order="rank",
+    )
+    legacy = kernel_moe_plan("unquant", **kwargs)
+    explicit = kernel_moe_plan(
+        "unquant", requires_deterministic_finalize=False, **kwargs
+    )
+    assert legacy["deterministic_finalize"] is False
+    assert legacy["apply_kernel_name"] == explicit["apply_kernel_name"]
