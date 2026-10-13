@@ -35,6 +35,10 @@ from tokenspeed_kernel.selection import NoKernelFoundError
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
+from tokenspeed.runtime.distributed.comm_ops import (
+    all_to_all_head_scatter,
+    all_to_all_transpose,
+)
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
@@ -180,6 +184,16 @@ class DSABackend(PagedAttentionBackend):
         self.qcp_rank = config.qcp_rank
         if len(self.qcp_group) > 1 and spec.index_kpool is not None:
             raise ValueError("DSA query context parallelism does not support KPool")
+        # Attention token parallelism: a sparse launch large enough to fill
+        # the GPU attends its rows spread over the group (_spreads_rows).
+        self.token_parallel_group = tuple(config.token_parallel_group)
+        self.token_parallel_rank = config.token_parallel_rank
+        self._spread_min_row_columns = 0
+        if len(self.token_parallel_group) > 1:
+            sms = torch.cuda.get_device_properties(
+                torch.cuda.current_device()
+            ).multi_processor_count
+            self._spread_min_row_columns = sms * spec.index_topk // 4
         self.index_head_dim = spec.index_head_dim
         # The index-K plane's format (configs/dsa.py INDEX_K_FORMATS): the
         # history gather packs rows in it and hands the indexer that form.
@@ -835,6 +849,128 @@ class DSABackend(PagedAttentionBackend):
         group's query heads in and reduce-scatters its own back out."""
         return heads != self.num_local_heads
 
+    def _group_sink(self, layer) -> torch.Tensor | None:
+        """The sink logits of the token-parallel group's heads, in rank order."""
+        sink = layer.attn_sink
+        heads = len(self.token_parallel_group) * layer.tp_q_head_num
+        if sink is not None and sink.numel() != heads:
+            raise RuntimeError(
+                "DSA needs the sink logits of the token-parallel group's "
+                f"{heads} heads, got {sink.numel()}"
+            )
+        return sink
+
+    def _local_sink(self, layer) -> torch.Tensor | None:
+        """The sink logits of this rank's TP-local heads, the ones a launch
+        kept on its rank attends."""
+        if len(self.token_parallel_group) == 1:
+            return layer.attn_sink
+        sink = self._group_sink(layer)
+        if sink is None:
+            return None
+        heads = layer.tp_q_head_num
+        start = self.token_parallel_rank * heads
+        return sink[start : start + heads]
+
+    def _spreads_rows(self, rows: int, columns: int) -> bool:
+        """Whether a sparse launch is spread over the token-parallel group.
+
+        ``columns`` bounds the KV slots one row attends. While ``rows *
+        columns`` stays under a quarter of ``sms * index_topk``, the kernel
+        splits every row's columns four or more ways over the idle SMs, so no
+        SM walks more than a quarter of an ``index_topk``-slot row and the two
+        exchanges would cost more than spreading saves. From there on each SM
+        walks at least half such a row, and cutting the rows by the group size
+        outweighs the exchanges. Every rank of the group gets a row.
+        """
+        return (
+            len(self.token_parallel_group) > 1
+            and rows >= len(self.token_parallel_group)
+            and rows * columns >= self._spread_min_row_columns
+        )
+
+    def _sparse_rows_attention(
+        self, layer, kv_cache: torch.Tensor, max_seq_len: int, *, return_lse: bool
+    ):
+        """``dsa_prefill`` over ``kv_cache`` for query rows that each attend
+        their own selected slots.
+
+        Rows are independent, so a subset of a launch's rows -- a rank's share
+        of spread rows included -- attends as in the full launch up to split-K
+        rounding: the kernel splits each row's columns a number of ways chosen
+        from the launch's row count and merges the partials by their LSE.
+        """
+
+        def attend(q_rows, slots, lens, row_kv_lens, sink):
+            return dsa_prefill(
+                q=q_rows,
+                kv_cache=kv_cache,
+                sparse_kv_cache=None,
+                topk_slots=slots,
+                topk_lens=lens,
+                kv_seq_lens=row_kv_lens,
+                max_seqlen_k=max_seq_len,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                softmax_scale=layer.scaling,
+                page_size=self.kernel_page_size,
+                logit_cap=layer.logit_cap,
+                k_scale=1.0,
+                return_lse=return_lse,
+                solution=self.kernel_solution,
+                slot_order=self.slot_order,
+                attn_sink=sink,
+            )
+
+        return attend
+
+    def _attend_spread_rows(
+        self,
+        q: torch.Tensor,
+        topk_slots: torch.Tensor,
+        topk_lens: torch.Tensor | None,
+        kv_seq_lens: torch.Tensor | None,
+        sink: torch.Tensor | None,
+        attend,
+    ) -> torch.Tensor:
+        """Attend a launch's rows spread over the token-parallel group.
+
+        Rank j of the group attends the j-th of the group's near-equal,
+        consecutive row slices with every head of the group: an all-to-all
+        brings it those rows' queries from each rank's heads, and the inverse
+        exchange returns every rank its own heads of all the rows. Heads are
+        independent, so each rank gets the output its own launch would give,
+        up to split-K rounding (see ``_sparse_rows_attention``).
+        """
+        group = self.token_parallel_group
+        size = len(group)
+        tokens, heads, dim = q.shape
+        base, extra = divmod(tokens, size)
+        split = [base + (j < extra) for j in range(size)]
+        start = sum(split[: self.token_parallel_rank])
+        rows = slice(start, start + split[self.token_parallel_rank])
+        # Both exchanges only move bytes, so queries of any dtype (FP8 too)
+        # travel as raw bytes.
+        group_q = (
+            all_to_all_transpose(
+                q.reshape(tokens, heads * dim).view(torch.uint8), group, split
+            )
+            .view(q.dtype)
+            .view(-1, size * heads, dim)
+        )
+        out = attend(
+            group_q,
+            topk_slots[rows],
+            None if topk_lens is None else topk_lens[rows],
+            None if kv_seq_lens is None else kv_seq_lens[rows],
+            sink,
+        )
+        own_heads = all_to_all_head_scatter(
+            out.contiguous().view(torch.uint8), group, split
+        )
+        return own_heads.view(out.dtype)
+
     def _validate_logit_cap(self, logits_soft_cap: float) -> None:
         if logits_soft_cap and logits_soft_cap > 0:
             raise NotImplementedError(
@@ -1071,32 +1207,33 @@ class DSABackend(PagedAttentionBackend):
             topk_slots = torch.where(owned, slots, -1)
             if not keep_all_heads:
                 q_view = gather_query_heads(q_view, self.kvp_group)
-        out = dsa_prefill(
-            q=q_view,
-            kv_cache=kv_cache,
-            sparse_kv_cache=None,
-            topk_slots=topk_slots,
-            topk_lens=topk_lens.to(device=q.device, dtype=torch.int32).contiguous(),
-            kv_seq_lens=(
-                kv_seq_lens.to(device=q.device, dtype=torch.int32).contiguous()
-                if kv_seq_lens is not None
-                else None
-            ),
-            max_seqlen_k=max_seq_len,
-            qk_nope_head_dim=self.qk_nope_head_dim,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            softmax_scale=layer.scaling,
-            page_size=self.kernel_page_size,
-            logit_cap=layer.logit_cap,
-            k_scale=1.0,
-            return_lse=use_dcp,
-            solution=self.kernel_solution,
-            slot_order=self.slot_order,
+        topk_lens = topk_lens.to(device=q.device, dtype=torch.int32).contiguous()
+        if kv_seq_lens is not None:
+            kv_seq_lens = kv_seq_lens.to(device=q.device, dtype=torch.int32)
+            kv_seq_lens = kv_seq_lens.contiguous()
+        attend = self._sparse_rows_attention(
+            layer, kv_cache, max_seq_len, return_lse=use_dcp
+        )
+        if self._spreads_rows(q_view.shape[0], min(max_seq_len, topk_slots.shape[1])):
+            # Token parallelism excludes KVP, so spread rows never return LSE.
+            out = self._attend_spread_rows(
+                q_view,
+                topk_slots,
+                topk_lens,
+                kv_seq_lens,
+                self._group_sink(layer),
+                attend,
+            )
+        else:
             # Under DCP the kernel returns per-shard partials and a no-sink LSE
             # so the sink is applied exactly once, after the combine.
-            attn_sink=None if use_dcp else layer.attn_sink,
-        )
+            out = attend(
+                q_view,
+                topk_slots,
+                topk_lens,
+                kv_seq_lens,
+                None if use_dcp else self._local_sink(layer),
+            )
         if use_dcp:
             local_output, local_lse = out
             out = combine_attention_partials(
@@ -1305,6 +1442,25 @@ class DSABackend(PagedAttentionBackend):
             topk_slots = torch.where(owned, slots, -1)
             if not keep_all_heads:
                 q_view = gather_query_heads(q_view, self.kvp_group)
+        if self._spreads_rows(num_tokens, topk_slots.shape[1]):
+            # A rank's share of spread rows need not hold whole requests, so it
+            # attends through dsa_prefill, whose rows are independent. Dense-KV
+            # decode with a sink resolves to that kernel anyway; without a sink,
+            # decode switches from its dsa_decode kernel to dsa_prefill once a
+            # launch reaches the spread threshold. Token parallelism excludes
+            # KVP, so the rows need no LSE combine.
+            attend = self._sparse_rows_attention(
+                layer, kv_cache, max_seqlen_k, return_lse=False
+            )
+            out = self._attend_spread_rows(
+                q_view,
+                topk_slots,
+                topk_lens,
+                kv_seq_lens,
+                self._group_sink(layer),
+                attend,
+            )
+            return out.reshape(-1, heads * layer.v_head_dim)
         out = dsa_decode(
             q=q_view,
             kv_cache=kv_cache,
@@ -1326,7 +1482,7 @@ class DSABackend(PagedAttentionBackend):
             slot_order=self.slot_order,
             # See forward_sparse_prefill: the sink is applied once, by the DCP
             # combine, whenever the KV is sharded.
-            attn_sink=None if use_dcp else layer.attn_sink,
+            attn_sink=None if use_dcp else self._local_sink(layer),
         )
         if use_dcp:
             local_output, local_lse = out

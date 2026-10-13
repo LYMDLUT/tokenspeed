@@ -157,9 +157,11 @@ class PagedAttention(nn.Module):
         self.rotary_emb = rotary_emb
         self.qk_norm = qk_norm
         # Per-head learnable attention-sink logits for architectures that carry
-        # one (HY V4). The attention backend reads this off the layer, so it is
-        # declared here rather than probed with ``getattr``. None means the
-        # architecture has no sink and the kernel must not apply one.
+        # one (HY V4), covering the heads of this rank's attention token-parallel
+        # group (the TP-local heads when that group is this rank alone). The
+        # attention backend reads this off the layer, so it is declared here
+        # rather than probed with ``getattr``. None means the architecture has
+        # no sink and the kernel must not apply one.
         self.attn_sink: torch.Tensor | None = None
 
     @property

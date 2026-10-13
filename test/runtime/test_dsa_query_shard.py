@@ -102,6 +102,7 @@ def _backend(
     backend.kvp_virtual_block_count = None
     backend.qcp_group = tuple(range(WORLD)) if qcp else (0,)
     backend.qcp_rank = rank if qcp else 0
+    backend.token_parallel_group = (0,)
     backend.query_shard_metadata = None
     backend._prefill_page_table = None
     backend._history_workspace = None
