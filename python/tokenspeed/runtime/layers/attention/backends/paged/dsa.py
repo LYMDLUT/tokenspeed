@@ -1095,7 +1095,12 @@ class DSABackend(PagedAttentionBackend):
             slot_order=self.slot_order,
             # Under DCP the kernel returns per-shard partials and a no-sink LSE
             # so the sink is applied exactly once, after the combine.
-            attn_sink=None if use_dcp else layer.attn_sink,
+            # An absent sink keeps the legacy kernel-package call signature.
+            **(
+                {"attn_sink": layer.attn_sink}
+                if not use_dcp and layer.attn_sink is not None
+                else {}
+            ),
         )
         if use_dcp:
             local_output, local_lse = out
@@ -1326,7 +1331,12 @@ class DSABackend(PagedAttentionBackend):
             slot_order=self.slot_order,
             # See forward_sparse_prefill: the sink is applied once, by the DCP
             # combine, whenever the KV is sharded.
-            attn_sink=None if use_dcp else layer.attn_sink,
+            # An absent sink keeps the legacy kernel-package call signature.
+            **(
+                {"attn_sink": layer.attn_sink}
+                if not use_dcp and layer.attn_sink is not None
+                else {}
+            ),
         )
         if use_dcp:
             local_output, local_lse = out
