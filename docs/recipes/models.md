@@ -455,6 +455,8 @@ before allocating layers. Model discovery imports the residual module rather
 than new iHC symbols, so an older kernel package does not prevent unrelated
 models from being discovered. Use a matching runtime/kernel source build or
 a release containing the required iHC and DSA sink APIs.
+The fused-boundary model also requires `ihc_fused_hc`; it rejects older
+iHC-only kernels before model allocation rather than on its first forward.
 
 `tencent/Hy4-preview` (`HYV4ForCausalLM`, 770B total / 49B active) runs on the
 GLM-DSA serving path with four additions: a gated MLA output, a per-head

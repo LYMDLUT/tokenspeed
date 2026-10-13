@@ -757,6 +757,14 @@ class HYV4RuntimeCapabilityTests(unittest.TestCase):
     def test_current_capabilities_are_accepted_without_allocating(self):
         hy_v4.check_hyv4_runtime(SimpleNamespace(has_pp=False), enable_ihc=True)
 
+    def test_missing_fused_boundary_is_rejected_before_allocation(self):
+        available = SimpleNamespace(
+            ihc_pre=lambda: None, ihc_post=lambda: None, ihc_head=lambda: None
+        )
+        with mock.patch.object(hy_v4, "residual_ops", available):
+            with self.assertRaisesRegex(RuntimeError, "ihc_fused_hc"):
+                hy_v4.check_hyv4_runtime(SimpleNamespace(has_pp=False), enable_ihc=True)
+
 
 if __name__ == "__main__":
     unittest.main()

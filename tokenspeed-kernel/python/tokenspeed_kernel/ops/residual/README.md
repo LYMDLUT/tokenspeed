@@ -10,6 +10,9 @@ iHC keeps `hc_mult` parallel residual channels shaped
 - `ihc_post` scatters the gated sub-block output across every channel and
   adds the residual.
 - `ihc_head` merges the channels into one hidden state before the final norm.
+- `ihc_fused_hc` runs one sub-block's `ihc_post` and the next sub-block's
+  `ihc_pre` as one boundary, returning the updated channels with the next
+  sub-block's input and post gates.
 
 The channels may be BF16 or FP32; HY V4 keeps them in FP32 across the decoder
 stack. The projection `fn`, scales `hc_scale` and biases `hc_base` are FP32,
@@ -19,9 +22,10 @@ and every gate is evaluated in FP32. A pre boundary has `2 * hc_mult` gates
 The public entry points check, before dispatch, that `hc_mult > 1`, that
 `fn` is `[gates, hc_mult * hidden_size]`, `hc_scale` is `[scales]`,
 `hc_base` is `[gates]` and `norm_weight` is `[hidden_size]`, that these
-parameters are contiguous, that `ihc_post`'s `block_output` is
-`[..., hidden_size]` and its `gates` `[..., hc_mult]` over the residual's
-leading dimensions, and that every tensor is on the residual's device. Any
+parameters are contiguous, that `ihc_post`'s `block_output` (`ihc_fused_hc`'s
+`x_prev`) is `[..., hidden_size]` and its `gates` (`post_prev`)
+`[..., hc_mult]` over the residual's leading dimensions, and that every tensor
+is on the residual's device. Any
 mismatch raises `ValueError`. The checks read tensor metadata only, so they do
 not synchronize and are safe under CUDA graph capture. Outputs keep the
 residual's leading dimensions in every implementation.
@@ -67,6 +71,17 @@ The tile shapes and the split count follow the token count. Results are
 reproducible run to run, but the projection's summation order, and with it
 the last bits of the gates, can change with the batch size.
 
-The Triton pre boundary registers for `hc_mult` 2 through 8 (at most 16
-gates) and the head for 2 through 16; wider boundaries select the portable
-torch implementation. `ihc_post` has no channel limit.
+On FP32 channels a multiple of 128 wide, the widest K tile, `ihc_fused_hc`
+applies the post boundary of a batch of up to 64 tokens inside the next
+projection: each tile of the updated channels lies in one channel, is stored
+and is projected from registers, which saves the projection's read of the
+channels and a launch. The fused kernel keeps the expressions of the two
+kernels it replaces and the projection's tile layout, so its outputs equal
+`ihc_post` followed by `ihc_pre` bit for bit. A projection program walks its K
+tiles one at a time, so in larger batches the post pass costs more inside it
+than as its own fully parallel kernel; those, BF16 channels (rounded between
+the two boundaries) and other channel sizes run the two kernels in turn.
+
+The Triton pre and fused boundaries register for `hc_mult` 2 through 8 (at
+most 16 gates) and the head for 2 through 16; wider boundaries select the
+portable torch implementation. `ihc_post` has no channel limit.

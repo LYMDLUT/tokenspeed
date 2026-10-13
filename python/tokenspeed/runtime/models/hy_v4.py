@@ -39,6 +39,7 @@ from __future__ import annotations
 import inspect
 from collections.abc import Iterable
 from dataclasses import replace
+from typing import NamedTuple
 
 import torch
 from tokenspeed_kernel.ops import residual as residual_ops
@@ -135,7 +136,7 @@ def check_hyv4_runtime(mapping: Mapping, *, enable_ihc: bool) -> None:
     if enable_ihc:
         missing.extend(
             name
-            for name in ("ihc_pre", "ihc_post", "ihc_head")
+            for name in ("ihc_pre", "ihc_post", "ihc_head", "ihc_fused_hc")
             if not callable(getattr(residual_ops, name, None))
         )
     for name in ("dsa_prefill", "dsa_decode"):
@@ -649,13 +650,22 @@ class HYV4HCBoundary(nn.Module):
         )
 
 
+class IhcPost(NamedTuple):
+    """A sub-block output whose iHC post boundary is still to be applied."""
+
+    block_output: torch.Tensor
+    gates: torch.Tensor
+
+
 class HYV4DecoderLayer(nn.Module):
     """One HY V4 decoder layer: gated sparse MLA plus a dense or MoE MLP.
 
     With iHC enabled the residual lives on the channel axis of
-    ``hidden_states`` (``[num_tokens, hc_mult, hidden_size]``), so no separate
-    residual is threaded between layers and the returned residual is None. The
-    RMSNorm before each sub-block is fused into the iHC reduce pass.
+    ``hidden_states`` (``[num_tokens, hc_mult, hidden_size]``). Each post
+    boundary runs in the projection pass of the next pre boundary, so a layer
+    returns its channels before its MLP's post boundary and that post
+    (``IhcPost``) as the residual; the next layer, or the model's head, applies
+    it. The RMSNorm before each sub-block is fused into the iHC reduce pass.
 
     iHC requires the attention and MLP to see full token rows: the boundary
     reduces and re-scatters every channel of a token at once. Attention data
@@ -755,21 +765,19 @@ class HYV4DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        residual: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        residual: torch.Tensor | IhcPost | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | IhcPost | None]:
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
             ctx
         )
         if self.enable_ihc:
-            return (
-                self._forward_ihc(
-                    positions,
-                    hidden_states,
-                    ctx,
-                    num_global_tokens,
-                    max_num_tokens_per_gpu,
-                ),
-                None,
+            return self._forward_ihc(
+                positions,
+                hidden_states,
+                ctx,
+                residual,
+                num_global_tokens,
+                max_num_tokens_per_gpu,
             )
 
         if not ctx.forward_mode.is_idle():
@@ -811,10 +819,15 @@ class HYV4DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
+        pending: IhcPost | None,
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
-    ) -> torch.Tensor:
-        """iHC forward: each sub-block reduces the channels, then re-scatters."""
+    ) -> tuple[torch.Tensor, IhcPost | None]:
+        """iHC forward: each sub-block reduces the channels, then re-scatters.
+
+        ``pending`` is the previous layer's MLP post boundary, applied with the
+        attention pre boundary; this layer's own is returned the same way.
+        """
         if ctx.forward_mode.is_idle():
             # Idle ranks hold no tokens but must join the MoE collectives.
             # Mirror the active path's collectives exactly (pre gather, MoE,
@@ -828,19 +841,10 @@ class HYV4DecoderLayer(nn.Module):
                 max_num_tokens_per_gpu,
             )
             self.comm_manager.post_mlp_comm(mlp_output, mlp_output, ctx)
-            return hidden_states
+            return hidden_states, None
 
-        attn = self.hc_attn_layer
-        attn_input, attn_post = residual_ops.ihc_pre(
-            hidden_states,
-            attn.hc_fn,
-            attn.hc_scale,
-            attn.hc_base,
-            self.config.hc_magnitude,
-            self.config.rms_norm_eps,
-            self.config.hc_eps,
-            norm_weight=self.input_layernorm.weight,
-            norm_eps=self.input_layernorm.variance_epsilon,
+        hidden_states, attn_input, attn_post = self._ihc_pre(
+            hidden_states, pending, self.hc_attn_layer, self.input_layernorm
         )
         attn_output = self.self_attn(
             positions=positions,
@@ -849,19 +853,12 @@ class HYV4DecoderLayer(nn.Module):
             comm_manager=self.comm_manager,
         )
         attn_output, _ = self.comm_manager.post_attn_comm(attn_output, attn_output, ctx)
-        hidden_states = residual_ops.ihc_post(attn_output, hidden_states, attn_post)
 
-        mlp = self.hc_mlp_layer
-        mlp_input, mlp_post = residual_ops.ihc_pre(
+        hidden_states, mlp_input, mlp_post = self._ihc_pre(
             hidden_states,
-            mlp.hc_fn,
-            mlp.hc_scale,
-            mlp.hc_base,
-            self.config.hc_magnitude,
-            self.config.rms_norm_eps,
-            self.config.hc_eps,
-            norm_weight=self.post_attention_layernorm.weight,
-            norm_eps=self.post_attention_layernorm.variance_epsilon,
+            IhcPost(attn_output, attn_post),
+            self.hc_mlp_layer,
+            self.post_attention_layernorm,
         )
         mlp_output = self._run_mlp(
             self.comm_manager.pre_mlp_comm(mlp_input, ctx),
@@ -869,7 +866,36 @@ class HYV4DecoderLayer(nn.Module):
             max_num_tokens_per_gpu,
         )
         mlp_output, _ = self.comm_manager.post_mlp_comm(mlp_output, mlp_output, ctx)
-        return residual_ops.ihc_post(mlp_output, hidden_states, mlp_post)
+        return hidden_states, IhcPost(mlp_output, mlp_post)
+
+    def _ihc_pre(
+        self,
+        hidden_states: torch.Tensor,
+        pending: IhcPost | None,
+        boundary: HYV4HCBoundary,
+        norm: RMSNorm,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply ``pending``, then reduce the channels for ``boundary``'s sub-block.
+
+        Returns the channels after ``pending``, the sub-block input and its post
+        gates.
+        """
+        args = (
+            boundary.hc_fn,
+            boundary.hc_scale,
+            boundary.hc_base,
+            self.config.hc_magnitude,
+            self.config.rms_norm_eps,
+            self.config.hc_eps,
+        )
+        norm_args = dict(norm_weight=norm.weight, norm_eps=norm.variance_epsilon)
+        if pending is None:
+            return hidden_states, *residual_ops.ihc_pre(
+                hidden_states, *args, **norm_args
+            )
+        return residual_ops.ihc_fused_hc(
+            pending.block_output, hidden_states, pending.gates, *args, **norm_args
+        )
 
 
 class HYV4Model(nn.Module):
@@ -955,6 +981,10 @@ class HYV4Model(nn.Module):
             return hidden_states, None
 
         if self.hc_head is not None:
+            if residual is not None:
+                hidden_states = residual_ops.ihc_post(
+                    residual.block_output, hidden_states, residual.gates
+                )
             hidden_states = residual_ops.ihc_head(
                 hidden_states,
                 self.hc_head.hc_fn,
