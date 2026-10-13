@@ -227,3 +227,8 @@ context-parallel partials. An independent runtime upgrade therefore keeps
 the previous call signature for models without sinks. A sink-bearing model
 must use a kernel package that implements the sink API; it must never drop a
 nonempty sink to make an older package accept the call.
+
+A strong sink may underflow every selected key probability. Such a row is
+still nonempty: its LSE includes the sink. Empty-row detection uses the
+selected slots, not the accumulated floating-point key mass, for both dense
+and packed Triton caches.
