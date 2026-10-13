@@ -195,13 +195,34 @@ def dequantize_marlin_mxfp8(
     Args:
         qweight: :func:`marlin_mxfp8_moe_weights` int32 weights ``[E, K/16, 4N]``.
         scales: Its float8_e8m0fnu scales ``[E, K/32, N]``.
-        out: bf16 ``[E, N, K]`` destination.
+        out: bf16 ``[E, N, K]`` destination. All three tensors must be
+            contiguous and on the same CUDA device, with positive dimensions.
         swap_halves: Write the second half of N first, turning a
             ``[gate; up]`` w13 into CUTLASS's ``[up; gate]`` order.
+
+    Returns:
+        The supplied ``out`` tensor, filled in place.
+
+    Raises:
+        TypeError: A tensor has the wrong storage dtype.
+        ValueError: Shapes, alignment, strides or devices violate the layout.
+
+    Validation reads tensor metadata only and is safe during graph capture.
+    Scale encodings are validated once by the weight loader before repacking.
     """
+    if qweight.dtype != torch.int32:
+        raise TypeError("qweight must be int32 Marlin-packed storage")
+    if scales.dtype != torch.float8_e8m0fnu:
+        raise TypeError("scales must be float8_e8m0fnu Marlin-packed storage")
+    if out.dtype != torch.bfloat16:
+        raise TypeError("out must have bf16 dtype")
+    if any(t.ndim != 3 for t in (qweight, scales, out)):
+        raise ValueError("qweight, scales and out must be three-dimensional")
+    if any(not t.is_contiguous() for t in (qweight, scales, out)):
+        raise ValueError("qweight, scales and out must be contiguous")
     num_experts, size_n, size_k = out.shape
-    if out.dtype != torch.bfloat16 or not out.is_contiguous():
-        raise ValueError("out must be a contiguous bf16 [E, N, K] tensor")
+    if min(num_experts, size_n, size_k) <= 0:
+        raise ValueError("dequant dimensions E, N and K must be positive")
     if tuple(qweight.shape) != (num_experts, size_k // _TILE_K, size_n * 4):
         raise ValueError(
             f"Marlin weights {tuple(qweight.shape)} do not match out {tuple(out.shape)}"
@@ -215,6 +236,10 @@ def dequantize_marlin_mxfp8(
         raise ValueError(
             f"dequant needs N%{_TILE_N}==0 and K%{k_width}==0, got N={size_n}, K={size_k}"
         )
+    if qweight.device != out.device or scales.device != out.device:
+        raise ValueError("qweight, scales and out must share a device")
+    if out.device.type != "cuda":
+        raise ValueError("Marlin MXFP8 dequantization requires CUDA tensors")
     _marlin_mxfp8_to_bf16_kernel[(size_n // _TILE_N, size_k // k_width, num_experts)](
         qweight.view(torch.uint8),
         scales.view(torch.uint8),
