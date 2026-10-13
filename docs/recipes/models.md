@@ -518,8 +518,12 @@ Constraints that follow from the architecture:
   the smaller of 2048 and the chunked-prefill size) replay breakable CUDA
   graphs. Only the sparse attention core (cache writes, the indexer top-k and
   FlashMLA) runs eagerly between the graph segments, and it drops the padded
-  rows itself. MTP keeps the target's prefill graphs; the draft's first step
-  after a prefill runs eagerly.
+  rows itself. MTP keeps the target's prefill graphs. The draft's first step
+  after a prefill is a draft-owned `PrefillGraph` (`draft_first_step=True`)
+  around HY V4 NextN's encoder / eager gather / decoder split, on the
+  target's token ladder: longer forwards run both eager, and when the target
+  graph is off the draft stays eager too. Decode-side draft steps already
+  ride the decode graph.
 * Validated so far: the BF16 and MXFP8 checkpoints on four 8x H20 (96 GB)
   nodes with attention TP32 and EP32, there also the MXFP8 checkpoint with MTP
   (one and three draft steps) and with attention token parallelism 8, and the

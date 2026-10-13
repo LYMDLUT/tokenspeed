@@ -357,11 +357,32 @@ class HYV4Attention(GlmMoeDsaAttention):
         The token-shaped projections around the sparse core stay in the
         caller's graph segments; only :meth:`_sparse_attention` is an eager
         break. The hidden states are gathered once and shared by the indexer
-        and the gate, and the gate is applied before any draft narrowing so its
-        rows always match the attention output.
+        and the gate. Draft narrowing never reaches this forward: the MTP draft
+        narrows between :meth:`attend_token_shaped` and ``o_proj`` in its own
+        stages (``HYV4ModelNextN``).
         """
         if hidden_states.shape[0] == 0:
             return hidden_states
+        attn_output = self.attend_token_shaped(
+            positions, hidden_states, ctx, comm_manager, block_scale
+        )
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    def attend_token_shaped(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+        comm_manager: CommManager,
+        block_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Projections, sparse attention and the output gate; no draft narrowing.
+
+        Token-shaped through the eager ``_sparse_attention`` break. The NextN
+        prefill-graph encoder captures this; :meth:`narrowing_forward` then
+        gathers the live rows before :meth:`o_proj`.
+        """
         qkv = self.fused_qkv_a_proj_with_mqa(
             hidden_states,
             block_scale,
@@ -392,11 +413,7 @@ class HYV4Attention(GlmMoeDsaAttention):
         attn_output = self._sparse_attention(
             positions, q, latent_cache, index_q, index_k, index_weights, ctx
         )
-        attn_output = self._apply_output_gate(attn_output, hidden_states)
-        if ctx.draft_narrowing is not None:
-            attn_output = attn_output.index_select(0, ctx.gather_ids)
-        output, _ = self.o_proj(attn_output)
-        return output
+        return self._apply_output_gate(attn_output, hidden_states)
 
     @break_point
     def _sparse_attention(
@@ -790,8 +807,6 @@ class HYV4DecoderLayer(nn.Module):
                 ctx=ctx,
                 comm_manager=self.comm_manager,
             )
-            if ctx.draft_narrowing is not None:
-                residual = residual.index_select(0, ctx.gather_ids)
             hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
                 hidden_states, residual, ctx
             )

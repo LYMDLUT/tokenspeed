@@ -273,8 +273,8 @@ def configure_hyv4_attention(model_config, server_args: ServerArgs) -> None:
     """DSA geometry, plus the padded prefill replay HY V4's attention allows.
 
     HY V4's attention break holds every read of the live metadata and slices
-    off the padded rows. The MTP draft shares that attention and replays no
-    prefill graph of its own, so it leaves the target's prefill graph on.
+    off the padded rows. The MTP draft shares that attention and replays it
+    padded in its own step-0 prefill graph.
     """
     configure_dsa_attention(model_config, server_args)
     model_config.dsa_padded_prefill_replay = True

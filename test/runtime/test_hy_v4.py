@@ -717,6 +717,125 @@ class HYV4OutputGateTests(unittest.TestCase):
         torch.testing.assert_close(out, expected)
 
 
+class HYV4NextNPrefillStagesTests(unittest.TestCase):
+    def test_nextn_declares_the_narrowing_prefill_contract(self):
+        from tokenspeed.runtime.execution.prefill_graph import NarrowingPrefillModel
+
+        inner = HYV4ModelNextN.__new__(HYV4ModelNextN)
+        self.assertIsInstance(inner, NarrowingPrefillModel)
+        self.assertEqual(inner.max_decoder_rows_per_request, 1)
+
+    def test_nextn_row_state_lands_into_a_fixed_row_static(self):
+        from tokenspeed.runtime.models.hy_v4_nextn import NextNRowState
+
+        src = NextNRowState(
+            torch.arange(4, dtype=torch.float32).reshape(2, 2),
+            torch.arange(4, 8, dtype=torch.float32).reshape(2, 2),
+        )
+        dst = NextNRowState(torch.ones(4, 2), torch.ones(4, 2))
+        src.land_into(dst)
+        torch.testing.assert_close(dst.hidden[:2], src.hidden)
+        torch.testing.assert_close(dst.residual[:2], src.residual)
+        self.assertTrue(torch.all(dst.hidden[2:] == 0))
+        self.assertTrue(torch.all(dst.residual[2:] == 0))
+        with self.assertRaisesRegex(ValueError, "disagree on residual"):
+            NextNRowState(torch.ones(1, 2), None).land_into(dst)
+
+    def test_decoder_state_is_sized_like_the_narrowed_encoder_output(self):
+        from tokenspeed.runtime.models.hy_v4_nextn import NextNRowState
+
+        inner = HYV4ModelNextN.__new__(HYV4ModelNextN)
+        inner.config = SimpleNamespace(hidden_size=6)
+        inner.embed_tokens = SimpleNamespace(weight=torch.zeros(1, 6))
+        inner.decoder = SimpleNamespace(
+            self_attn=SimpleNamespace(
+                o_proj=SimpleNamespace(input_size_per_partition=4)
+            )
+        )
+        statics = inner.allocate_decoder_state(3)
+        self.assertEqual(tuple(statics.hidden.shape), (3, 4))
+        self.assertEqual(tuple(statics.residual.shape), (3, 6))
+
+        narrowed = NextNRowState(torch.ones(2, 4), torch.full((2, 6), 2.0))
+        narrowed.land_into(statics)
+        torch.testing.assert_close(statics.hidden[:2], narrowed.hidden)
+        torch.testing.assert_close(statics.residual[:2], narrowed.residual)
+
+    def test_narrowing_gathers_hidden_and_residual(self):
+        from tokenspeed.runtime.models.hy_v4_nextn import (
+            HYV4ModelNextN,
+            NextNRowState,
+        )
+
+        inner = HYV4ModelNextN.__new__(HYV4ModelNextN)
+        state = NextNRowState(
+            torch.arange(8, dtype=torch.float32).reshape(4, 2),
+            torch.arange(8, 16, dtype=torch.float32).reshape(4, 2),
+        )
+        ctx = SimpleNamespace(
+            draft_narrowing=object(),
+            gather_ids=torch.tensor([1, 3], dtype=torch.int64),
+            forward_mode=SimpleNamespace(is_idle=lambda: False),
+        )
+        out = inner.narrowing_forward(state, ctx)
+        self.assertEqual(out.rows, 2)
+        torch.testing.assert_close(out.hidden, state.hidden[[1, 3]])
+        torch.testing.assert_close(out.residual, state.residual[[1, 3]])
+
+    def test_narrowing_is_a_no_op_without_the_step0_handle(self):
+        from tokenspeed.runtime.models.hy_v4_nextn import (
+            HYV4ModelNextN,
+            NextNRowState,
+        )
+
+        inner = HYV4ModelNextN.__new__(HYV4ModelNextN)
+        state = NextNRowState(torch.ones(3, 2), torch.zeros(3, 2))
+        ctx = SimpleNamespace(
+            draft_narrowing=None,
+            gather_ids=torch.tensor([0], dtype=torch.int64),
+            forward_mode=SimpleNamespace(is_idle=lambda: False),
+        )
+        self.assertIs(inner.narrowing_forward(state, ctx), state)
+        self.assertEqual(inner.decoder_rows(SimpleNamespace(bs=7)), 7)
+
+    def test_decoder_sizes_every_collective_by_its_rows(self):
+        from tokenspeed.runtime.models.hy_v4_nextn import NextNRowState
+
+        ctx = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_idle=lambda: False),
+            global_bs=None,
+            collective_num_tokens=None,
+            collective_global_num_tokens=None,
+        )
+        seen = []
+
+        def note(name, out):
+            seen.append((name, ctx.collective_num_tokens))
+            return out
+
+        wide = torch.zeros(2, 6)
+        inner = HYV4ModelNextN.__new__(HYV4ModelNextN)
+        inner.final_layernorm = object()
+        inner.decoder = SimpleNamespace(
+            self_attn=SimpleNamespace(o_proj=lambda h: note("o_proj", (wide, None))),
+            comm_manager=SimpleNamespace(
+                post_attn_reduce_norm=lambda h, r, c: note("post_attn", (h, r)),
+                get_num_tokens=lambda c: note("num_tokens", (2, 2)),
+                pre_mlp_comm=lambda h, c: note("pre_mlp", h),
+                post_mlp_fused=lambda h, r, c: note("post_mlp", (h, r)),
+                final_norm=lambda h, r, c, norm: note("final_norm", (h, r)),
+            ),
+            _run_mlp=lambda h, num_global, max_per_gpu: note("mlp", h),
+        )
+        state = NextNRowState(torch.zeros(2, 4), torch.zeros(2, 6))
+        hidden, captured = inner.decoder_forward(state, ctx)
+        steps = "o_proj post_attn num_tokens pre_mlp mlp post_mlp final_norm"
+        self.assertEqual(seen, [(step, 2) for step in steps.split()])
+        self.assertIs(hidden, wide)
+        self.assertEqual(captured, [])
+        self.assertIsNone(ctx.collective_num_tokens)
+
+
 class HYV4RuntimeCapabilityTests(unittest.TestCase):
     def test_pipeline_is_rejected_before_embeddings_or_layers(self):
         mapping = SimpleNamespace(has_pp=True)
