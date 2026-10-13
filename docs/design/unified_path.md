@@ -1844,3 +1844,16 @@ mapping remains a separate consumer of the shared mapping helpers
 * New backends implement `refresh_decode_metadata` + `init_cuda_graph_state`;
   capture is inherited from the base default (idle refresh). Only a
   kernel-imposed capture asymmetry justifies an override.
+
+
+### Draft prefill graph validation
+
+Graph correctness evidence counts actual replays separately from eager
+fallbacks. Compare identical input tokens, positions, hidden states, gather
+rows and accepted frontiers; matching batch sizes alone do not align two
+runs. Check every replay proposal and full logits and written latent/index KV,
+not only an aggregate match rate or a median over matching proposals. Missing,
+truncated or non-finite traces fail. A free-running run that diverges is not
+comparable and must not be reported as a pass. The oracle's negative tests
+live in `test/runtime/test_draft_graph_validation.py` alongside the graph.
+Mixed first steps remain eager until an equivalent replay is demonstrated.
