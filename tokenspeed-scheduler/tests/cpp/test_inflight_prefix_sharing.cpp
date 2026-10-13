@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -288,6 +289,109 @@ TEST_F(InflightPrefixSharingStateCacheTest, OnlyAPromptSharingTheWritersCheckpoi
     ASSERT_EQ(second.size(), 1u);
     EXPECT_EQ(second.at("c").extend_prefix_len, 8);
     EXPECT_EQ(second.at("c").input_length, 3);
+}
+
+
+class InflightPrefixLifetimeTest : public SchedulerTestSuite, public ::testing::WithParamInterface<bool> {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
+        cfg.disable_l2_cache = true;
+        cfg.host_allocator.total_pages = 0;
+        return cfg;
+    }
+};
+
+TEST_P(InflightPrefixLifetimeTest, ReaderPinsSharedPagesAfterWriterExits) {
+    const std::int32_t available = scheduler_->AvailableLcmBlocks();
+    Submit({Prompt("writer", PromptA()), Prompt("reader", PromptB())});
+    const ExecutionPlan writer_plan = PlanOnce();
+    const ForwardBatch* writer = FindForwardBatch(writer_plan);
+    ASSERT_NE(writer, nullptr);
+    ASSERT_EQ(writer->request_ids, std::vector<std::string>{"writer"});
+
+    // Publish while the writer's forward is still in flight. The reader
+    // must own its hit, not merely borrow the writer's request lifetime.
+    const ExecutionPlan reader_plan = PlanOnce();
+    const ForwardBatch* reader = FindForwardBatch(reader_plan);
+    ASSERT_NE(reader, nullptr);
+    ASSERT_EQ(reader->request_ids, std::vector<std::string>{"reader"});
+    ASSERT_EQ(reader->extend_prefix_lens.at(0), 6);
+    const auto& writer_pages = writer->block_tables.at("full_attention").at(0);
+    const auto& reader_pages = reader->block_tables.at("full_attention").at(0);
+    ASSERT_GE(writer_pages.size(), 3u);
+    ASSERT_GE(reader_pages.size(), 3u);
+    for (std::size_t i = 0; i < 3; ++i) {
+        ASSERT_GT(reader_pages[i], 0);
+        EXPECT_EQ(reader_pages[i], writer_pages[i]);
+    }
+    const std::set<std::int32_t> pinned(reader_pages.begin(), reader_pages.end());
+    if (GetParam()) {
+        SendAbortEvent("writer");
+    } else {
+        SendFinish("writer");
+    }
+
+    // New unrelated writes cannot reuse any physical page the reader holds.
+    Submit(Prompt("other", MakeTokens(9, 500)));
+    const ExecutionPlan other_plan = PlanOnce();
+    const ForwardBatch* other = FindForwardBatch(other_plan);
+    ASSERT_NE(other, nullptr);
+    ASSERT_EQ(other->request_ids, std::vector<std::string>{"other"});
+    for (std::int32_t page : other->block_tables.at("full_attention").at(0)) {
+        if (page > 0) {
+            EXPECT_FALSE(pinned.contains(page));
+        }
+    }
+    SendForwardDone("writer", {400});
+    SendForwardDone("reader", {401});
+    SendForwardDone("other", {402});
+    SendFinish("reader");
+    SendFinish("other");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), available);
+
+    // Reuse most of the pool after the last reader exits: shared references
+    // must be released exactly once, and old unpinned entries may be evicted.
+    Submit(Prompt("churn", MakeTokens(55, 1000)));
+    const ExecutionPlan churn_plan = PlanOnce();
+    const ForwardBatch* churn = FindForwardBatch(churn_plan);
+    ASSERT_NE(churn, nullptr);
+    ASSERT_EQ(churn->request_ids, std::vector<std::string>{"churn"});
+    ASSERT_EQ(churn->input_lengths.at(0), 55);
+    std::set<std::int32_t> allocated;
+    for (std::int32_t page : churn->block_tables.at("full_attention").at(0)) {
+        if (page > 0) {
+            EXPECT_TRUE(allocated.insert(page).second);
+        }
+    }
+    SendForwardDone("churn", {403});
+    SendFinish("churn");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), available);
+}
+
+INSTANTIATE_TEST_SUITE_P(FinishAndAbort, InflightPrefixLifetimeTest, ::testing::Bool());
+
+TEST_F(InflightPrefixSharingTest, ExplicitReplayBoundCapsTheSharedHit) {
+    RequestSpec reader = Prompt("reader", PromptB());
+    reader.max_cached_prefix_tokens = 2;
+    Submit({Prompt("writer", PromptA()), reader});
+    ASSERT_EQ(ScheduledPrefills(PlanOnce()).size(), 1u);
+    const auto second = ScheduledPrefills(PlanOnce());
+    ASSERT_EQ(second.size(), 1u);
+    EXPECT_EQ(second.at("reader").extend_prefix_len, 2);
+    EXPECT_EQ(second.at("reader").input_length, 7);
+}
+
+TEST_F(InflightPrefixSharingTest, ARequestRecomputingItsWholePromptDoesNotWait) {
+    RequestSpec reader = Prompt("reader", PromptB());
+    reader.max_cached_prefix_tokens = 0;
+    Submit({Prompt("writer", PromptA()), reader});
+    const auto first = ScheduledPrefills(PlanOnce());
+    ASSERT_EQ(first.size(), 2u);
+    EXPECT_EQ(first.at("reader").extend_prefix_len, 0);
+    EXPECT_EQ(first.at("reader").input_length, 9);
 }
 
 }  // namespace tokenspeed::test

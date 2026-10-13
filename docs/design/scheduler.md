@@ -1049,3 +1049,15 @@ lands in the same change as the pin, never a release apart.
   (or is undeclared). Spending a partial reserve never makes it qualify: the
   exemption is judged against the budget open at admission, not the current
   remainder (4).
+
+
+### In-flight prefix lifetime regression coverage
+
+A prefix reader owns references to the published physical pages independently
+of the writer request. Ending or aborting the writer while its forward is in
+flight must not make those pages available for another request's writes.
+After the last reader releases them, unpinned cache entries can be evicted
+and the full pool must be reclaimable. The in-flight sharing tests exercise
+both writer exits, unrelated allocation, subsequent pool churn, and explicit
+prompt-replay bounds used by prompt-logprob requests. These state-machine
+tests complement, rather than replace, stream-ordering and transfer-ACK tests.
