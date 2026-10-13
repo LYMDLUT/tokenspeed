@@ -218,3 +218,12 @@ owned entries. Empty tiles still write negative-infinite logits, including
 when lengths or ownership change during graph replay. Partially valid tiles
 keep the per-entry mask and global forced-window policy. This avoids redundant
 arithmetic without changing the launch grid, logits capacity or Top-K scan.
+
+
+### Runtime/package compatibility
+
+The runtime omits the `attn_sink` keyword for sinkless kernels, including
+context-parallel partials. An independent runtime upgrade therefore keeps
+the previous call signature for models without sinks. A sink-bearing model
+must use a kernel package that implements the sink API; it must never drop a
+nonempty sink to make an older package accept the call.
