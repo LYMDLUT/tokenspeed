@@ -223,3 +223,8 @@ A strong sink may underflow every selected key probability. Such a row is
 still nonempty: its LSE includes the sink. Empty-row detection uses the
 selected slots, not the accumulated floating-point key mass, for both dense
 and packed Triton caches.
+
+Sinkless runtime calls omit the optional `attn_sink` keyword, including
+context-parallel partials and token-parallel row launches. This preserves
+the older kernel-package signature for unrelated models. An actual sink
+is never discarded for compatibility.

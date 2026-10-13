@@ -920,7 +920,7 @@ class DSABackend(PagedAttentionBackend):
                 return_lse=return_lse,
                 solution=self.kernel_solution,
                 slot_order=self.slot_order,
-                attn_sink=sink,
+                **({"attn_sink": sink} if sink is not None else {}),
             )
 
         return attend
@@ -1461,6 +1461,7 @@ class DSABackend(PagedAttentionBackend):
                 attend,
             )
             return out.reshape(-1, heads * layer.v_head_dim)
+        sink = None if use_dcp else self._local_sink(layer)
         out = dsa_decode(
             q=q_view,
             kv_cache=kv_cache,
@@ -1482,7 +1483,7 @@ class DSABackend(PagedAttentionBackend):
             slot_order=self.slot_order,
             # See forward_sparse_prefill: the sink is applied once, by the DCP
             # combine, whenever the KV is sharded.
-            attn_sink=None if use_dcp else self._local_sink(layer),
+            **({"attn_sink": sink} if sink is not None else {}),
         )
         if use_dcp:
             local_output, local_lse = out
