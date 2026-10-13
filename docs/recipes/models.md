@@ -513,7 +513,8 @@ Constraints that follow from the architecture:
   after a prefill runs eagerly.
 * Validated so far: the BF16 and MXFP8 checkpoints on four 8x H20 (96 GB)
   nodes with attention TP32 and EP32, there also the MXFP8 checkpoint with MTP
-  (one and three draft steps), and the MXFP8 checkpoint on two such nodes with
+  (one and three draft steps) and with attention token parallelism 8, and the
+  MXFP8 checkpoint on two such nodes with
   TP16 and EP16. Keep the KV cache in BF16 unless you have validated FP8 KV
   accuracy on your workload.
 
@@ -544,6 +545,20 @@ prompts, which roughly halves the per-token latency of a lightly loaded server.
 Near the batch limit the verified draft tokens cost about as much as they save:
 at 64 concurrent requests, throughput stays within 3% (one step) to 6% (three
 steps) of decoding without MTP.
+
+At attention TP32 each rank holds two of the 64 query heads, while the FlashMLA
+sparse kernels pad every launch to 64 heads on Hopper. Attending the sparse
+core token-parallel across each node's eight ranks instead removes most of
+that padding; add to every node's command:
+
+```bash
+  --attn-token-parallel-size 8
+```
+
+On the four nodes above this cuts the TTFT of a 32K prompt by about 40% and
+raises the throughput of 64 concurrent requests by about 9%; single-request
+decode stays on its rank and is unchanged. It cannot be combined with KV
+parallelism or query context parallelism.
 
 `ts serve` defaults the reasoning and tool-call parsers to `hy_v4`; the pinned
 gateway (smg 1.11) provides both. The chat template accepts `reasoning_effort`
