@@ -237,3 +237,9 @@ The split Triton decode distinguishes zero softmax mass from non-finite mass.
 Only a truly empty partial receives the `+inf` LSE sentinel. A live partial
 containing NaN keeps its NaN LSE and propagates through the merge, rather than
 being silently discarded as if the row had selected no keys.
+
+The portable Triton prefill/decode wrappers require a supplied output buffer
+to be contiguous, on the query device, and to have the result's dtype and
+element count (BF16 for an FP8 query). Shape may differ, but the write must
+alias the caller's storage. Invalid buffers are rejected before launch; a
+reshape that silently allocates a temporary is never used for output writes.
