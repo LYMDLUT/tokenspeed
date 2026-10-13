@@ -145,3 +145,23 @@ The FlashMLA and Triton sink paths over a dense BF16 KV cache are covered by
 `tokenspeed-kernel/test/ops/test_attention_dsa_sink.py`, which goes through the
 public `dsa_decode` / `dsa_prefill` dispatchers. Neither check covers the FP8
 packed-KV kernel's sink branch or model-level numerics.
+
+
+### Strict draft step-0 graph evidence
+
+`draft_graph_check.py` now counts only actual graph replays. Eager/eager mixed
+rounds are controls, never evidence in a replay match-rate denominator. The
+checker requires identical live inputs/frontiers and checks every replay row,
+full logits, written latent KV and dequantized index-K, with explicit numerical
+tolerances. Missing or non-finite tensors, incomplete traces and different
+input sequences fail. Generated token sequences must also match. Tensor
+snapshots remain next to the trace for diagnosis; they may be large and the
+GPU synchronization makes this unsuitable for timing.
+
+`--min-match` is retained only for command-line compatibility and must be `1.0`.
+The checker no longer grants an arbitrary percentage of errors or uses a
+median that can hide a bad replay. Near ties or divergent schedules need a
+same-input reproduction; a failed comparison is not silently reclassified as
+rounding. The oracle and its negative tests ship with the graph change under
+`test/runtime/draft_graph_validation.py` and
+`test/runtime/test_draft_graph_validation.py`.

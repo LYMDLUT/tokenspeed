@@ -30,19 +30,14 @@ forwards; ``--enable-mixed-batch`` also lets those chunks share a batch with
 decodes, so step 0 follows mixed batches. The graph declines those, so they
 run eager in both runs and the check judges the pure extends among them.
 
-The truncated target barely agrees with its draft, so the outputs say little
-about the draft; the check reads the draft itself. Every served extend or
-mixed step (decode steps replay the decode graph) records the ids each draft
-step proposed and the top-2 logit gap behind each id. Step 0 is the graphed
-forward and is judged: its ids must match and, where they match, its gaps must
-agree to about bf16 rounding (the replay runs the bucket-padded shape, whose
-GEMMs may tile differently). Later steps run eagerly in both runs on top of
-step 0's cache, where that rounding compounds; they, the verify steps and the
-outputs are reported. A proposal flipped at a near-tie changes what verify
-accepts, and the same token then comes out of a different forward, so the
-outputs can drift after it although verification is lossless. The graph run
-must have replayed step 0 and the eager run must not have. Exit status 0 means
-all of that held.
+Only actual step-0 replays count as graph evidence; mixed/eager controls do
+not dilute their verdict. Every replay's proposed id and top-2 gap is checked,
+as are identical live inputs, full logits and all latent/index-K rows written
+by that step. The snapshots are retained for diagnosis. Missing, truncated,
+non-finite or non-comparable evidence fails, and generated token sequences must
+match. This is a strict regression oracle, not an accuracy benchmark: a near
+tie or divergent free-running schedule fails rather than being called a pass.
+See test/runtime/test_draft_graph_validation.py for adversarial oracle tests.
 """
 
 from __future__ import annotations
@@ -50,6 +45,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import math
 import os
 import random
 import shutil
@@ -89,6 +85,8 @@ def _run(args) -> int:
         # truncated checkpoint carries none.
         tokenizer=args.tokenizer,
         dtype="bfloat16",
+        kv_cache_dtype="bfloat16",
+        kv_cache_quant_method="none",
         skip_tokenizer_init=True,
         speculative_algorithm="MTP",
         speculative_num_steps=args.steps,
@@ -192,48 +190,51 @@ def _output_summary(graph: list[dict], eager: list[dict]) -> str:
     )
 
 
-def _compare_proposals(
-    graph: list[dict], eager: list[dict], min_match: float, max_gap_delta: float
-) -> tuple[list[str], str]:
-    """Judge step 0, the graphed forward, on its ids and its logit gaps.
+def _compare_proposals(graph, eager, min_match, max_gap_delta):
+    from test.runtime.draft_graph_validation import compare_proposals
 
-    The replay runs the bucket-padded shape, so its GEMMs may tile differently
-    from eager: matching rows then differ in their top-2 logit gap by about
-    bf16 rounding, and a near-tie can flip. A wrong graph moves the gap by the
-    gap's own size. Later steps run eagerly in both runs on step 0's cache, so
-    the rounding compounds there; they are reported, not judged.
-    """
-    if not graph:
-        return ["the graph run traced no served draft calls"], ""
-    shapes = [(call["bs"], call["num_extends"]) for call in graph]
-    if shapes != [(call["bs"], call["num_extends"]) for call in eager]:
-        return ["the two runs drafted different batches"], ""
-    step0 = step0_same = later = later_same = 0
-    deltas = []
-    for g, e in zip(graph, eager):
-        for ids_g, ids_e, gap_g, gap_e in zip(
-            g["draft"], e["draft"], g["margin"], e["margin"]
-        ):
-            step0 += 1
-            if ids_g[0] == ids_e[0]:
-                step0_same += 1
-                deltas.append(abs(gap_g[0] - gap_e[0]))
-            # A mid-chunk batch stops after step 0: no gap, placeholder ids.
-            drafted = [step for step in range(1, len(ids_g)) if gap_g[step] is not None]
-            later += len(drafted)
-            later_same += sum(ids_g[step] == ids_e[step] for step in drafted)
-    deltas.sort()
-    median = deltas[len(deltas) // 2] if deltas else float("inf")
-    summary = (
-        f"step-0 ids {step0_same}/{step0} match, median top-2 gap delta "
-        f"{median:.4f}; later-step ids {later_same}/{later} match"
-    )
+    return compare_proposals(graph, eager, min_match, max_gap_delta)
+
+
+def _compare_tensor_evidence(graph, eager, args):
+    import torch
+    from test.runtime.draft_graph_validation import compare_payloads
+
     problems = []
-    if step0_same < min_match * step0:
-        problems.append(f"step-0 ids match below {min_match:.0%}: {summary}")
-    if median > max_gap_delta:
-        problems.append(f"step-0 logit gaps disagree beyond rounding: {summary}")
-    return problems, summary
+    for number, (g, e) in enumerate(zip(graph, eager)):
+        first_g = g.get("first_step")
+        first_e = e.get("first_step")
+        if not isinstance(first_g, dict) or not isinstance(first_e, dict):
+            problems.append(f"call {number}: missing full tensor evidence")
+            continue
+        if first_g.get("path") != "graph":
+            continue
+        try:
+            left = torch.load(
+                first_g["artifact"], map_location="cpu", weights_only=True
+            )
+            right = torch.load(
+                first_e["artifact"], map_location="cpu", weights_only=True
+            )
+            errors = compare_payloads(
+                left,
+                right,
+                logit_atol=args.logit_atol,
+                logit_rtol=args.logit_rtol,
+                kv_atol=args.kv_atol,
+                kv_rtol=args.kv_rtol,
+            )
+            problems.extend(f"call {number}: {error}" for error in errors)
+        except (
+            OSError,
+            KeyError,
+            TypeError,
+            ValueError,
+            RuntimeError,
+            EOFError,
+        ) as error:
+            problems.append(f"call {number}: unreadable tensor evidence: {error}")
+    return problems
 
 
 def _accept_length(outputs: list[dict]) -> float:
@@ -260,20 +261,39 @@ def main() -> int:
     parser.add_argument(
         "--min-match",
         type=float,
-        default=0.95,
-        help="Least share of step-0 proposed ids that must match.",
+        default=1.0,
+        help="Compatibility option; must be 1.0. No arbitrary errors are allowed.",
     )
     parser.add_argument(
         "--max-gap-delta",
         type=float,
         default=0.05,
-        help="Largest median step-0 top-2 logit gap difference between runs.",
+        help="Largest per-row step-0 top-2 logit gap difference on actual replays.",
     )
+    parser.add_argument("--logit-atol", type=float, default=0.05)
+    parser.add_argument("--logit-rtol", type=float, default=0.01)
+    parser.add_argument("--kv-atol", type=float, default=0.004)
+    parser.add_argument("--kv-rtol", type=float, default=0.02)
     parser.add_argument("--run", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--model", help=argparse.SUPPRESS)
     parser.add_argument("--tokenizer", help=argparse.SUPPRESS)
     parser.add_argument("--out", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.min_match != 1.0:
+        parser.error("--min-match must be 1.0; aggregate error allowances are unsafe")
+    if args.steps < 1 or args.prompts < 1 or args.max_new_tokens < 1:
+        parser.error("steps, prompts and max-new-tokens must be positive")
+    if not all(
+        math.isfinite(value) and value >= 0
+        for value in (
+            args.max_gap_delta,
+            args.logit_atol,
+            args.logit_rtol,
+            args.kv_atol,
+            args.kv_rtol,
+        )
+    ):
+        parser.error("all tolerances must be finite and non-negative")
     if args.run:
         return _run(args)
     if not args.source:
@@ -309,6 +329,14 @@ def main() -> int:
     problems, summary = _compare_proposals(
         graph["trace"], eager["trace"], args.min_match, args.max_gap_delta
     )
+    problems.extend(_compare_tensor_evidence(graph["trace"], eager["trace"], args))
+    if len(graph["outputs"]) != len(eager["outputs"]) or any(
+        g["output_ids"] != e["output_ids"]
+        for g, e in zip(graph["outputs"], eager["outputs"])
+    ):
+        problems.append(
+            "generated token sequences differ; end-to-end parity is not established"
+        )
     if graph["counts"]["replays"] == 0:
         problems.append("the graph run never replayed the draft step-0 graph")
     if eager["counts"]["replays"] != 0 or eager["counts"]["eager_extends"] == 0:
