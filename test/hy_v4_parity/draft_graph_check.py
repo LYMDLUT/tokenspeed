@@ -329,6 +329,14 @@ def main() -> int:
     problems, summary = _compare_proposals(
         graph["trace"], eager["trace"], args.min_match, args.max_gap_delta
     )
+    from test.runtime.draft_graph_validation import validate_trace_counts
+
+    for name, run in (("graph", graph), ("eager", eager)):
+        problems.extend(f"{name}: {error}" for error in validate_trace_counts(run))
+        if len(run["outputs"]) != args.prompts:
+            problems.append(
+                f"{name}: output count does not match the submitted prompts"
+            )
     problems.extend(_compare_tensor_evidence(graph["trace"], eager["trace"], args))
     if len(graph["outputs"]) != len(eager["outputs"]) or any(
         g["output_ids"] != e["output_ids"]
