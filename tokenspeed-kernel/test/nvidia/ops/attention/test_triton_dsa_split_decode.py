@@ -320,3 +320,23 @@ def test_registration_is_gated_to_few_heads_with_a_sink():
     assert spec.traits["num_heads"] == frozenset({1, 2, 4, 8, 16})
     assert spec.traits["sinks"] == frozenset({True})
     assert spec.traits["has_sparse_kv_cache"] == frozenset({False})
+
+
+@pytest.mark.parametrize("with_sink", [False, True])
+def test_split_decode_preserves_nonfinite_live_partials(with_sink):
+    """A poisoned live key must not become the empty-partial +inf sentinel."""
+    q = torch.ones(3, 2, ROW, dtype=torch.bfloat16, device="cuda")
+    kv = torch.ones(64, 1, ROW, dtype=torch.bfloat16, device="cuda")
+    kv[0, 0, 0] = float("nan")
+    slots = torch.full((3, TOPK), -1, dtype=torch.int32, device="cuda")
+    slots[0, 0] = 0
+    slots[1, 0] = 1
+    lens = torch.tensor([1, 1, 0], dtype=torch.int32, device="cuda")
+    sink = torch.zeros(2, device="cuda") if with_sink else None
+    out, lse = _split_decode(q, kv, slots, lens, sink, return_lse=True)
+    assert torch.isnan(lse[0]).all()
+    assert torch.isnan(out[0]).any()
+    assert torch.isfinite(lse[1]).all() and torch.isfinite(out[1]).all()
+    assert torch.count_nonzero(out[1]) > 0
+    assert torch.isneginf(lse[2]).all()
+    assert torch.count_nonzero(out[2]) == 0
