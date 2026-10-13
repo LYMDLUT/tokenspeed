@@ -59,3 +59,22 @@ range, `-1` included; `deterministic_finalize` selects its unfused top-k
 reduction. Its permutation assumes distinct expert ids per token. The path
 calls CUTLASS the way the BF16 CUTLASS apply does, with PDL off and that
 apply's persistent workspace.
+
+
+### Input and package compatibility
+
+MXFP8 loading rejects E8M0 codes `0x00` (the nonzero scale `2**-127`,
+which the Marlin BF16 decoder cannot preserve) and `0xFF` (NaN) before
+repacking any parameter. Supported scale codes are `[1, 254]` on the
+Marlin, GEMV and dequantized CUTLASS branches. Apply normalizes activation
+and routing strides before selecting a branch; no value checks or host
+synchronization are added to the captured forward.
+
+The existing public `moe_plan` entry retains omission of
+`requires_deterministic_finalize` as the legacy `False` behavior. This is
+an explicit compatibility exception at the independently released package
+boundary, not an implicit model policy: every new runtime caller and
+`MoELayer` must state its requirement. The runtime negotiates older kernel
+planners only for `False`, and rejects a `True` requirement rather than
+dropping it. Release the paired kernel before raising the runtime's
+minimum package version; do not declare an unpublished version available.

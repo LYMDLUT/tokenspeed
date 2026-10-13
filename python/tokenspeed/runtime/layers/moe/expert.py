@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 
+import inspect
 import logging
 from collections.abc import Callable
 from dataclasses import replace
@@ -63,6 +64,29 @@ from tokenspeed.runtime.layers.quantization.utils import (
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = logging.getLogger(__name__)
+
+
+def _deterministic_finalize_kwargs(planner: Callable, required: bool) -> dict:
+    """Negotiate the optional kernel-package API without dropping a requirement.
+
+    An older kernel can still serve the legacy reduction when required=False.
+    A model requesting deterministic finalize must upgrade, before any weights
+    or communication buffers are allocated. Do not catch a TypeError from the
+    planner itself: that could conceal an unrelated implementation error.
+    """
+    parameters = inspect.signature(planner).parameters
+    if "requires_deterministic_finalize" in parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    ):
+        return {"requires_deterministic_finalize": required}
+    if required:
+        raise RuntimeError(
+            "The installed tokenspeed-kernel does not support deterministic "
+            "MoE finalize; install the kernel package from the same source "
+            "revision as this runtime (or a release including that capability)."
+        )
+    return {}
 
 
 class MoELayer(torch.nn.Module):
@@ -372,6 +396,9 @@ class MoELayer(torch.nn.Module):
             # it is the fold's group whatever the plan's solution.
             mapping = global_server_args_dict["mapping"]
             process_group = pg_manager.get_device_process_group(mapping.moe.ep_group)
+        finalize_kwargs = _deterministic_finalize_kwargs(
+            kernel_moe_plan, deterministic_finalize
+        )
         self.plan = kernel_moe_plan(
             self._quant_kind,
             input_dtype=input_dtype,
@@ -396,7 +423,7 @@ class MoELayer(torch.nn.Module):
                 deepep_low_latency_max_num_tokens_per_gpu
             ),
             persistent_max_num_tokens_per_gpu=persistent_max_num_tokens_per_gpu,
-            requires_deterministic_finalize=deterministic_finalize,
+            **finalize_kwargs,
             solution=moe_backend,
             # rl-bitwise promises one reduction order; fast-math epilogues
             # trade exactly that away.
