@@ -197,8 +197,9 @@ def _compare_proposals(graph, eager, min_match, max_gap_delta):
 
 
 def _compare_tensor_evidence(graph, eager, args):
-    import torch
     from test.runtime.draft_graph_validation import compare_payloads
+
+    import torch
 
     problems = []
     for number, (g, e) in enumerate(zip(graph, eager)):

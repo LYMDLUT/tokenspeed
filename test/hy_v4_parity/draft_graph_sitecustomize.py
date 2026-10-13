@@ -73,6 +73,7 @@ def _install() -> None:
     if not stats:
         return
     import torch
+
     from tokenspeed.runtime.execution import forward_step
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
     from tokenspeed.runtime.layers.attention.kv_cache.dsa import split_index_k_rows
