@@ -480,6 +480,106 @@ class ServingBenchmarkStreamTests(unittest.TestCase):
 
 
 class TruncatedCheckpointSafetyTests(unittest.TestCase):
+    def _small_source(self, root):
+        from safetensors.torch import save_file
+
+        source = root / "source"
+        source.mkdir()
+        (source / "config.json").write_text(
+            json.dumps({"num_hidden_layers": 1, "n_routed_experts": 8})
+        )
+        key = "model.embed_tokens.weight"
+        save_file({key: torch.ones(2, 2)}, str(source / "source.safetensors"))
+        (source / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {key: "source.safetensors"}})
+        )
+        return source
+
+    def test_nonempty_output_requires_explicit_overwrite(self):
+        from test.hy_v4_parity import hy_v4_fixtures as fixtures
+        from unittest import mock
+
+        for marker_kind in ("missing", "mismatched", "incomplete"):
+            with self.subTest(marker_kind=marker_kind):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    source = self._small_source(root)
+                    target = root / "output"
+                    target.mkdir()
+                    (target / "config.json").write_text("previous config")
+                    (target / "model.safetensors").write_bytes(b"previous weights")
+                    if marker_kind != "missing":
+                        (target / ".hy_v4_truncated.json").write_text(
+                            json.dumps(
+                                {
+                                    "repo_id": str(source),
+                                    "truncation": (
+                                        "1L/allE"
+                                        if marker_kind == "incomplete"
+                                        else "1L/4E"
+                                    ),
+                                }
+                            )
+                        )
+                    before = {p.name: p.read_bytes() for p in target.iterdir()}
+                    with mock.patch("safetensors.torch.save_file") as save:
+                        with self.assertRaisesRegex(FileExistsError, "overwrite"):
+                            fixtures.build_truncated_checkpoint(
+                                target, Truncation(1, None), repo_id=str(source)
+                            )
+                        save.assert_not_called()
+                    self.assertEqual(
+                        before, {p.name: p.read_bytes() for p in target.iterdir()}
+                    )
+
+    def test_empty_directory_export_reuse_and_explicit_rebuild(self):
+        from test.hy_v4_parity import hy_v4_fixtures as fixtures
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self._small_source(root)
+            target = root / "output"
+            target.mkdir()
+            selection = Truncation(1, None)
+            fixtures.build_truncated_checkpoint(target, selection, repo_id=str(source))
+            before = {p.name: p.read_bytes() for p in target.iterdir()}
+            with mock.patch("safetensors.torch.save_file") as save:
+                self.assertEqual(
+                    fixtures.build_truncated_checkpoint(
+                        target, selection, repo_id=str(source)
+                    ),
+                    target,
+                )
+                save.assert_not_called()
+            fixtures.build_truncated_checkpoint(
+                target, selection, repo_id=str(source), overwrite=True
+            )
+            self.assertEqual(before, {p.name: p.read_bytes() for p in target.iterdir()})
+
+    def test_output_symlink_cannot_modify_another_directory(self):
+        from test.hy_v4_parity import hy_v4_fixtures as fixtures
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self._small_source(root)
+            unrelated = root / "other_checkpoint"
+            unrelated.mkdir()
+            sentinel = unrelated / "config.json"
+            sentinel.write_text("must not change")
+            target = root / "output"
+            target.symlink_to(unrelated, target_is_directory=True)
+            for overwrite in (False, True):
+                with self.subTest(overwrite=overwrite):
+                    with self.assertRaisesRegex(ValueError, "symlink"):
+                        fixtures.build_truncated_checkpoint(
+                            target,
+                            Truncation(1, None),
+                            repo_id=str(source),
+                            overwrite=overwrite,
+                        )
+                    self.assertEqual(sentinel.read_text(), "must not change")
+
     def test_rebuild_cannot_remove_the_source_or_its_parent(self):
         from test.hy_v4_parity import hy_v4_fixtures as fixtures
         from unittest import mock

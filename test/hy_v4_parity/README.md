@@ -194,6 +194,10 @@ records with version 2 without rerunning the same workload. Existing published
 benchmark values are not recomputed or relabeled by this change.
 
 Checkpoint rebuilds refuse a destination equal to the source checkpoint or
-containing it, including a symlink alias. Configuration and selected source
+containing it, including a symlink alias. Symlink output directories are also
+rejected. Without `--rebuild`, only a matching export with its checkpoint files
+present is reused; a nonempty destination with a missing, different or
+incomplete marker is rejected instead of silently overwriting files. An empty
+directory may be used for a first export. Configuration and selected source
 tensors are validated before an existing output is removed. `--rebuild`
 replaces an export, never its source checkpoint; use a separate output path.

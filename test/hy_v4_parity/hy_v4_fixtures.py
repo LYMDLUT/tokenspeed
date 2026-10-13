@@ -189,8 +189,9 @@ def build_truncated_checkpoint(
         output_dir: Destination directory; created if missing.
         truncation: Which layers and experts to keep.
         repo_id: Source checkpoint, a hub id or a local snapshot directory.
-        overwrite: Replace an existing complete checkpoint. Without it, an
-            existing checkpoint is reused, so repeated runs are cheap.
+        overwrite: Replace an existing output directory. Without it, only a
+            complete export matching this request is reused; a nonempty
+            destination that cannot be reused is rejected.
         log: Optional ``callable(str)`` used to report progress.
 
     Returns:
@@ -205,17 +206,36 @@ def build_truncated_checkpoint(
     source_path, target_path = source.resolve(), target.resolve()
     if target_path == source_path or target_path in source_path.parents:
         raise ValueError("truncated output must not contain the source checkpoint")
+    if target.is_symlink():
+        raise ValueError("truncated output must not be a symlink")
+    if target.exists() and not target.is_dir():
+        raise FileExistsError("truncated output must be a directory")
     released_config = load_released_config(repo_id)
     rewritten_config = truncated_config(released_config, truncation)
     marker = target / ".hy_v4_truncated.json"
-    if marker.exists() and not overwrite:
-        existing = json.loads(marker.read_text())
-        if existing == {
-            "repo_id": repo_id,
-            "truncation": truncation.describe(),
-        }:
-            report(f"reusing truncated checkpoint at {target}")
-            return target
+    if not overwrite and target.exists():
+        if marker.is_file():
+            existing = json.loads(marker.read_text())
+            complete = all(
+                (target / name).is_file()
+                for name in (
+                    "config.json",
+                    "model.safetensors.index.json",
+                    "model.safetensors",
+                )
+            )
+            if complete and existing == {
+                "repo_id": repo_id,
+                "truncation": truncation.describe(),
+            }:
+                report(f"reusing truncated checkpoint at {target}")
+                return target
+        # A mismatched or incomplete marker is not permission to overwrite.
+        if any(target.iterdir()):
+            raise FileExistsError(
+                f"{target} is not a reusable export; choose a new output directory "
+                "or explicitly request overwrite=True (--rebuild)"
+            )
     index_path = source / "model.safetensors.index.json"
     if not index_path.exists():
         index_path = Path(hf_hub_download(repo_id, "model.safetensors.index.json"))
