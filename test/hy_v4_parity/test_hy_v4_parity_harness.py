@@ -336,5 +336,67 @@ class TruncationTests(unittest.TestCase):
             self.assertEqual(updated[key], released[key])
 
 
+class DraftGraphTensorEvidenceTests(unittest.TestCase):
+    """Exercise persisted evidence, not only the in-memory tensor comparator."""
+
+    def _compare(self, mutation=None):
+        from test.hy_v4_parity.draft_graph_check import _compare_tensor_evidence
+        from types import SimpleNamespace
+
+        def payload():
+            return {
+                "inputs": {
+                    name: torch.ones(2, 3)
+                    for name in (
+                        "input_ids",
+                        "positions",
+                        "hidden",
+                        "gather_ids",
+                        "frontier",
+                    )
+                },
+                "outputs": {
+                    name: torch.ones(2, 3)
+                    for name in ("logits", "latent_kv", "index_k")
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as directory:
+            graph_file = Path(directory) / "graph.pt"
+            eager_file = Path(directory) / "eager.pt"
+            graph_payload = payload()
+            if mutation == "kv":
+                graph_payload["outputs"]["latent_kv"][1, 2] = 10.0
+            elif mutation == "inputs":
+                graph_payload["inputs"]["frontier"][1, 2] = 9.0
+            elif mutation == "missing_tensor":
+                del graph_payload["outputs"]["index_k"]
+            if mutation != "missing_file":
+                torch.save(graph_payload, graph_file)
+            torch.save(payload(), eager_file)
+            graph = [{"first_step": {"path": "graph", "artifact": str(graph_file)}}]
+            eager = [{"first_step": {"path": "eager", "artifact": str(eager_file)}}]
+            tolerances = SimpleNamespace(
+                logit_atol=0.05, logit_rtol=0.01, kv_atol=0.004, kv_rtol=0.02
+            )
+            return _compare_tensor_evidence(graph, eager, tolerances)
+
+    def test_identical_saved_evidence_passes(self):
+        self.assertEqual(self._compare(), [])
+
+    def test_missing_artifact_fails(self):
+        errors = self._compare("missing_file")
+        self.assertTrue(any("unreadable tensor evidence" in error for error in errors))
+
+    def test_saved_kv_corruption_fails(self):
+        errors = self._compare("kv")
+        self.assertTrue(any("latent_kv" in error for error in errors))
+
+    def test_saved_inputs_and_tensor_coverage_are_checked(self):
+        for mutation in ("inputs", "missing_tensor"):
+            with self.subTest(mutation=mutation):
+                self.assertTrue(self._compare(mutation))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -165,3 +165,17 @@ same-input reproduction; a failed comparison is not silently reclassified as
 rounding. The oracle and its negative tests ship with the graph change under
 `test/runtime/draft_graph_validation.py` and
 `test/runtime/test_draft_graph_validation.py`.
+
+The CPU harness tests also exercise the saved draft-graph evidence reader:
+identical `.pt` payloads pass, while a missing file, corrupted latent KV,
+missing tensor or mismatched input frontier fails. Run them together with the
+oracle tests, without a checkpoint or GPU:
+
+```bash
+python -m pytest -q test/runtime/test_draft_graph_validation.py \
+  test/hy_v4_parity/test_hy_v4_parity_harness.py
+```
+
+These tests validate the checker and artifact reader, not the GPU recorder
+or the correctness of captured inference. The latter still needs a real
+checkpoint run at the tested commit.
