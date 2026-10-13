@@ -232,3 +232,8 @@ A strong sink may underflow every selected key probability. Such a row is
 still nonempty: its LSE includes the sink. Empty-row detection uses the
 selected slots, not the accumulated floating-point key mass, for both dense
 and packed Triton caches.
+
+The split Triton decode distinguishes zero softmax mass from non-finite mass.
+Only a truly empty partial receives the `+inf` LSE sentinel. A live partial
+containing NaN keeps its NaN LSE and propagates through the merge, rather than
+being silently discarded as if the row had selected no keys.

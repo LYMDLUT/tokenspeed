@@ -690,7 +690,9 @@ def _dsa_dense_kv_split_kernel(
         acc = tl.dot(probs.to(k_nope.dtype), k_nope, acc * rescale[:, None])
         max_score = new_max
 
-    attended = denom > 0.0
+    # NaN mass is a corrupt live partial, not the +inf empty sentinel.
+    # Keep it in the merge so invalid data cannot become a finite result.
+    attended = denom != 0.0
     result = acc / tl.where(attended, denom, 1.0)[:, None]
     out_rows = partial_out + (part * num_heads + heads[:, None]) * kv_lora_rank
     tl.store(
