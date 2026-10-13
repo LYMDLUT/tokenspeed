@@ -164,3 +164,23 @@ def compare_payloads(
             except AssertionError:
                 problems.append(f"{label}: full tensor exceeds tolerance")
     return problems
+
+
+def validate_trace_counts(run: dict) -> list[str]:
+    """Require a trace for every counted served step; paired truncation fails."""
+    try:
+        calls = run["trace"]
+        counts = run["counts"]
+        paths = [call["first_step"]["path"] for call in calls]
+        replayed = paths.count("graph")
+        eager_extends = sum(
+            path == "eager" and call["num_extends"] > 0
+            for path, call in zip(paths, calls, strict=True)
+        )
+        if any(path not in ("graph", "eager") for path in paths):
+            return ["trace contains an unknown execution path"]
+        if replayed != counts["replays"] or eager_extends != counts["eager_extends"]:
+            return ["served step counts do not match the trace; evidence is incomplete"]
+    except (KeyError, TypeError, ValueError) as error:
+        return [f"missing or invalid trace-count evidence: {error}"]
+    return []
