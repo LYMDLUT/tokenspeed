@@ -276,6 +276,53 @@ def torch_ihc_post(
 
 @register_kernel(
     "residual",
+    "ihc_fused_hc",
+    name="torch_ihc_fused_hc",
+    solution="torch",
+    signatures=frozenset(
+        format_signature(
+            x_prev=dense_tensor_format(torch.bfloat16),
+            residual_prev=dense_tensor_format(residual_dtype),
+            post_prev=dense_tensor_format(torch.float32),
+            fn=dense_tensor_format(torch.float32),
+            hc_scale=dense_tensor_format(torch.float32),
+            hc_base=dense_tensor_format(torch.float32),
+        )
+        for residual_dtype in _IHC_RESIDUAL_DTYPES
+    ),
+    priority=Priority.PORTABLE,
+)
+def torch_ihc_fused_hc(
+    x_prev: torch.Tensor,
+    residual_prev: torch.Tensor,
+    post_prev: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    magnitude: float,
+    rms_eps: float,
+    hc_eps: float,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the portable previous post boundary, then the next pre boundary."""
+    residual = torch_ihc_post(x_prev, residual_prev, post_prev)
+    layer_input, post = torch_ihc_pre(
+        residual,
+        fn,
+        hc_scale,
+        hc_base,
+        magnitude,
+        rms_eps,
+        hc_eps,
+        norm_weight,
+        norm_eps,
+    )
+    return residual, layer_input, post
+
+
+@register_kernel(
+    "residual",
     "ihc_head",
     name="torch_ihc_head",
     solution="torch",

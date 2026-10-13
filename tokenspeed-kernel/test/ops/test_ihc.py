@@ -27,7 +27,7 @@ import re
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.residual import ihc_head, ihc_post, ihc_pre
+from tokenspeed_kernel.ops.residual import ihc_fused_hc, ihc_head, ihc_post, ihc_pre
 
 requires_gpu = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="a CUDA/ROCm device is required"
@@ -206,6 +206,39 @@ def test_ihc_post_keeps_fp32_channels(solution: str) -> None:
 
 @requires_gpu
 @pytest.mark.parametrize("solution", SOLUTIONS)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+@pytest.mark.parametrize(
+    "hc_mult,hidden_size,rows",
+    [
+        *SHAPES,
+        # HY V4's projection width: the most K splits at decode, the longest
+        # K walk at prefill.
+        pytest.param(4, 6144, 1, id="production_decode"),
+        pytest.param(4, 6144, 4096, id="production_prefill"),
+    ],
+)
+def test_ihc_fused_hc_matches_post_then_pre(
+    solution: str, dtype: torch.dtype, hc_mult: int, hidden_size: int, rows: int
+) -> None:
+    residual = (_randn(rows, hc_mult, hidden_size, seed=rows + 2) * 3).to(dtype)
+    block_output = _randn(rows, hidden_size, seed=rows + 3).bfloat16()
+    gates = _randn(rows, hc_mult, seed=rows + 4).abs()
+    fn, hc_scale, hc_base = _params(hc_mult, hidden_size, 2 * hc_mult)
+    args = (fn, hc_scale, hc_base, MAGNITUDE, RMS_EPS, HC_EPS)
+    norm = dict(
+        norm_weight=_randn(hidden_size, seed=3), norm_eps=NORM_EPS, solution=solution
+    )
+
+    updated = ihc_post(block_output, residual, gates, solution=solution)
+    expected = (updated, *ihc_pre(updated, *args, **norm))
+    actual = ihc_fused_hc(block_output, residual, gates, *args, **norm)
+
+    for name, a, e in zip(("channels", "input", "post gates"), actual, expected):
+        assert a.dtype == e.dtype and torch.equal(a, e), name
+
+
+@requires_gpu
+@pytest.mark.parametrize("solution", SOLUTIONS)
 @pytest.mark.parametrize(
     "hc_mult,hidden_size",
     [pytest.param(4, 1536, id="hy_v4"), pytest.param(3, 512, id="odd_channels")],
@@ -271,6 +304,18 @@ def test_ihc_outputs_keep_leading_dimensions(solution: str) -> None:
         **norm,
     )
     updated = ihc_post(layer_input, residual, gates, solution=solution)
+    fused = ihc_fused_hc(
+        layer_input,
+        residual,
+        gates,
+        fn,
+        hc_scale,
+        hc_base,
+        MAGNITUDE,
+        RMS_EPS,
+        HC_EPS,
+        **norm,
+    )
     merged = ihc_head(
         residual,
         fn[:hc_mult],
@@ -286,6 +331,7 @@ def test_ihc_outputs_keep_leading_dimensions(solution: str) -> None:
     assert torch.equal(layer_input.flatten(0, 1), flat_input)
     assert torch.equal(gates.flatten(0, 1), flat_gates)
     assert updated.shape == residual.shape
+    assert [t.shape for t in fused] == [residual.shape, layer_input.shape, gates.shape]
     assert merged.shape == (2, 3, hidden_size)
 
 
@@ -366,6 +412,41 @@ def test_ihc_post_rejects_mismatched_operands(case: str) -> None:
     operands = {**_post_operands(), **changes}
     with pytest.raises(ValueError, match=re.escape(message)):
         ihc_post(operands["block_output"], operands["residual"], operands["gates"])
+
+
+_FUSED_MISMATCHES = {
+    "one_channel": ({"residual": torch.zeros(3, 1, 32)}, "hc_mult > 1"),
+    "short_x_prev": (
+        {"block_output": torch.zeros(2, 8, dtype=torch.bfloat16)},
+        "x_prev must have shape (3, 8)",
+    ),
+    "flat_post_prev": ({"gates": torch.zeros(12)}, "post_prev must have shape (3, 4)"),
+    "head_projection": ({"fn": torch.zeros(4, 32)}, "fn must have shape (8, 32)"),
+    "short_norm_weight": (
+        {"norm_weight": torch.ones(4)},
+        "norm_weight must have shape (8,)",
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_FUSED_MISMATCHES))
+def test_ihc_fused_hc_rejects_mismatched_operands(case: str) -> None:
+    changes, message = _FUSED_MISMATCHES[case]
+    operands = {**_pre_operands(), **_post_operands(), **changes}
+    with pytest.raises(ValueError, match=re.escape(message)):
+        ihc_fused_hc(
+            operands["block_output"],
+            operands["residual"],
+            operands["gates"],
+            operands["fn"],
+            operands["hc_scale"],
+            operands["hc_base"],
+            MAGNITUDE,
+            RMS_EPS,
+            HC_EPS,
+            norm_weight=operands["norm_weight"],
+            norm_eps=NORM_EPS,
+        )
 
 
 def _head_operands() -> dict[str, torch.Tensor]:

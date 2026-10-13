@@ -819,8 +819,9 @@ def mhc_fused_hc(
 # iHC keeps ``hc_mult`` parallel residual channels but has no combination
 # matrix: the pre boundary emits one pre gate and one post gate per channel, the
 # post boundary scatters the sub-block output across every channel, and the head
-# merges the channels. All three boundaries take FP32 parameters and evaluate
-# their gates in FP32, so they are dispatched by role rather than by dtype.
+# merges the channels; ``ihc_fused_hc`` runs a post boundary and the following
+# pre boundary as one. All boundaries take FP32 parameters and evaluate their
+# gates in FP32, so they are dispatched by role rather than by dtype.
 # Every boundary checks its operands' shapes and devices before dispatch and
 # raises ValueError. The checks read tensor metadata only, so they never
 # synchronize the device and are safe under CUDA graph capture.
@@ -1031,6 +1032,117 @@ def ihc_post(
         return kernel(block_output, residual, gates)
 
 
+def ihc_fused_hc(
+    x_prev: _torch.Tensor,
+    residual_prev: _torch.Tensor,
+    post_prev: _torch.Tensor,
+    fn: _torch.Tensor,
+    hc_scale: _torch.Tensor,
+    hc_base: _torch.Tensor,
+    magnitude: float,
+    rms_eps: float,
+    hc_eps: float,
+    *,
+    norm_weight: _torch.Tensor | None,
+    norm_eps: float | None,
+    override: str | None = None,
+    solution: str | None = None,
+) -> tuple[_torch.Tensor, _torch.Tensor, _torch.Tensor]:
+    """Compose the previous sub-block's iHC post boundary and the next pre boundary.
+
+    Returns what :func:`ihc_post` followed by :func:`ihc_pre` on its result
+    returns. All tensors must be on the residual's device.
+
+    Args:
+        x_prev: BF16 previous sub-block output shaped ``[..., hidden_size]``.
+        residual_prev: BF16 or FP32 residual channels before that sub-block's
+            post boundary, shaped ``[..., hc_mult, hidden_size]``.
+        post_prev: FP32 post gates of that sub-block shaped ``[..., hc_mult]``.
+        fn: Contiguous FP32 pre/post mixing projection of the next sub-block
+            shaped ``[2 * hc_mult, hc_mult * hidden_size]``.
+        hc_scale: Contiguous FP32 pre-mix and post-mix scales shaped ``[2]``.
+        hc_base: Contiguous FP32 pre/post mixing biases shaped
+            ``[2 * hc_mult]``.
+        magnitude: Scale applied to the post-gate sigmoid branch.
+        rms_eps: Epsilon of the RMS factor applied to the projection output.
+        hc_eps: Epsilon added to both sigmoid gates.
+        norm_weight: Optional contiguous RMSNorm weight shaped
+            ``[hidden_size]``, fused into the reduce pass.
+        norm_eps: RMSNorm epsilon; required with ``norm_weight``.
+        override: Optional exact registered kernel name.
+        solution: Optional registered solution name.
+
+    Returns:
+        The updated residual channels (shape and dtype of ``residual_prev``),
+        the BF16 input of the next sub-block ``[..., hidden_size]``, and its
+        FP32 post gates ``[..., hc_mult]``.
+    """
+    if (norm_weight is None) != (norm_eps is None):
+        raise ValueError("norm_weight and norm_eps must be provided together")
+    _check_ihc_residual(residual_prev)
+    _check_ihc_operand(
+        residual_prev,
+        x_prev,
+        "x_prev",
+        (*residual_prev.shape[:-2], residual_prev.shape[-1]),
+    )
+    _check_ihc_operand(
+        residual_prev, post_prev, "post_prev", tuple(residual_prev.shape[:-1])
+    )
+    _check_ihc_projection(
+        residual_prev,
+        fn,
+        hc_scale,
+        hc_base,
+        gate_count=2 * residual_prev.shape[-2],
+        scale_count=2,
+    )
+    if norm_weight is not None:
+        _check_ihc_parameter(
+            residual_prev, norm_weight, "norm_weight", (residual_prev.shape[-1],)
+        )
+    traits = _ihc_traits(residual_prev)
+    signature = format_signature(
+        x_prev=dense_tensor_format(x_prev.dtype),
+        residual_prev=dense_tensor_format(residual_prev.dtype),
+        post_prev=dense_tensor_format(post_prev.dtype),
+        fn=dense_tensor_format(fn.dtype),
+        hc_scale=dense_tensor_format(hc_scale.dtype),
+        hc_base=dense_tensor_format(hc_base.dtype),
+    )
+    kernel = select_kernel(
+        "residual",
+        "ihc_fused_hc",
+        signature,
+        traits=traits,
+        override=override,
+        solution=solution,
+    )
+    ShapeCapture.get().record(
+        "residual", "ihc_fused_hc", kernel.name, residual_prev.dtype, traits
+    )
+    with kernel_scope(
+        "residual",
+        "ihc_fused_hc",
+        residual_prev.dtype,
+        kernel_name=kernel.name,
+        **traits,
+    ):
+        return kernel(
+            x_prev,
+            residual_prev,
+            post_prev,
+            fn,
+            hc_scale,
+            hc_base,
+            float(magnitude),
+            float(rms_eps),
+            float(hc_eps),
+            norm_weight,
+            norm_eps,
+        )
+
+
 def ihc_head(
     residual: _torch.Tensor,
     fn: _torch.Tensor,
@@ -1110,6 +1222,7 @@ __all__ = [
     "attn_res_fwd_available",
     "gated_residual_combine",
     "gated_residual_mix",
+    "ihc_fused_hc",
     "ihc_head",
     "ihc_post",
     "ihc_pre",
