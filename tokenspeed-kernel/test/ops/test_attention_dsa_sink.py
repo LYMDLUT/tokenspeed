@@ -30,6 +30,7 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.ops.attention.dsa import dsa_decode, dsa_prefill
+from tokenspeed_kernel.ops.attention.dsa import triton as dsa_triton
 
 HEADS = 64
 KV_LORA_RANK = 512
@@ -199,3 +200,64 @@ def test_strong_sink_does_not_turn_live_rows_into_empty_rows(
         )
     assert torch.isneginf(lse[1:3]).all()
     assert torch.count_nonzero(out[1:3]) == 0
+
+
+def _portable_dsa_output_call(q, out, packed):
+    return dsa_triton._run_dsa(
+        q=q,
+        kv_cache=None if packed else torch.zeros(64, 128, dtype=torch.bfloat16),
+        packed_kv_cache=torch.zeros(64, 132, dtype=torch.uint8) if packed else None,
+        topk_slots=torch.zeros(2, 512, dtype=torch.int32),
+        topk_lens=torch.ones(2, dtype=torch.int32),
+        kv_lora_rank=128,
+        qk_rope_head_dim=0,
+        softmax_scale=0.1,
+        k_scale=1.0,
+        sink=None,
+        out=out,
+        return_lse=True,
+    )
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("case", ["strided", "dtype", "count", "device"])
+def test_portable_dsa_rejects_invalid_output_before_launch(monkeypatch, packed, case):
+    """The host wrapper rejects incompatible storage without launching a kernel."""
+    q = torch.ones(2, 2, 128, dtype=torch.bfloat16)
+    if case == "strided":
+        out = torch.full((4, 128), -3.0, dtype=torch.bfloat16).t()
+    elif case == "dtype":
+        out = torch.empty(2, 256, dtype=torch.float32)
+    elif case == "count":
+        out = torch.empty(511, dtype=torch.bfloat16)
+    else:
+        out = torch.empty(512, dtype=torch.bfloat16, device="meta")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid output reached a kernel launcher")
+
+    monkeypatch.setattr(dsa_triton, "_run_dense_kv", forbidden)
+    monkeypatch.setattr(dsa_triton, "_run_packed_kv", forbidden)
+    with pytest.raises(ValueError, match="output buffer"):
+        _portable_dsa_output_call(q, out, packed)
+
+
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("q_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_portable_dsa_writes_the_callers_output_storage(monkeypatch, packed, q_dtype):
+    q = torch.ones(2, 2, 128).to(q_dtype)
+    out = torch.full((2, 256), -3.0, dtype=torch.bfloat16)
+    expected = torch.arange(512, dtype=torch.float32).bfloat16().view(2, 2, 128)
+    expected_lse = torch.zeros(2, 2)
+    calls = []
+
+    def compute(*args, **kwargs):
+        calls.append(1)
+        return expected, expected_lse
+
+    monkeypatch.setattr(dsa_triton, "_run_dense_kv", compute)
+    monkeypatch.setattr(dsa_triton, "_run_packed_kv", compute)
+    result, lse = _portable_dsa_output_call(q, out, packed)
+    assert calls == [1]
+    assert result is out and lse is expected_lse
+    torch.testing.assert_close(out.view_as(expected), expected, atol=0, rtol=0)
