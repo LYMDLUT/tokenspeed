@@ -157,7 +157,8 @@ def _marlin_mxfp8_to_bf16_kernel(
     w = tl.reshape(w, (64, GROUPS, 32))
 
     # Scale byte p of a 64-wide block holds n = (p >> 2 & 1) * 32 + (p & 1) * 16
-    # + (p >> 1 & 1) * 8 + (p >> 3); E8M0 e -> 2^(e - 127), 0 -> 0 as in Marlin.
+    # + (p >> 1 & 1) * 8 + (p >> 3); E8M0 e -> 2^(e - 127).
+    # Loading rejects 0x00 and 0xFF before any parameter is repacked.
     groups = k_block * GROUPS + tl.arange(0, GROUPS)
     s_offs = (
         expert * (K // 32 * N)
@@ -622,6 +623,20 @@ def _block_size_m(routes_per_expert: float) -> int:
     return block
 
 
+def _validate_mxfp8_scales(name: str, scale: torch.Tensor) -> None:
+    """Reject encodings not faithfully supported by every execution branch.
+
+    E8M0 0x00 is 2**-127, not zero. Marlin's BF16 scale decoder flushes it;
+    0xFF denotes NaN. Check once while loading, before repacking any parameter,
+    rather than silently changing the scale or synchronizing captured applies.
+    """
+    if bool(((scale == 0) | (scale == 255)).any()):
+        raise ValueError(
+            f"Marlin MXFP8 {name} contains unsupported E8M0 scale encoding "
+            "0x00 (2**-127) or 0xFF (NaN); scales must be in [1, 254]."
+        )
+
+
 def marlin_mxfp8_moe_weights(plan: dict, w: torch.nn.Module) -> None:
     """Repack loader-format MXFP8 experts into the Marlin layout, once.
 
@@ -675,6 +690,9 @@ def marlin_mxfp8_moe_weights(plan: dict, w: torch.nn.Module) -> None:
             f"MXFP8 scales {tuple(w13_scale.shape)}/{tuple(w2_scale.shape)} do "
             f"not match the 1x{MXFP8_BLOCK} blocks of the weights {expected_scales}"
         )
+
+    _validate_mxfp8_scales("w13_weight_scale_inv", w13_scale)
+    _validate_mxfp8_scales("w2_weight_scale_inv", w2_scale)
 
     device = w13.device
     perm = torch.empty(0, dtype=torch.int, device=device)
@@ -830,7 +848,21 @@ def marlin_mxfp8_precomputed_moe_apply(
     ispp = state.ispp
     num_local_experts = int(w.w13_weight.shape[0])
 
-    topk_ids = topk_ids.to(torch.int32)
+    if (
+        x.ndim != 2
+        or x.shape[1] != hidden
+        or topk_ids.ndim != 2
+        or topk_ids.shape[0] != x.shape[0]
+        or topk_weights.shape != topk_ids.shape
+    ):
+        raise ValueError("MXFP8 activations and routing shapes disagree")
+    if any(t.device != x.device for t in (topk_ids, topk_weights, w.w13_weight)):
+        raise ValueError("MXFP8 activations, routing and weights must share a device")
+    # All three implementations read dense rows. A dtype conversion alone
+    # preserves strided FP32 route-weight views (including a flattened ::2).
+    x = x.contiguous()
+    topk_ids = topk_ids.to(torch.int32).contiguous()
+    topk_weights = topk_weights.to(torch.float32).contiguous()
     num_tokens, top_k = topk_ids.shape
     # Size blocks by the routes each expert receives across all ranks: in EP
     # only 1/ep_size of the routes land on this rank's experts.
@@ -840,9 +872,7 @@ def marlin_mxfp8_precomputed_moe_apply(
 
     # Ids stay global: the align kernel and the two Triton kernels below test
     # them against this rank's range instead of a separately remapped copy.
-    topk_ids = topk_ids.contiguous()
     expert_start = state.expert_start
-    topk_weights = topk_weights.to(torch.float32)
     if _gemv_is_faster(num_tokens * top_k, w.ep_size):
         return _gemv_apply(x, w, state, topk_weights, topk_ids)
 
