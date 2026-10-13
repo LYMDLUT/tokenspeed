@@ -103,13 +103,42 @@ or mixed step:
 python -m test.hy_v4_parity.draft_graph_check --source /path/to/hy_v4
 ```
 
-Step 0 must propose the same ids, with top-2 logit gaps that agree to about
-BF16 rounding (`--min-match`, `--max-gap-delta`); the later steps, verification
-and the outputs are only reported. `--enable-mixed-batch` also lets prompt
-chunks share batches with decodes. Every engine process loads
-`draft_graph_sitecustomize.py` as its `sitecustomize`, which turns the draft
-graph on or off (`HY_V4_DRAFT_GRAPH`) and records its replays and the draft's
-proposals.
+Only actual graph replays count as graph evidence. `--enable-mixed-batch`
+also lets prompt chunks share batches with decodes; those mixed rounds keep
+the eager step 0 in both runs and cannot dilute the replay verdict. Every
+engine process loads `draft_graph_sitecustomize.py` as its `sitecustomize`,
+which toggles the draft graph (`HY_V4_DRAFT_GRAPH`) and records the actual
+step-0 path, an input fingerprint, proposals and full tensor snapshots.
+
+The checker requires identical live inputs/frontiers and checks every replay
+proposal and per-row top-2 gap (`--max-gap-delta`), full logits, written latent
+KV and dequantized index-K with explicit numerical tolerances. Missing or
+non-finite tensors, incomplete traces and different input sequences fail.
+Generated token sequences must also match. Later draft ids and verification
+counts remain diagnostic; matching those counts alone cannot establish parity.
+
+`--min-match` is retained only for command-line compatibility and must be `1.0`.
+The checker grants neither an arbitrary percentage of errors nor a median
+that can hide a bad replay. Near ties or divergent schedules need a same-input
+reproduction; a failed comparison is not silently reclassified as rounding.
+Snapshots remain next to the trace for diagnosis; they may be large, and the
+GPU synchronization makes this unsuitable for timing.
+
+The oracle and its negative tests ship with the graph change under
+`test/runtime/draft_graph_validation.py` and
+`test/runtime/test_draft_graph_validation.py`. The CPU harness tests also
+exercise the saved evidence reader: identical `.pt` payloads pass, while a
+missing file, corrupted latent KV, missing tensor or mismatched input frontier
+fails. Run them without a checkpoint or GPU:
+
+```bash
+python -m pytest -q test/runtime/test_draft_graph_validation.py \
+  test/hy_v4_parity/test_hy_v4_parity_harness.py
+```
+
+These tests validate the checker and artifact reader, not the GPU recorder
+or captured inference. The latter still needs a real-checkpoint run at the
+tested commit.
 
 ## Suggested order
 
@@ -143,39 +172,7 @@ Notes on the tolerances, since they are deliberate:
 
 The FlashMLA and Triton sink paths over a dense BF16 KV cache are covered by
 `tokenspeed-kernel/test/ops/test_attention_dsa_sink.py`, which goes through the
-public `dsa_decode` / `dsa_prefill` dispatchers. Neither check covers the FP8
-packed-KV kernel's sink branch or model-level numerics.
-
-
-### Strict draft step-0 graph evidence
-
-`draft_graph_check.py` now counts only actual graph replays. Eager/eager mixed
-rounds are controls, never evidence in a replay match-rate denominator. The
-checker requires identical live inputs/frontiers and checks every replay row,
-full logits, written latent KV and dequantized index-K, with explicit numerical
-tolerances. Missing or non-finite tensors, incomplete traces and different
-input sequences fail. Generated token sequences must also match. Tensor
-snapshots remain next to the trace for diagnosis; they may be large and the
-GPU synchronization makes this unsuitable for timing.
-
-`--min-match` is retained only for command-line compatibility and must be `1.0`.
-The checker no longer grants an arbitrary percentage of errors or uses a
-median that can hide a bad replay. Near ties or divergent schedules need a
-same-input reproduction; a failed comparison is not silently reclassified as
-rounding. The oracle and its negative tests ship with the graph change under
-`test/runtime/draft_graph_validation.py` and
-`test/runtime/test_draft_graph_validation.py`.
-
-The CPU harness tests also exercise the saved draft-graph evidence reader:
-identical `.pt` payloads pass, while a missing file, corrupted latent KV,
-missing tensor or mismatched input frontier fails. Run them together with the
-oracle tests, without a checkpoint or GPU:
-
-```bash
-python -m pytest -q test/runtime/test_draft_graph_validation.py \
-  test/hy_v4_parity/test_hy_v4_parity_harness.py
-```
-
-These tests validate the checker and artifact reader, not the GPU recorder
-or the correctness of captured inference. The latter still needs a real
-checkpoint run at the tested commit.
+public `dsa_decode` / `dsa_prefill` dispatchers. Its strong-sink regressions also
+cover the portable Triton FP8 packed-KV path, true empty rows and invalid
+slots, in both prefill and decode. These are kernel checks, not model-level
+numerical validation.
