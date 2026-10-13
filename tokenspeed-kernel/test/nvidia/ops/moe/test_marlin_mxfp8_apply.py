@@ -570,3 +570,68 @@ def test_dequant_half_swap_wraps_each_row(size_n, swap_halves):
     torch.testing.assert_close(out, expected, rtol=0.0, atol=0.0)
     assert torch.all(storage[:guard] == -17)
     assert torch.all(storage[-guard:] == -17)
+
+
+@pytest.mark.parametrize(
+    "case,exception,message",
+    [
+        ("weight_dtype", TypeError, "qweight must be int32"),
+        ("scale_dtype", TypeError, "scales must be float8_e8m0fnu"),
+        ("output_dtype", TypeError, "out must have bf16"),
+        ("weight_rank", ValueError, "three-dimensional"),
+        ("weight_stride", ValueError, "contiguous"),
+        ("scale_stride", ValueError, "contiguous"),
+        ("output_stride", ValueError, "contiguous"),
+        ("weight_shape", ValueError, "Marlin weights"),
+        ("scale_shape", ValueError, "Marlin scales"),
+        ("alignment", ValueError, "dequant needs"),
+        ("empty", ValueError, "must be positive"),
+        ("weight_device", ValueError, "share a device"),
+        ("scale_device", ValueError, "share a device"),
+        ("cpu", ValueError, "requires CUDA"),
+    ],
+)
+def test_dequant_rejects_invalid_storage_before_launch(
+    monkeypatch, case, exception, message
+):
+    """Metadata-only rejection never reads storage or launches a GPU kernel."""
+    qweight = torch.empty(1, 8, 512, dtype=torch.int32)
+    scales = torch.empty(1, 4, 128, dtype=torch.float8_e8m0fnu)
+    out = torch.empty(1, 128, 128, dtype=torch.bfloat16)
+    if case == "weight_dtype":
+        # The right logical shape with one quarter of the required bytes.
+        qweight = torch.empty(qweight.shape, dtype=torch.uint8)
+    elif case == "scale_dtype":
+        scales = torch.empty(scales.shape, dtype=torch.float32)
+    elif case == "output_dtype":
+        out = out.float()
+    elif case == "weight_rank":
+        qweight = qweight.flatten()
+    elif case == "weight_stride":
+        qweight = torch.empty(1, 16, 512, dtype=qweight.dtype)[:, ::2, :]
+    elif case == "scale_stride":
+        scales = torch.empty(1, 8, 128, dtype=scales.dtype)[:, ::2, :]
+    elif case == "output_stride":
+        out = torch.empty(1, 256, 128, dtype=out.dtype)[:, ::2, :]
+    elif case == "weight_shape":
+        qweight = qweight[:, :7, :]
+    elif case == "scale_shape":
+        scales = scales[:, :3, :]
+    elif case == "alignment":
+        qweight = torch.empty(1, 8, 384, dtype=qweight.dtype)
+        scales = torch.empty(1, 4, 96, dtype=scales.dtype)
+        out = torch.empty(1, 96, 128, dtype=out.dtype)
+    elif case == "empty":
+        qweight, scales, out = qweight[:0], scales[:0], out[:0]
+    elif case == "weight_device":
+        qweight = torch.empty(qweight.shape, dtype=qweight.dtype, device="meta")
+    elif case == "scale_device":
+        scales = torch.empty(scales.shape, dtype=scales.dtype, device="meta")
+
+    class ForbiddenLaunch:
+        def __getitem__(self, grid):
+            pytest.fail(f"invalid {case} input reached kernel launch: {grid}")
+
+    monkeypatch.setattr(mxfp8, "_marlin_mxfp8_to_bf16_kernel", ForbiddenLaunch())
+    with pytest.raises(exception, match=message):
+        mxfp8.dequantize_marlin_mxfp8(qweight, scales, out, swap_halves=True)
