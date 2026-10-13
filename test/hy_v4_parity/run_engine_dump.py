@@ -25,9 +25,9 @@ both install a variant of the same runtime in site-packages and cannot coexist
 in one interpreter. The parent ``hy_v4_parity.py`` orchestrates the two runs and
 compares the dumps.
 
-The reference engine is a vLLM build that ships ``vllm/models/hy_v4``; point
-``--reference-python`` at the interpreter that can import it, and
-``--reference-repo`` at its checkout.
+The reference engine is vLLM 0.29.0, the first release that ships
+``vllm/models/hy_v4``; point ``--reference-python`` at the interpreter that can
+import it, and ``--reference-repo`` at its checkout.
 """
 
 from __future__ import annotations
@@ -137,7 +137,7 @@ def run_tokenspeed(args, dump_path: Path) -> dict:
 def run_reference(args, dump_path: Path) -> dict:
     """Boot the reference vLLM engine and dump the same taps.
 
-    The reference build is imported from ``--reference-repo``. Its HY V4 model
+    vLLM is imported from ``--reference-repo``. Its HY V4 model
     names the sub-blocks the same way TokenSpeed does, so the same instrumentation
     attaches without a second hook implementation.
     """
@@ -234,7 +234,7 @@ def main() -> int:
     parser.add_argument(
         "--reference-repo",
         default=os.environ.get("HY_V4_REFERENCE_REPO", ""),
-        help="Checkout of the reference vLLM build (reference engine only).",
+        help="vLLM checkout (reference engine only).",
     )
     parser.add_argument(
         "--reference-attention-backend",

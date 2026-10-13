@@ -61,11 +61,10 @@ TARGETS_ENV = "HY_V4_DUMP_TARGETS"
 DEFAULT_DUMP_PATH = "/tmp/hy_v4_parity_dump.json"
 
 # Known ``module:class`` locations of the HY V4 target model: TokenSpeed's and
-# both plausible layouts for the reference checkout. Missing ones are skipped.
+# vLLM's. Missing ones are skipped.
 _TARGETS = (
     ("tokenspeed", "tokenspeed.runtime.models.hy_v4", "HYV4ForCausalLM"),
-    ("vllm", "vllm.model_executor.models.hy_v4.nvidia.model", "HYV4ForCausalLM"),
-    ("vllm-flat", "vllm.models.hy_v4.nvidia.model", "HYV4ForCausalLM"),
+    ("vllm", "vllm.models.hy_v4.nvidia.model", "HYV4ForCausalLM"),
 )
 
 

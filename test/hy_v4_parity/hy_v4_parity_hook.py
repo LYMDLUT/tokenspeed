@@ -22,7 +22,7 @@
 
 The hook is engine-agnostic: it attaches to whatever module tree is handed to it
 and wraps the sub-blocks of each decoder layer whose names it is told to look
-for. TokenSpeed and the reference vLLM build name those sub-modules
+for. TokenSpeed and vLLM name those sub-modules
 ``self_attn``/``mlp`` and ``hc_attn_layer``/``hc_mlp_layer`` identically, so one
 implementation covers both and a dump cannot silently come from a different
 place than the other engine's.

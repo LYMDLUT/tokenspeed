@@ -1,6 +1,6 @@
 # HY V4 cross-engine parity harness
 
-Compares TokenSpeed against the reference vLLM build that already ships
+Compares TokenSpeed against vLLM 0.29.0, the first vLLM release that ships
 `vllm/models/hy_v4`, layer by layer, on a small truncated HY V4 checkpoint.
 
 A full 78-layer HY V4 is ~1.5 TB in BF16, so the harness builds a checkpoint
@@ -13,8 +13,8 @@ it rather than only at the final logits.
 
 ```bash
 python -m test.hy_v4_parity.hy_v4_parity \
-    --reference-repo /path/to/reference-vllm \
-    --reference-python /path/to/reference-venv/bin/python \
+    --reference-repo /path/to/vllm \
+    --reference-python /path/to/vllm-venv/bin/python \
     --tokenspeed-python $(which python)
 ```
 

@@ -22,7 +22,7 @@
 
 A full 78-layer HY V4 is ~1.5 TB in BF16, far too heavy to iterate on. This
 module materialises a small checkpoint that is *bit-identical* to the released
-weights on the layers it keeps, so TokenSpeed and the reference vLLM build load
+weights on the layers it keeps, so TokenSpeed and vLLM load
 exactly the same tensors and any per-layer divergence is a kernel/wiring bug
 rather than a weight difference.
 

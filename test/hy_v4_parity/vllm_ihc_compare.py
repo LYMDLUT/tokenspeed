@@ -17,14 +17,15 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-"""TokenSpeed iHC kernels vs the vLLM HY V4 iHC path, on the same GPU.
+"""TokenSpeed iHC kernels vs the vLLM 0.29.0 HY V4 iHC path, on the same GPU.
 
-The reference vLLM (``vllm/models/hy_v4/nvidia/hc.py``) only uses its fused HPC
-iHC kernels on sm100/sm103. On Hopper (H20/H100) without them it runs the eager
-torch bodies of ``HYV4HCPreLayer`` / ``HYV4HCPostLayer`` /
-``HYV4HCHeadLayer`` under CUDA graphs (the model is not torch.compiled), with
+vLLM 0.29.0 (``vllm/models/hy_v4/nvidia/hc.py``) only uses its fused HPC iHC
+kernels on sm100/sm103. On Hopper (H20/H100) it runs the eager torch bodies of
+``HYV4HCPreLayer`` / ``HYV4HCPostLayer`` / ``HYV4HCHeadLayer`` under CUDA graphs
+(the model is not torch.compiled), with
 ``torch.set_float32_matmul_precision("highest")`` (VLLM_FLOAT32_MATMUL_PRECISION
-default). Those bodies are reproduced verbatim below, followed by the decoder
+default); later releases add a Triton path for the pre and post blocks. Those
+bodies are reproduced verbatim below, followed by the decoder
 layer's separate ``RMSNorm`` (vLLM does not fold it into the pre block), so the
 comparison is like for like with TokenSpeed's fused pre+norm.
 

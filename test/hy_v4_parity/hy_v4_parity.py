@@ -21,8 +21,8 @@
 """Compare TokenSpeed and the reference engine on a truncated HY V4, layer by layer.
 
     python -m test.hy_v4_parity.hy_v4_parity \
-        --reference-repo /path/to/reference-vllm \
-        --reference-python /path/to/reference/venv/bin/python
+        --reference-repo /path/to/vllm \
+        --reference-python /path/to/vllm-venv/bin/python
 
 Steps: build a truncated checkpoint from the released weights (bit-identical on
 the layers it keeps), run each engine over a fixed prompt dumping every
@@ -148,12 +148,12 @@ def main() -> int:
     parser.add_argument(
         "--reference-repo",
         default=os.environ.get("HY_V4_REFERENCE_REPO", ""),
-        help="Checkout of the reference vLLM build that ships vllm/models/hy_v4.",
+        help="vLLM checkout that ships vllm/models/hy_v4 (0.29.0).",
     )
     parser.add_argument(
         "--reference-python",
         default=sys.executable,
-        help="Interpreter that can import the reference build.",
+        help="Interpreter that can import that vLLM checkout.",
     )
     parser.add_argument(
         "--tokenspeed-python",
