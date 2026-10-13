@@ -36,13 +36,15 @@ that cannot apply it would change the model's output, so the DSA kernels declare
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Iterable
 from dataclasses import replace
 from typing import NamedTuple
 
 import torch
+from tokenspeed_kernel.ops import residual as residual_ops
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
-from tokenspeed_kernel.ops.residual import ihc_fused_hc, ihc_head, ihc_post, ihc_pre
+from tokenspeed_kernel.ops.attention import dsa as dsa_ops
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -116,6 +118,40 @@ def normalize_hyv4_checkpoint_name(name: str) -> str:
         if checkpoint_part in name:
             name = name.replace(checkpoint_part, module_part)
     return name
+
+
+def check_hyv4_runtime(mapping: Mapping, *, enable_ihc: bool) -> None:
+    """Reject unsupported topology or kernel packages before allocating layers.
+
+    Import the residual module, not the new iHC symbols, so model discovery
+    with an older kernel package can still serve unrelated architectures.
+    HY V4 itself requires the iHC and sink-capable kernels from its release.
+    """
+    if mapping.has_pp:
+        raise ValueError(
+            "HY V4 does not support pipeline parallelism; "
+            "--pipeline-parallel-size must be 1."
+        )
+    missing = []
+    if enable_ihc:
+        missing.extend(
+            name
+            for name in ("ihc_pre", "ihc_post", "ihc_head", "ihc_fused_hc")
+            if not callable(getattr(residual_ops, name, None))
+        )
+    for name in ("dsa_prefill", "dsa_decode"):
+        operation = getattr(dsa_ops, name, None)
+        if (
+            operation is None
+            or "attn_sink" not in inspect.signature(operation).parameters
+        ):
+            missing.append(f"{name}(attn_sink=...)")
+    if missing:
+        raise RuntimeError(
+            f"HY V4 requires newer tokenspeed-kernel capabilities: {', '.join(missing)}. "
+            "Install tokenspeed-kernel from the same source revision as the "
+            "runtime, or a release including iHC, DSA sinks and MXFP8 MoE."
+        )
 
 
 class HYV4DsaIndexer(GlmDsaIndexer):
@@ -850,8 +886,10 @@ class HYV4DecoderLayer(nn.Module):
         )
         norm_args = dict(norm_weight=norm.weight, norm_eps=norm.variance_epsilon)
         if pending is None:
-            return hidden_states, *ihc_pre(hidden_states, *args, **norm_args)
-        return ihc_fused_hc(
+            return hidden_states, *residual_ops.ihc_pre(
+                hidden_states, *args, **norm_args
+            )
+        return residual_ops.ihc_fused_hc(
             pending.block_output, hidden_states, pending.gates, *args, **norm_args
         )
 
@@ -871,6 +909,7 @@ class HYV4Model(nn.Module):
         super().__init__()
         check_hyv4_quant_config(quant_config)
         check_hyv4_speculative_algorithm()
+        check_hyv4_runtime(mapping, enable_ihc=config.enable_ihc)
         self.config = config
         self.mapping = mapping
         self.padding_id = config.pad_token_id
@@ -939,10 +978,10 @@ class HYV4Model(nn.Module):
 
         if self.hc_head is not None:
             if residual is not None:
-                hidden_states = ihc_post(
+                hidden_states = residual_ops.ihc_post(
                     residual.block_output, hidden_states, residual.gates
                 )
-            hidden_states = ihc_head(
+            hidden_states = residual_ops.ihc_head(
                 hidden_states,
                 self.hc_head.hc_fn,
                 self.hc_head.hc_scale,
