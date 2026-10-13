@@ -836,5 +836,46 @@ class HYV4NextNPrefillStagesTests(unittest.TestCase):
         self.assertIsNone(ctx.collective_num_tokens)
 
 
+class HYV4RuntimeCapabilityTests(unittest.TestCase):
+    def test_pipeline_is_rejected_before_embeddings_or_layers(self):
+        mapping = SimpleNamespace(has_pp=True)
+        for model_cls in (HYV4Model, HYV4ModelNextN):
+            with self.subTest(model=model_cls.__name__):
+                with (
+                    mock.patch.object(hy_v4, "VocabParallelEmbedding") as embedding,
+                    mock.patch.object(
+                        hy_v4_nextn, "VocabParallelEmbedding"
+                    ) as draft_embedding,
+                    mock.patch.dict(
+                        hy_v4.global_server_args_dict, {"speculative_algorithm": None}
+                    ),
+                ):
+                    with self.assertRaisesRegex(ValueError, "pipeline parallelism"):
+                        model_cls(HYV4Config(), mapping=mapping)
+                    embedding.assert_not_called()
+                    draft_embedding.assert_not_called()
+
+    def test_missing_ihc_is_an_actionable_model_error(self):
+        with mock.patch.object(hy_v4, "residual_ops", SimpleNamespace()):
+            with self.assertRaisesRegex(
+                RuntimeError, "requires newer tokenspeed-kernel"
+            ):
+                hy_v4.check_hyv4_runtime(SimpleNamespace(has_pp=False), enable_ihc=True)
+
+    def test_old_dsa_without_sink_is_rejected(self):
+        def old_attention(q):
+            return q
+
+        old = SimpleNamespace(dsa_prefill=old_attention, dsa_decode=old_attention)
+        with mock.patch.object(hy_v4, "dsa_ops", old):
+            with self.assertRaisesRegex(RuntimeError, "attn_sink"):
+                hy_v4.check_hyv4_runtime(
+                    SimpleNamespace(has_pp=False), enable_ihc=False
+                )
+
+    def test_current_capabilities_are_accepted_without_allocating(self):
+        hy_v4.check_hyv4_runtime(SimpleNamespace(has_pp=False), enable_ihc=True)
+
+
 if __name__ == "__main__":
     unittest.main()

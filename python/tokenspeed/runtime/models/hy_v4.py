@@ -36,12 +36,14 @@ that cannot apply it would change the model's output, so the DSA kernels declare
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Iterable
 from dataclasses import replace
 
 import torch
+from tokenspeed_kernel.ops import residual as residual_ops
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
-from tokenspeed_kernel.ops.residual import ihc_head, ihc_post, ihc_pre
+from tokenspeed_kernel.ops.attention import dsa as dsa_ops
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -115,6 +117,40 @@ def normalize_hyv4_checkpoint_name(name: str) -> str:
         if checkpoint_part in name:
             name = name.replace(checkpoint_part, module_part)
     return name
+
+
+def check_hyv4_runtime(mapping: Mapping, *, enable_ihc: bool) -> None:
+    """Reject unsupported topology or kernel packages before allocating layers.
+
+    Import the residual module, not the new iHC symbols, so model discovery
+    with an older kernel package can still serve unrelated architectures.
+    HY V4 itself requires the iHC and sink-capable kernels from its release.
+    """
+    if mapping.has_pp:
+        raise ValueError(
+            "HY V4 does not support pipeline parallelism; "
+            "--pipeline-parallel-size must be 1."
+        )
+    missing = []
+    if enable_ihc:
+        missing.extend(
+            name
+            for name in ("ihc_pre", "ihc_post", "ihc_head")
+            if not callable(getattr(residual_ops, name, None))
+        )
+    for name in ("dsa_prefill", "dsa_decode"):
+        operation = getattr(dsa_ops, name, None)
+        if (
+            operation is None
+            or "attn_sink" not in inspect.signature(operation).parameters
+        ):
+            missing.append(f"{name}(attn_sink=...)")
+    if missing:
+        raise RuntimeError(
+            f"HY V4 requires newer tokenspeed-kernel capabilities: {', '.join(missing)}. "
+            "Install tokenspeed-kernel from the same source revision as the "
+            "runtime, or a release including iHC, DSA sinks and MXFP8 MoE."
+        )
 
 
 class HYV4DsaIndexer(GlmDsaIndexer):
@@ -806,7 +842,7 @@ class HYV4DecoderLayer(nn.Module):
             return hidden_states
 
         attn = self.hc_attn_layer
-        attn_input, attn_post = ihc_pre(
+        attn_input, attn_post = residual_ops.ihc_pre(
             hidden_states,
             attn.hc_fn,
             attn.hc_scale,
@@ -824,10 +860,10 @@ class HYV4DecoderLayer(nn.Module):
             comm_manager=self.comm_manager,
         )
         attn_output, _ = self.comm_manager.post_attn_comm(attn_output, attn_output, ctx)
-        hidden_states = ihc_post(attn_output, hidden_states, attn_post)
+        hidden_states = residual_ops.ihc_post(attn_output, hidden_states, attn_post)
 
         mlp = self.hc_mlp_layer
-        mlp_input, mlp_post = ihc_pre(
+        mlp_input, mlp_post = residual_ops.ihc_pre(
             hidden_states,
             mlp.hc_fn,
             mlp.hc_scale,
@@ -844,7 +880,7 @@ class HYV4DecoderLayer(nn.Module):
             max_num_tokens_per_gpu,
         )
         mlp_output, _ = self.comm_manager.post_mlp_comm(mlp_output, mlp_output, ctx)
-        return ihc_post(mlp_output, hidden_states, mlp_post)
+        return residual_ops.ihc_post(mlp_output, hidden_states, mlp_post)
 
 
 class HYV4Model(nn.Module):
@@ -862,6 +898,7 @@ class HYV4Model(nn.Module):
         super().__init__()
         check_hyv4_quant_config(quant_config)
         check_hyv4_speculative_algorithm()
+        check_hyv4_runtime(mapping, enable_ihc=config.enable_ihc)
         self.config = config
         self.mapping = mapping
         self.padding_id = config.pad_token_id
@@ -929,7 +966,7 @@ class HYV4Model(nn.Module):
             return hidden_states, None
 
         if self.hc_head is not None:
-            hidden_states = ihc_head(
+            hidden_states = residual_ops.ihc_head(
                 hidden_states,
                 self.hc_head.hc_fn,
                 self.hc_head.hc_scale,

@@ -53,6 +53,7 @@ from tokenspeed.runtime.models.hy_v4 import (
     HYV4DecoderLayer,
     HYV4ForCausalLM,
     check_hyv4_quant_config,
+    check_hyv4_runtime,
     finalize_hyv4_attention,
     load_hyv4_weights,
 )
@@ -118,6 +119,7 @@ class HYV4ModelNextN(nn.Module):
     ) -> None:
         super().__init__()
         check_hyv4_quant_config(quant_config)
+        check_hyv4_runtime(mapping, enable_ihc=False)
         self.config = config
         self.mapping = mapping
         self.vocab_size = config.vocab_size
