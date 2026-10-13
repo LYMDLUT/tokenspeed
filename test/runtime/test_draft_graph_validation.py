@@ -37,6 +37,7 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 from test.runtime.draft_graph_validation import (
     compare_payloads,
     compare_proposals,
+    validate_trace_counts,
 )  # noqa: E402
 
 
@@ -135,3 +136,14 @@ def test_payload_accepts_identical_inputs_and_small_output_rounding():
     assert compare_payloads(
         graph, eager, logit_atol=0.05, logit_rtol=0.01, kv_atol=0.004, kv_rtol=0.02
     )
+
+
+def test_trace_cannot_drop_calls_from_both_runs():
+    run = {"trace": [_call()], "counts": {"replays": 2, "eager_extends": 0}}
+    assert validate_trace_counts(run)
+    run["counts"]["replays"] = 1
+    assert not validate_trace_counts(run)
+    run["trace"].append(_call("eager"))
+    assert validate_trace_counts(run)
+    run["counts"]["eager_extends"] = 1
+    assert not validate_trace_counts(run)
