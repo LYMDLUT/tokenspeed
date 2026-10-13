@@ -449,6 +449,15 @@ ts serve zai-org/GLM-5.3 \
 
 ## HY V4 (Hy4-preview)
 
+HY V4 currently requires pipeline-parallel size 1; unsupported PP layouts are
+rejected before allocating model layers. Use a `tokenspeed-kernel` build from
+the same source revision, or a release containing iHC, DSA attention sinks and
+MXFP8 MoE. Older kernel packages remain usable by unrelated models; HY V4
+reports missing capabilities explicitly instead of breaking model discovery.
+The runtime dependency floor must be raised to the containing kernel release
+when that wheel is published, not to an invented or unpublished version.
+
+
 `tencent/Hy4-preview` (`HYV4ForCausalLM`, 770B total / 49B active) runs on the
 GLM-DSA serving path with four additions: a gated MLA output, a per-head
 learnable attention sink, independent Hyper-Connections (iHC, four residual
