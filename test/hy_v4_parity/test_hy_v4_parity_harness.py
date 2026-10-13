@@ -479,5 +479,51 @@ class ServingBenchmarkStreamTests(unittest.TestCase):
                     self._run_stream(frames)
 
 
+class TruncatedCheckpointSafetyTests(unittest.TestCase):
+    def test_rebuild_cannot_remove_the_source_or_its_parent(self):
+        from test.hy_v4_parity import hy_v4_fixtures as fixtures
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            sentinel = source / "keep.txt"
+            sentinel.write_text("source data")
+            alias = root / "alias"
+            alias.symlink_to(source, target_is_directory=True)
+            for target in (source, root, alias):
+                with self.subTest(target=target.name):
+                    with mock.patch.object(fixtures.shutil, "rmtree") as remove:
+                        with self.assertRaisesRegex(ValueError, "source checkpoint"):
+                            fixtures.build_truncated_checkpoint(
+                                target, repo_id=str(source), overwrite=True
+                            )
+                        remove.assert_not_called()
+                    self.assertEqual(sentinel.read_text(), "source data")
+
+    def test_invalid_truncation_keeps_the_previous_export(self):
+        from test.hy_v4_parity import hy_v4_fixtures as fixtures
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, target = root / "source", root / "output"
+            source.mkdir()
+            target.mkdir()
+            (source / "config.json").write_text(
+                json.dumps({"num_hidden_layers": 2, "n_routed_experts": 8})
+            )
+            sentinel = target / "keep.txt"
+            sentinel.write_text("previous export")
+            with mock.patch.object(fixtures.shutil, "rmtree") as remove:
+                with self.assertRaisesRegex(ValueError, "num_layers"):
+                    fixtures.build_truncated_checkpoint(
+                        target, Truncation(3, 8), repo_id=str(source), overwrite=True
+                    )
+                remove.assert_not_called()
+            self.assertEqual(sentinel.read_text(), "previous export")
+
+
 if __name__ == "__main__":
     unittest.main()

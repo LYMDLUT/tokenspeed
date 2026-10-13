@@ -192,3 +192,8 @@ HTTP-200 error events and short generations fail instead of borrowing the
 requested token count to manufacture throughput. Do not mix older metric
 records with version 2 without rerunning the same workload. Existing published
 benchmark values are not recomputed or relabeled by this change.
+
+Checkpoint rebuilds refuse a destination equal to the source checkpoint or
+containing it, including a symlink alias. Configuration and selected source
+tensors are validated before an existing output is removed. `--rebuild`
+replaces an export, never its source checkpoint; use a separate output path.

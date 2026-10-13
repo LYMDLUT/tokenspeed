@@ -201,6 +201,12 @@ def build_truncated_checkpoint(
 
     report = log or (lambda message: None)
     target = Path(output_dir)
+    source = _config_dir(repo_id)
+    source_path, target_path = source.resolve(), target.resolve()
+    if target_path == source_path or target_path in source_path.parents:
+        raise ValueError("truncated output must not contain the source checkpoint")
+    released_config = load_released_config(repo_id)
+    rewritten_config = truncated_config(released_config, truncation)
     marker = target / ".hy_v4_truncated.json"
     if marker.exists() and not overwrite:
         existing = json.loads(marker.read_text())
@@ -210,16 +216,10 @@ def build_truncated_checkpoint(
         }:
             report(f"reusing truncated checkpoint at {target}")
             return target
-    if target.exists() and overwrite:
-        shutil.rmtree(target)
-    target.mkdir(parents=True, exist_ok=True)
-
-    source = _config_dir(repo_id)
     index_path = source / "model.safetensors.index.json"
     if not index_path.exists():
         index_path = Path(hf_hub_download(repo_id, "model.safetensors.index.json"))
     weight_map = json.loads(index_path.read_text())["weight_map"]
-    released_config = load_released_config(repo_id)
     released_experts = released_config["n_routed_experts"]
 
     keys = _needed_keys(weight_map, truncation)
@@ -250,6 +250,11 @@ def build_truncated_checkpoint(
             f"{len(missing)} tensors were not found in the shards, e.g. {missing[:5]}"
         )
 
+    # Validate and read all source tensors before replacing a previous export.
+    if target.exists() and overwrite:
+        shutil.rmtree(target)
+    target.mkdir(parents=True, exist_ok=True)
+
     # One shard keeps the comparison setup simple; these checkpoints are small.
     shard_name = "model.safetensors"
     save_file(dict(tensors), str(target / shard_name))
@@ -262,9 +267,7 @@ def build_truncated_checkpoint(
             indent=2,
         )
     )
-    (target / "config.json").write_text(
-        json.dumps(truncated_config(released_config, truncation), indent=2)
-    )
+    (target / "config.json").write_text(json.dumps(rewritten_config, indent=2))
     for side_file in _SIDE_FILES:
         candidate = source / side_file
         if candidate.exists():
