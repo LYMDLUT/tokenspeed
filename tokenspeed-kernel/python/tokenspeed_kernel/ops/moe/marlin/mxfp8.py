@@ -173,7 +173,9 @@ def _marlin_mxfp8_to_bf16_kernel(
     scale = (s << 23).to(tl.float32, bitcast=True)
 
     out = tl.reshape(w * scale[:, :, None], (64, K_TILES * 16)).to(tl.bfloat16)
-    rows = (n_tile * 64 + ROW_SHIFT) % N + tl.arange(0, 64)
+    # Wrap each row, not just the tile origin: half-swapping an odd number
+    # of 64-row tiles can otherwise store past the final output row.
+    rows = (n_tile * 64 + ROW_SHIFT + tl.arange(0, 64)) % N
     cols = k_block * K_TILES * 16 + tl.arange(0, K_TILES * 16)
     tl.store(
         out_ptr + expert * (N * K) + rows.to(tl.int64)[:, None] * K + cols[None, :],
