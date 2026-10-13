@@ -72,13 +72,15 @@ reproducible run to run, but the projection's summation order, and with it
 the last bits of the gates, can change with the batch size.
 
 On FP32 channels a multiple of 128 wide, the widest K tile, `ihc_fused_hc`
-applies the post boundary inside the next projection: each tile of the updated
-channels lies in one channel, is stored and is projected from registers, which
-saves the projection's read of the channels. The fused kernel keeps the
-expressions of the two kernels it replaces and the projection's tile layout,
-so its outputs equal `ihc_post` followed by `ihc_pre` bit for bit. BF16
-channels are rounded between the two boundaries, so they, like other channel
-sizes, run the two kernels in turn.
+applies the post boundary of a batch of up to 64 tokens inside the next
+projection: each tile of the updated channels lies in one channel, is stored
+and is projected from registers, which saves the projection's read of the
+channels and a launch. The fused kernel keeps the expressions of the two
+kernels it replaces and the projection's tile layout, so its outputs equal
+`ihc_post` followed by `ihc_pre` bit for bit. A projection program walks its K
+tiles one at a time, so in larger batches the post pass costs more inside it
+than as its own fully parallel kernel; those, BF16 channels (rounded between
+the two boundaries) and other channel sizes run the two kernels in turn.
 
 The Triton pre and fused boundaries register for `hc_mult` 2 through 8 (at
 most 16 gates) and the head for 2 through 16; wider boundaries select the

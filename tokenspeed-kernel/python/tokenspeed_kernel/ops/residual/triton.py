@@ -2063,6 +2063,11 @@ _IHC_MAX_GATES = 16
 _IHC_FP32_ACCUMULATOR = 8192
 # Widest K tile of the FP32 projection; every narrower one divides it.
 _IHC_FP32_MAX_BLOCK_K = 128
+# Largest batch whose post boundary runs inside the next projection. A
+# projection program walks its K tiles one at a time, so past small batches
+# the post pass costs more inside it than as its own fully parallel kernel
+# (H20: 16.4 -> 14.3 us at 64 tokens, but 54 -> 61 us at 256).
+_IHC_FUSED_MAX_TOKENS = 64
 
 
 def _ihc_tile_m(num_tokens: int) -> int:
@@ -2790,16 +2795,23 @@ def triton_ihc_fused_hc(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run the previous iHC post boundary and the next pre boundary in Triton.
 
-    FP32 channels are updated and projected in one pass when the widest K tile
-    divides them. BF16 channels are rounded between the two boundaries, so
-    they, like other channel sizes, run the two kernels in turn.
+    FP32 channels of small batches are updated and projected in one pass when
+    the widest K tile divides them. BF16 channels are rounded between the two
+    boundaries, so they, like larger batches and other channel sizes, run the
+    two kernels in turn.
     """
     if (norm_weight is None) != (norm_eps is None):
         raise ValueError("norm_weight and norm_eps must be provided together")
     if not residual_prev.is_cuda:
         raise RuntimeError("fast iHC requires CUDA tensors")
+    hc_mult = residual_prev.shape[-2]
     hidden_size = residual_prev.shape[-1]
-    if residual_prev.dtype != torch.float32 or hidden_size % _IHC_FP32_MAX_BLOCK_K:
+    outer_shape = residual_prev.shape[:-2]
+    if (
+        residual_prev.dtype != torch.float32
+        or hidden_size % _IHC_FP32_MAX_BLOCK_K
+        or outer_shape.numel() > _IHC_FUSED_MAX_TOKENS
+    ):
         residual = triton_ihc_post(x_prev, residual_prev, post_prev)
         layer_input, post = triton_ihc_pre(
             residual,
@@ -2813,8 +2825,6 @@ def triton_ihc_fused_hc(
             norm_eps,
         )
         return residual, layer_input, post
-    hc_mult = residual_prev.shape[-2]
-    outer_shape = residual_prev.shape[:-2]
     if residual_prev.numel() == 0:
         return (
             torch.empty_like(residual_prev),
