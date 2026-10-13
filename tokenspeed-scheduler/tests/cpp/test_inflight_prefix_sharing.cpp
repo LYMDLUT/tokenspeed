@@ -20,6 +20,7 @@
 
 #include "integration_test_helper.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -273,10 +274,11 @@ TEST_F(InflightPrefixSharingChunkedTest, IncompleteChunkHoldsTheLineThenTheShare
 
 TEST_F(InflightPrefixSharingStateCacheTest, OnlyAPromptSharingTheWritersCheckpointWaits) {
     // A state group resumes only where a checkpoint was published: a's
-    // completed prompt leaves one at its last full page, 8 tokens in. b
-    // diverges before it and could not resume there, so it does not wait;
-    // c extends a's first 8 tokens and does.
-    const std::vector<std::int32_t> a = PromptA();
+    // completed prompt ends at its aligned natural checkpoint, 8 tokens in.
+    // b diverges before it and cannot resume there, so it does not wait;
+    // c extends that exact checkpoint and does.
+    std::vector<std::int32_t> a = PromptA();
+    a.resize(8);
     const std::vector<std::int32_t> c = Concat({a.begin(), a.begin() + 8}, {300, 301, 302});
     Submit({Prompt("a", a), Prompt("b", PromptB()), Prompt("c", c)});
 
@@ -289,6 +291,60 @@ TEST_F(InflightPrefixSharingStateCacheTest, OnlyAPromptSharingTheWritersCheckpoi
     ASSERT_EQ(second.size(), 1u);
     EXPECT_EQ(second.at("c").extend_prefix_len, 8);
     EXPECT_EQ(second.at("c").input_length, 3);
+}
+
+TEST_F(InflightPrefixSharingStateCacheTest, UnalignedStateDoesNotCreateAnInteriorCheckpoint) {
+    const std::vector<std::int32_t> a = PromptA();
+    const std::vector<std::int32_t> shorter = Concat({a.begin(), a.begin() + 8}, {300, 301, 302});
+    Submit({Prompt("writer", a), Prompt("reader", shorter)});
+    const auto first = ScheduledPrefills(PlanOnce());
+    ASSERT_EQ(first.size(), 2u) << "no state checkpoint exists at token 8 of a 9-token forward";
+    EXPECT_EQ(first.at("reader").extend_prefix_len, 0);
+}
+
+class InflightStateSpeculationTest : public InflightPrefixSharingStateCacheTest {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = InflightPrefixSharingStateCacheTest::MakeConfig();
+        cfg.decode_input_tokens = 5;
+        return cfg;
+    }
+};
+
+TEST_F(InflightStateSpeculationTest, PublishesThePromptFrontierNotTheSpeculativeWidth) {
+    const auto prefix = MakeTokens(8, 1);
+    Submit({Prompt("writer", prefix), Prompt("reader", Concat(prefix, {300, 301, 302}))});
+    ASSERT_EQ(ScheduledPrefills(PlanOnce()).size(), 1u);
+    SendForwardDone("writer", {41});
+    const auto next = ScheduledPrefills(PlanOnce());
+    ASSERT_EQ(next.size(), 1u);
+    EXPECT_EQ(next.at("reader").extend_prefix_len, 8);
+    EXPECT_EQ(next.at("reader").input_length, 3);
+}
+
+TEST_F(InflightPrefixSharingTest, WritableTailIsNotSharedBeforeDecodeAdmission) {
+    const auto prompt = PromptA();
+    Submit(Prompt("writer", prompt));
+    const ExecutionPlan first = PlanOnce();
+    const ForwardBatch* writer = FindForwardBatch(first);
+    ASSERT_NE(writer, nullptr);
+    const auto writer_tail = writer->block_tables.at("full_attention").at(0).at(4);
+    SendForwardDone("writer", {400});
+    Submit(Prompt("reader", Concat(prompt, {300, 301, 302})));
+    const ExecutionPlan next = PlanOnce();
+    const auto prefills = ScheduledPrefills(next);
+    ASSERT_EQ(prefills.size(), 1u);
+    EXPECT_EQ(prefills.at("reader").extend_prefix_len, 8);
+    const ForwardBatch* reader = FindForwardBatch(next);
+    ASSERT_NE(reader, nullptr);
+    EXPECT_NE(reader->block_tables.at("full_attention").at(0).at(4), writer_tail);
+    SendForwardDone("reader", {401});
+    SendFinish("reader");
+    const ExecutionPlan decode = PlanOnce();
+    const auto& copies = decode.pages_to_copy.at("full_attention");
+    EXPECT_TRUE(std::any_of(copies.begin(), copies.end(), [writer_tail](const auto& copy) {
+        return copy.first == writer_tail && copy.second != writer_tail;
+    })) << "the owner's tail moves only through the first decode admission";
 }
 
 class InflightPrefixLifetimeTest : public SchedulerTestSuite, public ::testing::WithParamInterface<bool> {
