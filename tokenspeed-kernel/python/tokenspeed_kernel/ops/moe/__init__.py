@@ -501,7 +501,7 @@ def moe_plan(
     ep_size: int | None = None,
     ispp: int | None = None,
     *,
-    requires_deterministic_finalize: bool,
+    requires_deterministic_finalize: bool = False,
     hidden: int | None,
     swiglu_form: str | None,
     activation_clamped: bool,
@@ -531,7 +531,9 @@ def moe_plan(
             that reduce through atomics declare
             ``deterministic_finalize={False}``; a selected kernel that does not
             declare support is rejected. False leaves the reduction order to
-            the kernel.
+            the kernel. Omission preserves the legacy public API
+            (False), so an independently upgraded kernel package remains
+            compatible with older runtimes. New callers must state it.
         routing_mode: Optional routing-mode requirement. "precomputed_topk"
             requires a kernel that consumes externally computed top-k ids and
             weights (for models whose routing function the fused kernels

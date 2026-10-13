@@ -379,3 +379,22 @@ def test_kernel_routing_rejects_missing_logits(monkeypatch) -> None:
             max_num_tokens_per_gpu=1,
         )
     apply.assert_not_called()
+
+
+@pytest.mark.parametrize("required", [False, True])
+def test_finalize_negotiation_preserves_new_kernel_requirement(required):
+    def planner(*, requires_deterministic_finalize):
+        return requires_deterministic_finalize
+
+    kwargs = expert_module._deterministic_finalize_kwargs(planner, required)
+    assert planner(**kwargs) is required
+
+
+def test_finalize_negotiation_keeps_old_kernel_legacy_calls():
+    def legacy_planner(*, hidden):
+        return hidden
+
+    kwargs = expert_module._deterministic_finalize_kwargs(legacy_planner, False)
+    assert legacy_planner(hidden=128, **kwargs) == 128
+    with pytest.raises(RuntimeError, match="does not support deterministic"):
+        expert_module._deterministic_finalize_kwargs(legacy_planner, True)

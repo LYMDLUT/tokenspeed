@@ -483,3 +483,53 @@ def test_marlin_mxfp8_rejects_malformed_scales():
         marlin_mxfp8_moe_weights(
             {"activation": "swiglu", "deterministic_finalize": True}, w
         )
+
+
+@pytest.mark.parametrize("num_tokens", [2, 32, 1024])
+def test_marlin_mxfp8_strided_inputs_match_contiguous(num_tokens):
+    """Strided FP32 routing and K-strided activations on GEMV, Marlin, CUTLASS."""
+    _requires_sm90()
+    generator = torch.Generator(device="cuda").manual_seed(47)
+    hidden, ispp, experts, top_k = 256, 128, 8, 2
+    raw = _make_weights(experts, hidden, ispp, generator)
+    x_storage = torch.randn(
+        num_tokens, 2 * hidden, device="cuda", generator=generator
+    ).bfloat16()
+    x = x_storage[:, ::2]
+    ids, weights = _routing(num_tokens, experts, top_k, generator)
+    weight_storage = torch.full((num_tokens, 2 * top_k), 99.0, device="cuda")
+    weight_storage[:, ::2] = weights
+    strided_weights = weight_storage[:, ::2]
+    assert not x.is_contiguous() and not strided_weights.is_contiguous()
+    expected = _run(raw, x.contiguous(), ids, weights, ep_size=2, limit=None)
+    actual = _run(raw, x, ids, strided_weights, ep_size=2, limit=None)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("code", [0, 255])
+@pytest.mark.parametrize("name", ["w13_weight_scale_inv", "w2_weight_scale_inv"])
+def test_marlin_mxfp8_rejects_scale_encoding_before_repack(monkeypatch, code, name):
+    _requires_sm90()
+    generator = torch.Generator(device="cuda").manual_seed(53)
+    raw = _make_weights(2, 256, 128, generator)
+    raw[name].view(-1)[0] = code
+    w = _Experts(raw, 1, 0, None)
+    original = {name: parameter for name, parameter in w.named_parameters()}
+
+    def unexpected_repack(*args, **kwargs):
+        pytest.fail("invalid scales reached weight repacking")
+
+    monkeypatch.setattr(mxfp8, "gptq_marlin_repack", unexpected_repack)
+    with pytest.raises(ValueError, match="unsupported E8M0"):
+        marlin_mxfp8_moe_weights(
+            {"activation": "swiglu", "deterministic_finalize": True}, w
+        )
+    assert w._moe_backend_state is None
+    for name, parameter in w.named_parameters():
+        assert parameter is original[name]
+
+
+def test_marlin_mxfp8_accepts_finite_normal_scale_endpoints():
+    mxfp8._validate_mxfp8_scales(
+        "scales", torch.tensor([1, 127, 254], dtype=torch.uint8)
+    )
