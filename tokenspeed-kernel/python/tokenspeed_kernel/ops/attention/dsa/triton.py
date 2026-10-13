@@ -80,6 +80,7 @@ def _dsa_packed_kv_kernel(
 
     valid_len = tl.load(topk_lens + token).to(tl.int32)
     max_score = tl.full((), -float("inf"), tl.float32)
+    has_keys = tl.full((), False, tl.int1)
 
     for start in range(0, topk, BLOCK_TOPK):
         cols = start + topk_offsets
@@ -90,6 +91,7 @@ def _dsa_packed_kv_kernel(
             other=0,
         ).to(tl.int64)
         valid = valid & (slots >= 0)
+        has_keys = has_keys | (tl.sum(valid.to(tl.int32), axis=0) > 0)
         score = tl.zeros((BLOCK_TOPK,), tl.float32)
 
         for k_start in range(0, kv_lora_rank, BLOCK_K):
@@ -192,7 +194,8 @@ def _dsa_packed_kv_kernel(
 
     # A row with no selected key stays empty (zero output, -inf LSE) even
     # with a sink, matching the other DSA backends.
-    has_keys = denom > 0.0
+    # Key probabilities may underflow under a strong sink; emptiness is
+    # determined by valid slots, not by the floating-point denominator.
     if HAS_SINK:
         sink_value = tl.load(sink + head).to(tl.float32)
         denom += tl.exp(sink_value - max_score)
@@ -252,6 +255,7 @@ def _dsa_dense_kv_kernel(
 
     valid_len = tl.load(topk_lens + token).to(tl.int32)
     max_score = tl.full((), -float("inf"), tl.float32)
+    has_keys = tl.full((), False, tl.int1)
 
     for start in range(0, topk, BLOCK_TOPK):
         cols = start + topk_offsets
@@ -262,6 +266,7 @@ def _dsa_dense_kv_kernel(
             other=0,
         ).to(tl.int64)
         valid = valid & (slots >= 0)
+        has_keys = has_keys | (tl.sum(valid.to(tl.int32), axis=0) > 0)
         score = tl.zeros((BLOCK_TOPK,), tl.float32)
 
         for k_start in range(0, kv_lora_rank, BLOCK_K):
@@ -335,7 +340,8 @@ def _dsa_dense_kv_kernel(
 
     # A row with no selected key stays empty (zero output, -inf LSE) even
     # with a sink, matching the other DSA backends.
-    has_keys = denom > 0.0
+    # Key probabilities may underflow under a strong sink; emptiness is
+    # determined by valid slots, not by the floating-point denominator.
     if HAS_SINK:
         sink_value = tl.load(sink + head).to(tl.float32)
         denom += tl.exp(sink_value - max_score)

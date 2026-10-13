@@ -218,3 +218,8 @@ owned entries. Empty tiles still write negative-infinite logits, including
 when lengths or ownership change during graph replay. Partially valid tiles
 keep the per-entry mask and global forced-window policy. This avoids redundant
 arithmetic without changing the launch grid, logits capacity or Top-K scan.
+
+A strong sink may underflow every selected key probability. Such a row is
+still nonempty: its LSE includes the sink. Empty-row detection uses the
+selected slots, not the accumulated floating-point key mass, for both dense
+and packed Triton caches.
