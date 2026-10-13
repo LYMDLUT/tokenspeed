@@ -78,3 +78,7 @@ boundary, not an implicit model policy: every new runtime caller and
 planners only for `False`, and rejects a `True` requirement rather than
 dropping it. Release the paired kernel before raising the runtime's
 minimum package version; do not declare an unpublished version available.
+
+The MXFP8 dequantization helper wraps every output row when swapping the
+gate/up halves, including matrices with an odd count of 64-row tiles.
+Destination guard tests cover these non-production helper shapes.
