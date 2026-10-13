@@ -500,6 +500,60 @@ def test_server_args_reject_a_token_parallel_group_across_nodes():
         _mapping_from_cli("--attn-token-parallel-size", "16")
 
 
+def test_hy_v4_loads_the_sink_heads_the_backend_attends(monkeypatch):
+    from tokenspeed.runtime.models import hy_v4
+
+    class _MLAHeads:
+        """The part of the MLA constructor the sink loader reads: the head split."""
+
+        def __init__(self, *, mapping, num_heads, **kwargs):
+            torch.nn.Module.__init__(self)
+            self.num_local_heads = num_heads // mapping.attn.tp_size
+
+    monkeypatch.setattr(hy_v4, "DeepseekV3AttentionMLA", _MLAHeads)
+    _patch_device(monkeypatch, sms=132)
+    hf_config = SimpleNamespace(
+        hidden_size=16,
+        num_attention_heads=64,
+        qk_nope_head_dim=4,
+        qk_rope_head_dim=DIM - DIM_V,
+        v_head_dim=DIM_V,
+        q_lora_rank=8,
+        kv_lora_rank=DIM_V,
+        rope_theta=10000.0,
+        max_position_embeddings=64,
+        rms_norm_eps=1e-6,
+        index_topk=WIDTH,
+        # Layer 1 reuses layer 0's top-k, so it builds no indexer.
+        indexer_types=("full", "shared"),
+        gated_mla=False,
+        learnable_sink=True,
+    )
+    checkpoint_sink = torch.arange(64, dtype=torch.float32)
+    spec = _dsa_spec(num_attention_heads=64, attn_tp_size=32)
+    for rank in range(32):
+        mapping = Mapping(
+            rank=rank,
+            world_size=32,
+            attn_tp_size=32,
+            attn_token_parallel_size=8,
+            nprocs_per_node=8,
+        )
+        attn = hy_v4.HYV4Attention(hf_config, mapping, layer_id=1, is_nextn=False)
+        sink = attn.learnable_sink_param
+        sink.weight_loader(sink, checkpoint_sink)
+        layer = SimpleNamespace(
+            attn_sink=sink.detach(), tp_q_head_num=attn.num_local_heads
+        )
+        config = _attn_config(
+            spec, mapping.attn.token_parallel_group, mapping.attn.token_parallel_rank
+        )
+        backend = dsa.DSABackend(config, spec, kernel_page_size=64)
+        first = 2 * mapping.attn.token_parallel_group[0]
+        assert backend._group_sink(layer).tolist() == list(range(first, first + 16))
+        assert backend._local_sink(layer).tolist() == [2 * rank, 2 * rank + 1]
+
+
 def _initialize(
     monkeypatch, sm_counts: list[int], *, emulate_rank_zero: bool = False
 ) -> list:
