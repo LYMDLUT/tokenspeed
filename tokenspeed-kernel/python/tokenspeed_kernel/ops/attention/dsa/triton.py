@@ -500,6 +500,19 @@ def _run_dsa(
     return_lse: bool,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     q = _flatten_query(q).contiguous()
+    output_dtype = torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype
+    output_elements = q.shape[0] * q.shape[1] * kv_lora_rank
+    if out is not None and (
+        out.dtype != output_dtype
+        or out.device != q.device
+        or out.numel() != output_elements
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            f"DSA output buffer must be contiguous {output_dtype} with "
+            f"{output_elements} elements on {q.device}; got {out.dtype} "
+            f"{tuple(out.shape)} on {out.device} with strides {out.stride()}"
+        )
     topk_slots = topk_slots.contiguous()
     topk_lens = (
         torch.full(
@@ -536,7 +549,7 @@ def _run_dsa(
         )
 
     if out is not None:
-        out.reshape_as(result).copy_(result)
+        out.view_as(result).copy_(result)
         result = out
     return (result, lse) if return_lse else result
 
