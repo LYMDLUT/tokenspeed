@@ -18,22 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from dataclasses import dataclass
+"""QSA attention kernels for AMD GFX950."""
 
-import torch
+from tokenspeed_kernel_amd.ops.gfx950.attention.qsa.sparse_attention import (
+    launch_gluon_qsa_sparse_attention_gfx950,
+)
 
-
-@dataclass
-class ExpertParallelConfig:
-    top_k: int
-    num_experts: int
-    low_latency_max_num_tokens_per_gpu: int
-    max_num_tokens_per_gpu: int
-    hidden_size: int
-    rank: int
-    world_size: int
-    group: torch.distributed.ProcessGroup
-    params_dtype: torch.dtype
-
-
-EPConfig = ExpertParallelConfig
+__all__ = [
+    "launch_gluon_qsa_sparse_attention_gfx950",
+]
