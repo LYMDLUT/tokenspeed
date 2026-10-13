@@ -533,3 +533,40 @@ def test_marlin_mxfp8_accepts_finite_normal_scale_endpoints():
     mxfp8._validate_mxfp8_scales(
         "scales", torch.tensor([1, 127, 254], dtype=torch.uint8)
     )
+
+
+@pytest.mark.parametrize("size_n", [64, 128, 192, 320])
+@pytest.mark.parametrize("swap_halves", [False, True])
+def test_dequant_half_swap_wraps_each_row(size_n, swap_halves):
+    """Odd N-tile counts wrap row by row without overwriting output guards."""
+    _requires_sm90()
+    size_k = 128
+    # Enough space to contain the old kernel's entire erroneous extra tile.
+    guard = 64 * size_k
+    # Each Marlin 16x64 tile has one constant E4M3 value. Distinct N tiles
+    # also check the half-swap permutation, not merely that every row was set.
+    values = torch.arange(1, size_n // 64 + 1, device="cuda").float()
+    codes = values.to(torch.float8_e4m3fn).view(torch.uint8).to(torch.int32)
+    words = codes * 0x01010101
+    qweight = torch.empty(
+        (1, size_k // 16, size_n * 4), dtype=torch.int32, device="cuda"
+    )
+    qweight.view(1, size_k // 16, size_n // 64, 256).copy_(words.view(1, 1, -1, 1))
+    scales = torch.full(
+        (1, size_k // BLOCK, size_n), 127, dtype=torch.uint8, device="cuda"
+    ).view(torch.float8_e8m0fnu)
+    storage = torch.full(
+        (size_n * size_k + 2 * guard,),
+        -17.0,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    out = storage[guard:-guard].view(1, size_n, size_k)
+    dequantize_marlin_mxfp8(qweight, scales, out, swap_halves=swap_halves)
+    expected_rows = values.repeat_interleave(64)
+    if swap_halves:
+        expected_rows = expected_rows.roll(size_n // 2)
+    expected = expected_rows.bfloat16().view(1, size_n, 1).expand_as(out)
+    torch.testing.assert_close(out, expected, rtol=0.0, atol=0.0)
+    assert torch.all(storage[:guard] == -17)
+    assert torch.all(storage[-guard:] == -17)
