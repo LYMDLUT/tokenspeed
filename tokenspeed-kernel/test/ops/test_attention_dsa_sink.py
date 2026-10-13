@@ -136,3 +136,66 @@ def test_dsa_dense_kv_sink(device, require, solution, mode, with_sink, case):
     # Rows with nothing selected must stay empty even when the sink is set.
     assert torch.isneginf(lse[~finite]).all()
     assert (out[~finite.all(dim=1)] == 0).all()
+
+
+@pytest.mark.parametrize("packed", [False, True], ids=["dense", "packed"])
+@pytest.mark.parametrize("mode", ["decode", "prefill"])
+def test_strong_sink_does_not_turn_live_rows_into_empty_rows(
+    device, require, packed, mode
+):
+    """A sink can underflow key mass without making selected slots disappear."""
+    require("attention", f"dsa_{mode}", "triton", torch.bfloat16, "q")
+    q = torch.zeros(4, 3, ROW, dtype=torch.bfloat16, device=device)
+    slots = torch.full((4, TOPK), -1, dtype=torch.int32, device=device)
+    slots[0, :2] = torch.tensor([1, 2], dtype=torch.int32, device=device)
+    slots[1, :2] = slots[0, :2]  # Valid storage, but outside a zero live length.
+    slots[3, 1] = 3  # A valid slot after an invalid one still makes a live row.
+    lens = torch.tensor([2, 0, 2, 2], dtype=torch.int32, device=device)
+    sink = torch.tensor([200.0, -200.0, 0.0], device=device)
+    kv = sparse_kv = None
+    if packed:
+        # FP8 latent ones, one FP32 scale per 128 values, and BF16 RoPE zeros.
+        scale_bytes = 4 * (KV_LORA_RANK // 128)
+        sparse_kv = torch.zeros(
+            64,
+            KV_LORA_RANK + scale_bytes + 2 * QK_ROPE_HEAD_DIM,
+            dtype=torch.uint8,
+            device=device,
+        )
+        sparse_kv[:, :KV_LORA_RANK].fill_(0x38)  # E4M3 encoding of 1.0.
+        sparse_kv[:, KV_LORA_RANK : KV_LORA_RANK + scale_bytes].view(
+            torch.float32
+        ).fill_(1.0)
+    else:
+        kv = torch.zeros(64, ROW, dtype=torch.bfloat16, device=device)
+        kv[:, :KV_LORA_RANK].fill_(1.0)
+    operation = dsa_decode if mode == "decode" else dsa_prefill
+    out, lse = operation(
+        q=q,
+        kv_cache=kv,
+        sparse_kv_cache=sparse_kv,
+        topk_slots=slots,
+        topk_lens=lens,
+        max_seqlen_k=64,
+        qk_nope_head_dim=QK_NOPE_HEAD_DIM,
+        kv_lora_rank=KV_LORA_RANK,
+        qk_rope_head_dim=QK_ROPE_HEAD_DIM,
+        softmax_scale=SCALE,
+        page_size=64,
+        attn_sink=sink,
+        return_lse=True,
+        slot_order="selection",
+        override=f"triton_dsa_{mode}",
+    )
+    # Every key logit is zero. Positive/negative/zero sinks exercise
+    # underflow, almost unattenuated values, and an ordinary softmax.
+    for row, num_keys in ((0, 2), (3, 1)):
+        log_keys = torch.full_like(sink, float(num_keys)).log()
+        expected_lse = torch.logaddexp(log_keys, sink)
+        expected_out = (log_keys - expected_lse).exp().bfloat16()
+        torch.testing.assert_close(lse[row], expected_lse, atol=1e-5, rtol=0.0)
+        torch.testing.assert_close(
+            out[row], expected_out[:, None].expand_as(out[row]), atol=0.0, rtol=0.0
+        )
+    assert torch.isneginf(lse[1:3]).all()
+    assert torch.count_nonzero(out[1:3]) == 0
