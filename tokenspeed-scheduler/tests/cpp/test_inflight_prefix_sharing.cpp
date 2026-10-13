@@ -291,7 +291,6 @@ TEST_F(InflightPrefixSharingStateCacheTest, OnlyAPromptSharingTheWritersCheckpoi
     EXPECT_EQ(second.at("c").input_length, 3);
 }
 
-
 class InflightPrefixLifetimeTest : public SchedulerTestSuite, public ::testing::WithParamInterface<bool> {
 protected:
     SchedulerConfig MakeConfig() override {
