@@ -398,5 +398,86 @@ class DraftGraphTensorEvidenceTests(unittest.TestCase):
                 self.assertTrue(self._compare(mutation))
 
 
+class ServingBenchmarkStreamTests(unittest.TestCase):
+    """Client metrics need visible output and actual usage, not requested counts."""
+
+    def _run_stream(self, frames):
+        import asyncio
+        from test.hy_v4_parity import serve_bench
+        from types import SimpleNamespace
+        from unittest import mock
+
+        clock = [100.0]
+
+        class Content:
+            async def __aiter__(self):
+                for when, payload in frames:
+                    clock[0] = 100.0 + when
+                    data = payload if isinstance(payload, str) else json.dumps(payload)
+                    yield f"data: {data}\n".encode()
+
+        class Response:
+            status = 200
+            content = Content()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+        session = SimpleNamespace(post=lambda *args, **kwargs: Response())
+        with mock.patch.object(serve_bench.time, "perf_counter", lambda: clock[0]):
+            return asyncio.run(
+                serve_bench.one_request(session, "unused", "model", "prompt", 2)
+            )
+
+    def _frames(self):
+        return [
+            (1.0, {"choices": [{"text": ""}]}),
+            (5.0, {"choices": [{"text": "a"}]}),
+            (7.0, {"choices": [{"text": "b"}]}),
+            (10.0, {"usage": {"completion_tokens": 2, "prompt_tokens": 3}}),
+            (11.0, "[DONE]"),
+        ]
+
+    def test_empty_frames_and_delayed_usage_do_not_bias_token_latency(self):
+        self.assertEqual(self._run_stream(self._frames()), (5.0, 2.0, 11.0, 2, 3))
+
+    def test_whitespace_is_visible_output_not_an_empty_frame(self):
+        frames = self._frames()
+        frames[1] = (5.0, {"choices": [{"text": " "}]})
+        self.assertEqual(self._run_stream(frames), (5.0, 2.0, 11.0, 2, 3))
+
+    def test_incomplete_or_unaccounted_responses_fail(self):
+        cases = [
+            "usage_missing",
+            "done_missing",
+            "zero",
+            "short",
+            "float",
+            "boolean",
+            "error",
+            "empty",
+        ]
+        for case in cases:
+            with self.subTest(case=case):
+                frames = self._frames()
+                if case == "usage_missing":
+                    frames.pop(3)
+                elif case == "done_missing":
+                    frames.pop()
+                elif case in {"zero", "short", "float", "boolean"}:
+                    value = {"zero": 0, "short": 1, "float": 2.0, "boolean": True}[case]
+                    frames[3][1]["usage"]["completion_tokens"] = value
+                elif case == "error":
+                    frames.insert(1, (2.0, {"error": {"message": "generation failed"}}))
+                else:
+                    frames[1] = (5.0, {"choices": [{"text": ""}]})
+                    frames[2] = (7.0, {"choices": [{"text": ""}]})
+                with self.assertRaises(RuntimeError):
+                    self._run_stream(frames)
+
+
 if __name__ == "__main__":
     unittest.main()

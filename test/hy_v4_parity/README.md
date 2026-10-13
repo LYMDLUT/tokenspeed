@@ -176,3 +176,19 @@ public `dsa_decode` / `dsa_prefill` dispatchers. Its strong-sink regressions als
 cover the portable Triton FP8 packed-KV path, true empty rows and invalid
 slots, in both prefill and decode. These are kernel checks, not model-level
 numerical validation.
+
+## Serving benchmark metric contract
+
+`serve_bench.py` emits `metrics_version: 2`. TTFT is measured at the first
+nonempty text frame (whitespace counts); TPOT uses the interval between the
+first and last nonempty text frames divided by the reported completion token
+count minus one. It is a client-observed estimate when frames coalesce tokens,
+not a measurement of every GPU token step. End-to-end time includes the
+remaining protocol tail, while delayed usage/footer frames do not inflate TPOT.
+
+A response must finish with `[DONE]`, contain visible output, and report valid
+usage with the requested completion length. Missing usage, truncated streams,
+HTTP-200 error events and short generations fail instead of borrowing the
+requested token count to manufacture throughput. Do not mix older metric
+records with version 2 without rerunning the same workload. Existing published
+benchmark values are not recomputed or relabeled by this change.

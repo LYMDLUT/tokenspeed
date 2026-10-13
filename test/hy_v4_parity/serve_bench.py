@@ -38,8 +38,6 @@ import random
 import statistics
 import time
 
-import aiohttp
-
 _TOK = None
 
 
@@ -67,7 +65,8 @@ async def one_request(session, url, model, prompt, output_len):
     }
     start = time.perf_counter()
     first = None
-    stamps = []
+    last = None
+    complete = False
     usage = None
     async with session.post(url, json=payload) as resp:
         if resp.status != 200:
@@ -78,27 +77,44 @@ async def one_request(session, url, model, prompt, output_len):
                 continue
             data = line[5:].strip()
             if data == "[DONE]":
+                complete = True
                 break
             chunk = json.loads(data)
+            if chunk.get("error") is not None:
+                raise RuntimeError("completion stream returned an error event")
             if chunk.get("usage"):
                 usage = chunk["usage"]
             if not chunk.get("choices"):
                 continue
-            now = time.perf_counter()
-            if chunk["choices"][0].get("text") is None:
+            text = chunk["choices"][0].get("text")
+            if not isinstance(text, str) or text == "":
                 continue
+            now = time.perf_counter()
             if first is None:
                 first = now
-            stamps.append(now)
+            last = now
     end = time.perf_counter()
-    n_out = (usage or {}).get("completion_tokens") or output_len
-    n_in = (usage or {}).get("prompt_tokens") or 0
-    ttft = (first or end) - start
-    tpot = (end - (first or end)) / max(n_out - 1, 1)
+    if not complete or first is None or last is None:
+        raise RuntimeError("incomplete completion stream or no visible output")
+    if not isinstance(usage, dict):
+        raise RuntimeError("completion stream omitted token usage")
+    n_out = usage.get("completion_tokens")
+    n_in = usage.get("prompt_tokens")
+    if type(n_out) is not int or n_out <= 0 or type(n_in) is not int or n_in < 0:
+        raise RuntimeError("completion stream returned invalid token usage")
+    if n_out != output_len:
+        raise RuntimeError(
+            f"completion produced {n_out} tokens, expected {output_len} with ignore_eos"
+        )
+    ttft = first - start
+    # Do not charge a delayed usage/footer frame to the token generation span.
+    tpot = (last - first) / max(n_out - 1, 1)
     return ttft, tpot, end - start, n_out, n_in
 
 
 async def run_level(url, model, prompts, output_len, concurrency):
+    import aiohttp
+
     sem = asyncio.Semaphore(concurrency)
     timeout = aiohttp.ClientTimeout(total=3600)
     results = []
@@ -118,6 +134,7 @@ async def run_level(url, model, prompts, output_len, concurrency):
     in_tokens = sum(r[4] for r in results)
     pct = lambda xs, q: xs[min(len(xs) - 1, int(q * len(xs)))]  # noqa: E731
     return {
+        "metrics_version": 2,
         "concurrency": concurrency,
         "num_prompts": len(prompts),
         "avg_in": round(in_tokens / len(results), 1),
