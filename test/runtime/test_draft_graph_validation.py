@@ -34,11 +34,11 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-from test.runtime.draft_graph_validation import (
+from test.runtime.draft_graph_validation import (  # noqa: E402
     compare_payloads,
     compare_proposals,
     validate_trace_counts,
-)  # noqa: E402
+)
 
 
 def _call(path="graph", *, token=7, gap=1.0, key="same-input"):
