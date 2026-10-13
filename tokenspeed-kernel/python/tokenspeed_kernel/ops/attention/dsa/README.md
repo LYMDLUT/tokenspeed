@@ -228,3 +228,8 @@ Sinkless runtime calls omit the optional `attn_sink` keyword, including
 context-parallel partials and token-parallel row launches. This preserves
 the older kernel-package signature for unrelated models. An actual sink
 is never discarded for compatibility.
+
+The split Triton decode distinguishes zero softmax mass from non-finite mass.
+Only a truly empty partial receives the `+inf` LSE sentinel. A live partial
+containing NaN keeps its NaN LSE and propagates through the merge, rather than
+being silently discarded as if the row had selected no keys.
