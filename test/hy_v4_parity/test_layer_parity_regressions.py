@@ -116,3 +116,119 @@ def test_invalid_comparison_tolerance_is_rejected(tolerance):
             {"output_ids": [1], "logprobs": [0.0]},
             atol=tolerance,
         )
+
+
+# Match the functional residual API: the boundary itself is a parameter holder.
+from types import SimpleNamespace
+
+
+def _pre(residual, fn):
+    return residual.sum(dim=1), torch.ones_like(residual[..., 0]) * fn[0]
+
+
+def _fused(x_prev, residual_prev, post_prev, fn):
+    updated = residual_prev + x_prev[:, None, :] * post_prev[..., None]
+    return updated, updated.sum(dim=1), torch.ones_like(updated[..., 0]) * fn[0]
+
+
+residual_ops = SimpleNamespace(ihc_pre=_pre, ihc_fused_hc=_fused)
+
+
+class _ParameterBoundary(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.hc_fn = torch.nn.Parameter(torch.ones(1))
+
+
+class _Attention(torch.nn.Module):
+    def forward(self, positions, hidden_states):
+        return hidden_states + 1
+
+
+class _Mlp(torch.nn.Module):
+    def forward(self, hidden_states):
+        return hidden_states * 2
+
+
+class _FunctionalLayer(torch.nn.Module):
+    def __init__(self, fused):
+        super().__init__()
+        self.hc_attn_layer = _ParameterBoundary()
+        self.hc_mlp_layer = _ParameterBoundary()
+        self.self_attn = _Attention()
+        self.mlp = _Mlp()
+        self.fused = fused
+
+    def forward(self, hidden_states):
+        residual = hidden_states[:, None, :].expand(-1, 2, -1).clone()
+        x, gates = residual_ops.ihc_pre(residual, self.hc_attn_layer.hc_fn)
+        x = self.self_attn(positions=torch.arange(x.shape[0]), hidden_states=x)
+        if self.fused:
+            residual, x, gates = residual_ops.ihc_fused_hc(
+                x, residual, gates, self.hc_mlp_layer.hc_fn
+            )
+        else:
+            residual = residual + x[:, None, :] * gates[..., None]
+            x, gates = residual_ops.ihc_pre(residual, self.hc_mlp_layer.hc_fn)
+        return self.mlp(x)
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_parameter_boundaries_and_keyword_inputs_are_collected(fused, monkeypatch):
+    from test.hy_v4_parity.hy_v4_parity_hook import LayerDumper
+
+    monkeypatch.setenv("HY_V4_DUMP_ONLY_TOKENS", "4")
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList([_FunctionalLayer(fused)])
+    inputs = torch.ones(4, 3)
+    expected = model.layers[0](inputs)
+    original_pre, original_fused = residual_ops.ihc_pre, residual_ops.ihc_fused_hc
+    dumper = LayerDumper()
+    try:
+        dumper.attach(model, num_layers=1)
+        actual = model.layers[0](inputs)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert len(dumper.records) == 8
+        assert dumper.records["p0_layer0_hc_attn_in"]["shape"] == [4, 2, 3]
+        assert dumper.records["p0_layer0_attn_in"]["sample"][0] == [2.0] * 3
+        assert dumper.records["p0_layer0_hc_mlp_in"]["sample"][0] == [4.0] * 3
+        dumper.validate_complete()
+    finally:
+        dumper.detach()
+    assert (
+        residual_ops.ihc_pre is original_pre
+        and residual_ops.ihc_fused_hc is original_fused
+    )
+    before = copy.deepcopy(dumper.records)
+    model.layers[0](inputs * 7)
+    assert dumper.records == before
+
+
+def test_expected_but_unexecuted_boundary_fails():
+    from test.hy_v4_parity.hy_v4_parity_hook import LayerDumper
+
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList([_FunctionalLayer(False)])
+    dumper = LayerDumper()
+    try:
+        dumper.attach(model, num_layers=1)
+        # Simulate an unexpected execution path which bypasses all iHC calls.
+        model.layers[0].self_attn(
+            positions=torch.zeros(2), hidden_states=torch.ones(2, 3)
+        )
+        with pytest.raises(RuntimeError, match="missing taps"):
+            dumper.validate_complete()
+    finally:
+        dumper.detach()
+
+
+def test_enabled_ihc_cannot_silently_omit_a_boundary():
+    from test.hy_v4_parity.hy_v4_parity_hook import LayerDumper
+
+    model = torch.nn.Module()
+    model.config = SimpleNamespace(enable_ihc=True)
+    layer = _FunctionalLayer(False)
+    layer.hc_mlp_layer = None
+    model.layers = torch.nn.ModuleList([layer])
+    with pytest.raises(ValueError, match="hc_mlp_layer"):
+        LayerDumper().attach(model, num_layers=1)

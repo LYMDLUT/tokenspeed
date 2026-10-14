@@ -20,12 +20,10 @@
 
 """Dump per-layer activations from either engine, then compare them.
 
-The hook is engine-agnostic: it attaches to whatever module tree is handed to it
-and wraps the sub-blocks of each decoder layer whose names it is told to look
-for. TokenSpeed and vLLM name those sub-modules
-``self_attn``/``mlp`` and ``hc_attn_layer``/``hc_mlp_layer`` identically, so one
-implementation covers both and a dump cannot silently come from a different
-place than the other engine's.
+The collector records named computation boundaries. Callable sub-blocks use
+forward hooks; parameter-only iHC containers are mapped to the residual
+operations that actually consume them. Unknown layouts and incomplete
+collections are errors, not evidence that two engines agree.
 
 Why per-layer dumps rather than only end-to-end logits: a full-stack logprob
 comparison tells you *that* something diverged, while the first diverging layer
@@ -36,10 +34,13 @@ separates them.
 
 from __future__ import annotations
 
+import functools
+import inspect
 import json
 import math
 import os
-from collections.abc import Iterable
+import sys
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 import torch
@@ -74,6 +75,9 @@ class LayerDumper:
         self.records: dict[str, dict] = {}
         self._handles: list[torch.utils.hooks.RemovableHandle] = []
         self._pass_index = 0
+        self.enabled = True
+        self._restorers: list[Callable[[], None]] = []
+        self._expected_taps: set[tuple[int, str, str]] = set()
 
     # -- attachment --------------------------------------------------------
     def attach(
@@ -93,19 +97,97 @@ class LayerDumper:
             layer_container: Attribute holding the layer list; the MTP draft puts
                 its single block at ``model.decoder``, hence the override.
         """
-        layers = self._resolve_layers(root, layer_container)
+        layers = list(self._resolve_layers(root, layer_container))
+        if not 0 < num_layers <= len(layers):
+            raise ValueError("requested layer count is not present in the model")
         self.detach()
-        for layer_id, layer in enumerate(list(layers)[:num_layers]):
-            for attribute, stage in taps:
-                target = layer
-                for part in attribute.split("."):
-                    target = getattr(target, part, None)
+        self.records.clear()
+        self._expected_taps.clear()
+        taps = tuple(taps)
+        functional = {}
+        try:
+            for layer_id, layer in enumerate(layers[:num_layers]):
+                for attribute, stage in taps:
+                    target = layer
+                    for part in attribute.split("."):
+                        target = getattr(target, part, None)
+                        if target is None:
+                            break
                     if target is None:
-                        break
-                if target is None:
-                    # iHC boundaries are absent when the model runs without them.
-                    continue
-                self._wrap(target, layer_id, stage)
+                        if stage.startswith("hc_") and not getattr(
+                            getattr(root, "config", None), "enable_ihc", False
+                        ):
+                            continue
+                        raise ValueError(
+                            f"layer {layer_id} has no {attribute} boundary"
+                        )
+                    self._expected_taps.update(
+                        (layer_id, stage, side) for side in ("in", "out")
+                    )
+                    if type(target).forward is torch.nn.Module.forward:
+                        # HY's iHC objects hold parameters; their forward is never called.
+                        module = sys.modules[type(layer).__module__]
+                        ops = getattr(module, "residual_ops", None)
+                        if not stage.startswith("hc_") or ops is None:
+                            raise ValueError(
+                                f"unsupported functional boundary: {attribute}"
+                            )
+                        _, targets = functional.setdefault(id(ops), (ops, []))
+                        targets.append((target, layer_id, stage))
+                    else:
+                        self._wrap(target, layer_id, stage)
+            for ops, targets in functional.values():
+                self._wrap_ihc_operation(ops, "ihc_pre", targets)
+                if callable(getattr(ops, "ihc_fused_hc", None)):
+                    self._wrap_ihc_operation(ops, "ihc_fused_hc", targets)
+        except Exception:
+            self.detach()
+            raise
+
+    def expected_keys(self) -> set[str]:
+        return {
+            f"p{self._pass_index}_layer{layer}_{stage}_{side}"
+            for layer, stage, side in self._expected_taps
+        }
+
+    def validate_complete(self) -> None:
+        expected = self.expected_keys()
+        missing = expected - self.records.keys()
+        if not expected or missing:
+            raise RuntimeError(
+                f"incomplete layer collection; missing taps: {sorted(missing)}"
+            )
+
+    def _wrap_ihc_operation(self, ops, name, targets) -> None:
+        original = getattr(ops, name)
+        signature = inspect.signature(original)
+
+        @functools.wraps(original)
+        def traced(*args, **kwargs):
+            bound = signature.bind(*args, **kwargs).arguments
+            target = next(
+                (
+                    (layer, stage)
+                    for boundary, layer, stage in targets
+                    if bound["fn"] is boundary.hc_fn
+                ),
+                None,
+            )
+            if target is not None and name == "ihc_pre":
+                self._record(*target, "in", bound["residual"])
+            output = original(*args, **kwargs)
+            if target is not None:
+                if name == "ihc_fused_hc":
+                    # Observe the updated channels the fused operation returns;
+                    # never split or recompute its post/pre operations to dump.
+                    self._record(*target, "in", output[0])
+                    self._record(*target, "out", output[1])
+                else:
+                    self._record(*target, "out", output[0])
+            return output
+
+        setattr(ops, name, traced)
+        self._restorers.append(lambda: setattr(ops, name, original))
 
     @staticmethod
     def _resolve_layers(root: torch.nn.Module, container: str) -> torch.nn.ModuleList:
@@ -115,23 +197,42 @@ class LayerDumper:
         return node
 
     def _wrap(self, module: torch.nn.Module, layer_id: int, stage: str) -> None:
-        def pre_hook(_module, args, layer_id=layer_id, stage=stage):
-            if args:
-                self._record(layer_id, stage, "in", args[0])
+        signature = inspect.signature(module.forward)
+        input_name = next(
+            (
+                name
+                for name in ("hidden_states", "residual", "x", "input")
+                if name in signature.parameters
+            ),
+            None,
+        )
+        if input_name is None:
+            raise ValueError(f"no known activation argument for {stage}: {signature}")
 
-        def post_hook(_module, _args, output, layer_id=layer_id, stage=stage):
+        def pre_hook(_module, args, kwargs):
+            value = signature.bind(*args, **kwargs).arguments[input_name]
+            self._record(layer_id, stage, "in", value)
+
+        def post_hook(_module, _args, output):
             self._record(layer_id, stage, "out", output)
 
-        self._handles.append(module.register_forward_pre_hook(pre_hook))
+        self._handles.append(
+            module.register_forward_pre_hook(pre_hook, with_kwargs=True)
+        )
         self._handles.append(module.register_forward_hook(post_hook))
 
     def detach(self) -> None:
         for handle in self._handles:
             handle.remove()
         self._handles.clear()
+        for restore in reversed(self._restorers):
+            restore()
+        self._restorers.clear()
 
     # -- recording ---------------------------------------------------------
     def _record(self, layer_id: int, stage: str, position: str, value) -> None:
+        if not self.enabled:
+            return
         if isinstance(value, (tuple, list)):
             if not value:
                 return
@@ -143,7 +244,10 @@ class LayerDumper:
         # Engines also run warmup / autotune / graph-capture forwards on dummy
         # batches; keep only the real prompt prefill when its length is known.
         only_tokens = int(os.environ.get("HY_V4_DUMP_ONLY_TOKENS", "0") or 0)
-        if only_tokens and tensor.reshape(-1, tensor.shape[-1]).shape[0] != only_tokens:
+        token_shape = tensor.shape[:-1]
+        if stage.startswith("hc_") and position == "in" and tensor.ndim >= 3:
+            token_shape = tensor.shape[:-2]
+        if only_tokens and math.prod(token_shape) != only_tokens:
             return
         if only_tokens and key in self.records:
             return
