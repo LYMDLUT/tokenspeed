@@ -232,3 +232,140 @@ def test_enabled_ihc_cannot_silently_omit_a_boundary():
     model.layers = torch.nn.ModuleList([layer])
     with pytest.raises(ValueError, match="hc_mlp_layer"):
         LayerDumper().attach(model, num_layers=1)
+
+
+def test_old_dump_cannot_satisfy_a_run_that_produced_nothing(tmp_path, monkeypatch):
+    import subprocess
+    import sys
+    from test.hy_v4_parity import hy_v4_parity as parity
+
+    stale = tmp_path / "tokenspeed.dump.json"
+    stale.write_text(json.dumps({"old_tap": _record()}))
+    (tmp_path / "tokenspeed.summary.json").write_text(
+        json.dumps({"output_ids": [3], "logprobs": [-0.1]})
+    )
+    monkeypatch.setattr(
+        parity.subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(command, 0),
+    )
+    with pytest.raises(SystemExit, match="no layer dump"):
+        parity._run_engine(
+            python=sys.executable,
+            engine="tokenspeed",
+            model_path=tmp_path,
+            workdir=tmp_path,
+            num_layers=1,
+            extra=[],
+        )
+    assert json.loads(stale.read_text()) == {"old_tap": _record()}
+
+
+def test_spawned_worker_persists_exact_prompt_before_hard_exit(tmp_path, monkeypatch):
+    import os
+    import subprocess
+    import sys
+    from test.hy_v4_parity import hy_v4_parity as parity
+
+    fixture = tmp_path / "parity_spawn_fixture.py"
+    fixture.write_text("""import json
+import multiprocessing as mp
+import os
+from pathlib import Path
+from types import SimpleNamespace
+import torch
+from test.hy_v4_parity.test_layer_parity_regressions import _FunctionalLayer
+from test.hy_v4_parity.run_engine_dump import PROMPT_IDS
+
+class FixtureModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(model_type="hy_v4", num_hidden_layers=1, enable_ihc=True)
+        self.layers = torch.nn.ModuleList([_FunctionalLayer(True)])
+    def forward(self, input_ids):
+        return self.layers[0](input_ids.float()[:, None].expand(-1, 3))
+
+def worker():
+    model = FixtureModel()
+    # Same length as the prompt, but different ids: this must not be collected.
+    model.forward(torch.zeros(len(PROMPT_IDS), dtype=torch.int64))
+    model.forward(torch.tensor(PROMPT_IDS))
+    # A later decode must not overwrite the selected prefill.
+    model.forward(torch.tensor([7]))
+    os._exit(0)
+
+def launch(dump_path, summary_path, run_id):
+    process = mp.get_context("spawn").Process(target=worker)
+    process.start()
+    process.join(60)
+    if process.is_alive():
+        process.terminate()
+        process.join()
+        raise RuntimeError("test worker timed out")
+    if process.exitcode != 0:
+        raise RuntimeError(f"test worker failed: {process.exitcode}")
+    from test.hy_v4_parity.hy_v4_dump import finish_collected_dump
+    finish_collected_dump(Path(dump_path), run_id=run_id, prompt_ids=PROMPT_IDS, num_layers=1)
+    Path(summary_path).write_text(json.dumps({"output_ids":[3,4], "logprobs":[-.1,-.2], "run_id":run_id}))
+""")
+    monkeypatch.setenv("HY_V4_DUMP_TARGETS", "parity_spawn_fixture:FixtureModel")
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path))
+    real_run = subprocess.run
+    environments = []
+
+    def run_fixture(command, **kwargs):
+        environments.append(kwargs["env"])
+        dump = command[command.index("--dump-path") + 1]
+        summary = command[command.index("--summary-path") + 1]
+        run_id = command[command.index("--run-id") + 1]
+        program = f"from parity_spawn_fixture import launch; launch({dump!r}, {summary!r}, {run_id!r})"
+        return real_run([sys.executable, "-c", program], timeout=90, **kwargs)
+
+    monkeypatch.setattr(parity.subprocess, "run", run_fixture)
+    summary, dump_path = parity._run_engine(
+        python=sys.executable,
+        engine="tokenspeed",
+        model_path=tmp_path,
+        workdir=tmp_path,
+        num_layers=1,
+        extra=[],
+    )
+    records = json.loads(dump_path.read_text())
+    metadata = json.loads(
+        dump_path.with_suffix(dump_path.suffix + ".meta.json").read_text()
+    )
+    assert len(records) == 8
+    assert metadata["pid"] != os.getpid()
+    assert metadata["complete"] is True
+    assert metadata["run_id"] == summary["run_id"]
+    assert records["p0_layer0_hc_attn_in"]["sample"][0] == [15496.0] * 3
+    assert str(tmp_path) in environments[0]["PYTHONPATH"].split(os.pathsep)
+
+
+@pytest.mark.parametrize("corruption", ["run", "prompt", "missing", "duplicate"])
+def test_worker_artifact_mismatch_is_rejected(tmp_path, corruption):
+    from test.hy_v4_parity.hy_v4_dump import finish_collected_dump
+
+    target = tmp_path / "dump.json"
+    worker = tmp_path / "dump.worker-42.json"
+    key = "p0_layer0_attn_in"
+    records = {key: _record()}
+    metadata = {
+        "run_id": "current",
+        "prompt_ids": [3],
+        "expected_keys": [key],
+        "complete": True,
+    }
+    if corruption == "run":
+        metadata["run_id"] = "previous"
+    elif corruption == "prompt":
+        metadata["prompt_ids"] = [4]
+    elif corruption == "missing":
+        records = {}
+    else:
+        (tmp_path / "dump.worker-43.json").write_text("{}")
+    worker.write_text(json.dumps(records))
+    worker.with_suffix(worker.suffix + ".meta.json").write_text(json.dumps(metadata))
+    with pytest.raises(RuntimeError):
+        finish_collected_dump(target, run_id="current", prompt_ids=[3], num_layers=1)
+    assert not target.exists()

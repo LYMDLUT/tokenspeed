@@ -35,7 +35,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
+import uuid
 from pathlib import Path
 
 # The prompt is fixed so both engines see identical tokens; the values are
@@ -76,12 +78,40 @@ PROMPT_IDS = [
 DECODE_STEPS = int(os.environ.get("HY_V4_DECODE_STEPS", "4"))
 
 
+def worker_environment(
+    *, dump_path: Path, run_id: str, num_layers: int, engine: str, reference_repo: str
+) -> dict[str, str]:
+    """Arm collection in this interpreter and every spawned model worker."""
+    dump_path = dump_path.resolve()
+    injection = dump_path.parent / "inject"
+    injection.mkdir(parents=True, exist_ok=True)
+    source = Path(__file__).with_name("hy_v4_dump_sitecustomize.py")
+    shutil.copyfile(source, injection / "sitecustomize.py")
+    paths = [str(injection), str(Path(__file__).resolve().parents[2])]
+    if reference_repo:
+        paths.append(str(Path(reference_repo).resolve()))
+    paths.extend(p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p)
+    env = dict(os.environ)
+    env.update(
+        PYTHONPATH=os.pathsep.join(dict.fromkeys(paths)),
+        HY_V4_DUMP_PATH=str(dump_path),
+        HY_V4_DUMP_RUN_ID=run_id,
+        HY_V4_DUMP_LAYERS=str(num_layers),
+        HY_V4_DUMP_PROMPT_IDS=json.dumps(PROMPT_IDS),
+        HY_V4_DUMP_ENGINE="vllm" if engine == "reference" else "tokenspeed",
+    )
+    # The exact input selects the forward; inherited size-only filters or
+    # incremental shared-file output must not override this run's collection.
+    env.pop("HY_V4_DUMP_ONLY_TOKENS", None)
+    env.pop("HY_V4_DUMP_EAGER_PATH", None)
+    return env
+
+
 def run_tokenspeed(args, dump_path: Path) -> dict:
     """Boot TokenSpeed's engine and dump the truncated model.
 
-    Instrumentation wraps the model class inside whichever process constructs it
-    (engine workers are separate processes), so the patch is installed here and
-    fires there.
+    The launcher installs sitecustomize for spawned workers; this call also
+    arms model construction in the current interpreter.
     """
     from test.hy_v4_parity.hy_v4_dump import instrument_hy_v4_classes
 
@@ -211,6 +241,9 @@ def main() -> int:
     parser.add_argument("--model-path", required=True, help="Truncated checkpoint.")
     parser.add_argument("--dump-path", required=True, help="Layer dump output.")
     parser.add_argument("--summary-path", required=True, help="Run summary output.")
+    parser.add_argument(
+        "--run-id", default=None, help="Identity shared by this run's worker evidence."
+    )
     parser.add_argument("--num-layers", type=int, default=3)
     parser.add_argument("--max-model-len", type=int, default=2048)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.4)
@@ -243,12 +276,35 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    dump_path = Path(args.dump_path)
-    summary_path = Path(args.summary_path)
+    dump_path = Path(args.dump_path).resolve()
+    summary_path = Path(args.summary_path).resolve()
+    if dump_path.exists() or summary_path.exists():
+        raise FileExistsError("use fresh dump and summary paths for each engine run")
+    run_id = args.run_id or uuid.uuid4().hex
+    env = worker_environment(
+        dump_path=dump_path,
+        run_id=run_id,
+        num_layers=args.num_layers,
+        engine=args.engine,
+        reference_repo=args.reference_repo if args.engine == "reference" else "",
+    )
+    os.environ.pop("HY_V4_DUMP_ONLY_TOKENS", None)
+    os.environ.pop("HY_V4_DUMP_EAGER_PATH", None)
+    os.environ.update(env)
+    # spawn imports sitecustomize before restoring the parent's sys.path;
+    # keep the paths on both sides, and arm the current process below too.
+    sys.path[:0] = [p for p in env["PYTHONPATH"].split(os.pathsep) if p not in sys.path]
     if args.engine == "tokenspeed":
         summary = run_tokenspeed(args, dump_path)
     else:
         summary = run_reference(args, dump_path)
+    from test.hy_v4_parity.hy_v4_dump import finish_collected_dump
+
+    finish_collected_dump(
+        dump_path, run_id=run_id, prompt_ids=PROMPT_IDS, num_layers=args.num_layers
+    )
+    summary["run_id"] = run_id
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
     write_summary(summary_path, summary)
     print(f"[{args.engine}] output_ids={summary['output_ids']}")
     return 0

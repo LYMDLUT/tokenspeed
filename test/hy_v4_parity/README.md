@@ -69,14 +69,24 @@ PYTHONPATH=/tmp/hy4inject:$PYTHONPATH \
   ./your_normal_launch.sh
 ```
 
-Every engine subprocess attaches a dumper as soon as its HY V4 model is
-constructed (a patch in the parent process cannot reach spawned workers) and
-writes the dump at interpreter exit. The instrumentation is inert unless
-`HY_V4_DUMP_PATH` is set.
+The launcher installs this injection for the parent and spawned workers,
+preserving additional `PYTHONPATH` entries. Each worker writes
+`<stem>.worker-<pid>.json` and a completion sidecar before its selected forward
+returns; it does not rely on interpreter exit. Direct `.forward()` calls are
+covered too. `HY_V4_DUMP_PROMPT_IDS` selects exact token ids rather than a
+warmup batch of the same length. Without that filter, live-server dumps are
+diagnostic snapshots of the latest complete forward.
+
+Every harness invocation creates a fresh engine-run directory. The default
+single-GPU check requires exactly one complete worker dump, the requested
+layers and input, and a summary with the same run identity. Missing evidence
+cannot reuse an older dump, and multiple worker dumps are not silently merged.
+The instrumentation is inert unless `HY_V4_DUMP_PATH` is set.
 
 | Variable | Meaning |
 | --- | --- |
-| `HY_V4_DUMP_PATH` | Dump destination. Unset means disabled. |
+| `HY_V4_DUMP_PATH` | Base dump name; each worker appends its pid. Unset means disabled. |
+| `HY_V4_DUMP_PROMPT_IDS` | JSON token-id list selecting one exact prefill; the harness sets it. |
 | `HY_V4_DUMP_LAYERS` | Layers to tap; default is all in the config. |
 | `HY_V4_DUMP_TAG` | Free-form label written to `<path>.meta.json`. |
 | `HY_V4_DUMP_TARGETS` | Extra `module:class` targets, for a reference checkout laid out differently. |

@@ -23,8 +23,8 @@
 Copy this file onto ``PYTHONPATH`` (keeping the name ``sitecustomize.py``) and
 set ``HY_V4_DUMP_PATH``. Every interpreter that starts afterwards -- including
 engine worker subprocesses, which a patch in the parent cannot reach -- attaches
-a layer dumper as soon as a HY V4 model finishes loading, and writes the dump on
-interpreter exit.
+a layer dumper as soon as a HY V4 model finishes loading. A complete selected
+forward is written before it returns, even when shutdown bypasses atexit.
 
     HY_V4_DUMP_PATH=/tmp/ts.json PYTHONPATH=/path/to/inject ./run_tokenspeed.sh
 

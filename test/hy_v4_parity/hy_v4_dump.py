@@ -40,6 +40,8 @@ the first sub-block that produced it: an iHC boundary bug shows up at
 
 from __future__ import annotations
 
+import functools
+import inspect
 import json
 import os
 from collections.abc import Iterable
@@ -148,7 +150,12 @@ def instrument_hy_v4_classes(
     """
     target = Path(path) if path else dump_path()
     label = tags if tags is not None else [f"tag={os.environ.get(DUMP_TAG_ENV, '')}"]
-    names = [f"{module_name}:{class_name}" for _, module_name, class_name in _TARGETS]
+    engine = os.environ.get("HY_V4_DUMP_ENGINE")
+    names = [
+        f"{module_name}:{class_name}"
+        for label, module_name, class_name in _TARGETS
+        if engine is None or label == engine
+    ]
     names.extend(extra_targets or [])
     from_env = os.environ.get(TARGETS_ENV, "")
     names.extend(part for part in from_env.split(",") if part.strip())
@@ -189,68 +196,115 @@ def _patch_model_class(
         targets actually took effect.
     """
     original_init = model_class.__init__
-    state: dict = {"session": None, "dumper": None}
+    original_forward = model_class.forward
+    signature = inspect.signature(original_forward)
+    target = target.with_name(f"{target.stem}.worker-{os.getpid()}{target.suffix}")
+    prompt = json.loads(os.environ.get("HY_V4_DUMP_PROMPT_IDS", "null"))
+    state = {
+        "dumper": None,
+        "model": None,
+        "complete": False,
+        "tags": tags,
+        "prompt_ids": None,
+    }
 
-    import functools
-
-    # ``wraps`` keeps ``__wrapped__`` so ``inspect.signature`` still reports the
-    # original keyword-only ``vllm_config``; vLLM picks its constructor calling
-    # convention from that signature.
     @functools.wraps(original_init)
     def patched_init(self, *args, **kwargs) -> None:
         original_init(self, *args, **kwargs)
         if state["dumper"] is not None:
-            # Only the first constructed model (the target) is dumped; a draft
-            # model would otherwise overwrite the target's taps.
             return
         dumper = attach_to_model(self, num_layers=num_layers)
-        if dumper is None:
-            return
-        session = ModelDumpSession(dumper)
-        session._dump_path = target  # noqa: SLF001
-        session._tags = tags  # noqa: SLF001
-        session._dumper = dumper  # noqa: SLF001
-        state["dumper"] = dumper
-        state["session"] = session
-        print(
-            f"[hy_v4_dump] attached to {type(self).__name__} "
-            f"({len(dumper.records)} taps so far)",
-            file=__import__("sys").stderr,
-        )
+        if dumper is not None:
+            dumper.enabled = False
+            state["dumper"], state["model"] = dumper, self
+
+    @functools.wraps(original_forward)
+    def traced_forward(self, *args, **kwargs):
+        dumper = state["dumper"]
+        if dumper is None or self is not state["model"]:
+            return original_forward(self, *args, **kwargs)
+        bound = signature.bind(self, *args, **kwargs).arguments
+        ids = bound.get("input_ids")
+        observed = None
+        if torch.is_tensor(ids) and (prompt is None or ids.numel() == len(prompt)):
+            observed = ids.detach().reshape(-1).cpu().tolist()
+        selected = observed is not None and (prompt is None or observed == prompt)
+        dumper.enabled = selected and not (prompt is not None and state["complete"])
+        if dumper.enabled:
+            dumper.records.clear()
+            state["prompt_ids"] = observed
+        try:
+            output = original_forward(self, *args, **kwargs)
+            if dumper.enabled:
+                # Workers may exit via os._exit or be terminated by shutdown.
+                # Persist the complete selected forward before returning.
+                _flush(state, target)
+                state["complete"] = True
+            return output
+        finally:
+            dumper.enabled = False
 
     model_class.__init__ = patched_init
+    model_class.forward = traced_forward
     model_class._hy_v4_dump_patched = True  # type: ignore[attr-defined]
-
-    import atexit
-
-    atexit.register(lambda: _flush(state, target))
     return [model_class.__name__]
 
 
 def _flush(state: dict, target: Path) -> None:
-    """Write the recorded dump (plus its tags) at interpreter exit.
-
-    Silent when nothing was attached, so an interpreter that merely imported the
-    instrumentation does not leave a misleading empty file behind.
-    """
-    import sys
-
-    dumper = state.get("dumper")
-    if dumper is None or not dumper.records:
-        return
-    try:
-        dumper.save(target)
-        session = state.get("session")
-        tags = getattr(session, "_tags", None) if session is not None else None
-        if tags:
-            sidecar = target.with_suffix(target.suffix + ".meta.json")
-            sidecar.write_text(json.dumps({"tags": tags}, indent=2))
-        print(
-            f"[hy_v4_dump] wrote {target} ({len(dumper.records)} taps)",
-            file=sys.stderr,
+    dumper = state["dumper"]
+    dumper.validate_complete()
+    dumper.save(target)
+    target.with_suffix(target.suffix + ".meta.json").write_text(
+        json.dumps(
+            {
+                "run_id": os.environ.get("HY_V4_DUMP_RUN_ID"),
+                "pid": os.getpid(),
+                "prompt_ids": state["prompt_ids"],
+                "expected_keys": sorted(dumper.expected_keys()),
+                "tags": state["tags"],
+                "complete": True,
+            },
+            indent=2,
         )
-    except Exception as error:  # pragma: no cover - diagnostics only
-        print(f"[hy_v4_dump] dump failed: {error}", file=sys.stderr)
+    )
+
+
+def finish_collected_dump(
+    target: Path, *, run_id: str, prompt_ids: list[int], num_layers: int
+) -> None:
+    """Accept exactly one complete worker collection from this single-GPU run."""
+    workers = [
+        p
+        for p in target.parent.glob(f"{target.stem}.worker-*{target.suffix}")
+        if not p.name.endswith(".meta.json")
+    ]
+    if len(workers) != 1:
+        raise RuntimeError(
+            f"expected one worker layer dump, found {len(workers)} in {target.parent}"
+        )
+    worker = workers[0]
+    metadata = json.loads(worker.with_suffix(worker.suffix + ".meta.json").read_text())
+    records = json.loads(worker.read_text())
+    expected = set(metadata["expected_keys"])
+    layers = {key.split("_", 2)[1] for key in expected}
+    if (
+        metadata.get("run_id") != run_id
+        or metadata.get("complete") is not True
+        or metadata.get("prompt_ids") != prompt_ids
+        or not expected
+        or layers != {f"layer{i}" for i in range(num_layers)}
+        or set(records) != expected
+    ):
+        raise RuntimeError(
+            "worker dump is incomplete or belongs to a different run/input"
+        )
+    report = first_divergence(records, records, atol=0, rtol=0)
+    if any(entry["status"] != "ok" for entry in report):
+        raise RuntimeError(f"invalid worker evidence: {format_report(report)}")
+    target.write_bytes(worker.read_bytes())
+    target.with_suffix(target.suffix + ".meta.json").write_text(
+        json.dumps(metadata, indent=2)
+    )
 
 
 def dump_layers(
