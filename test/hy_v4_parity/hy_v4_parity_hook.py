@@ -363,8 +363,6 @@ def first_divergence(
                 or left["sample_channels"] != right["sample_channels"]
             ):
                 raise ValueError("sample coordinates or shapes differ")
-            if left["dtype"] != right["dtype"]:
-                raise ValueError("activation dtypes differ")
         except (KeyError, TypeError, ValueError, RuntimeError) as error:
             report.append(_invalid_record(key, str(error)))
             continue

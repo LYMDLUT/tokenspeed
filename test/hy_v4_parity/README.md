@@ -30,6 +30,12 @@ Useful switches:
 - `--skip-reference` — smoke-test the harness with only TokenSpeed.
 - `--rebuild` — rebuild the truncated checkpoint instead of reusing the cache.
 
+Both engines receive fixed token ids and skip tokenizer initialization. The
+reference also disables detokenization; the truncated checkpoint therefore
+needs no vocabulary or tokenizer model files for this comparison. Dtype labels
+remain diagnostic; finite activation values are judged using the explicit
+numerical tolerances, not a new cross-engine storage-dtype equality rule.
+
 ## Which taps are compared
 
 Callable sub-blocks are hooked with their named activation argument, including

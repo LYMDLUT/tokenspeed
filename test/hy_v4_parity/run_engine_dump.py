@@ -197,7 +197,6 @@ def run_reference(args, dump_path: Path) -> dict:
 
     llm = LLM(
         model=args.model_path,
-        tokenizer=args.model_path,
         enforce_eager=True,
         # Sink-capable sparse MLA is the backend the reference binds for HY V4.
         attention_backend=args.reference_attention_backend,
@@ -205,12 +204,14 @@ def run_reference(args, dump_path: Path) -> dict:
         gpu_memory_utilization=args.gpu_memory_utilization,
         dtype="bfloat16",
         disable_log_stats=True,
-        # The truncated checkpoint carries no tokenizer of its own.
-        skip_tokenizer_init=False,
+        # Both engines receive token ids; the truncated export has no tokenizer.
+        skip_tokenizer_init=True,
     )
     outputs = llm.generate(
         [{"prompt_token_ids": PROMPT_IDS}],
-        SamplingParams(temperature=0.0, max_tokens=DECODE_STEPS, logprobs=1),
+        SamplingParams(
+            temperature=0.0, max_tokens=DECODE_STEPS, logprobs=1, detokenize=False
+        ),
     )
 
     completion = outputs[0].outputs[0]

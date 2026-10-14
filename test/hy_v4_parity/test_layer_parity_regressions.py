@@ -406,3 +406,55 @@ def test_hc_output_is_measured_after_a_separate_norm():
             )
     finally:
         dumper.detach()
+
+
+def test_reference_uses_token_ids_without_loading_a_tokenizer(tmp_path, monkeypatch):
+    import sys
+    import types
+    from test.hy_v4_parity import hy_v4_dump, run_engine_dump
+
+    class TokenOnlyLLM:
+        def __init__(self, **kwargs):
+            assert kwargs["skip_tokenizer_init"] is True
+            assert not kwargs.get("tokenizer")
+
+        def generate(self, prompts, sampling):
+            assert prompts == [{"prompt_token_ids": run_engine_dump.PROMPT_IDS}]
+            assert sampling.detokenize is False
+            result = SimpleNamespace(
+                token_ids=[3, 4],
+                logprobs=[
+                    {3: SimpleNamespace(logprob=-0.1)},
+                    {4: SimpleNamespace(logprob=-0.2)},
+                ],
+            )
+            return [SimpleNamespace(outputs=[result])]
+
+    module = types.ModuleType("vllm")
+    module.LLM = TokenOnlyLLM
+    module.SamplingParams = lambda **kwargs: SimpleNamespace(**kwargs)
+    monkeypatch.setitem(sys.modules, "vllm", module)
+    monkeypatch.setattr(sys, "path", sys.path.copy())
+    monkeypatch.setattr(
+        hy_v4_dump, "instrument_hy_v4_classes", lambda **kwargs: ["fixture"]
+    )
+    args = SimpleNamespace(
+        reference_repo=str(tmp_path),
+        model_path=str(tmp_path),
+        num_layers=1,
+        reference_attention_backend="FLASHMLA_SPARSE",
+        max_model_len=128,
+        gpu_memory_utilization=0.4,
+    )
+    result = run_engine_dump.run_reference(args, tmp_path / "dump.json")
+    assert result == {"output_ids": [3, 4], "logprobs": [-0.1, -0.2]}
+
+
+def test_numeric_tolerance_does_not_require_identical_storage_dtypes():
+    reference = {"tap": _record()}
+    candidate = copy.deepcopy(reference)
+    candidate["tap"]["dtype"] = "bfloat16"
+    assert (
+        worst_status(first_divergence(reference, candidate, atol=0.01, rtol=0.01))[0]
+        == "ok"
+    )
