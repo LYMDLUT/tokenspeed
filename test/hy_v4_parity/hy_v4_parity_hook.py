@@ -181,9 +181,6 @@ class LayerDumper:
                     # Observe the updated channels the fused operation returns;
                     # never split or recompute its post/pre operations to dump.
                     self._record(*target, "in", output[0])
-                    self._record(*target, "out", output[1])
-                else:
-                    self._record(*target, "out", output[0])
             return output
 
         setattr(ops, name, traced)
@@ -212,9 +209,15 @@ class LayerDumper:
         def pre_hook(_module, args, kwargs):
             value = signature.bind(*args, **kwargs).arguments[input_name]
             self._record(layer_id, stage, "in", value)
+            # Engines may fuse RMSNorm into iHC or run it separately. The
+            # comparable iHC output is the actual input to its consumer.
+            boundary = (layer_id, f"hc_{stage}", "out")
+            if boundary in self._expected_taps:
+                self._record(*boundary, value)
 
         def post_hook(_module, _args, output):
-            self._record(layer_id, stage, "out", output)
+            if not stage.startswith("hc_"):
+                self._record(layer_id, stage, "out", output)
 
         self._handles.append(
             module.register_forward_pre_hook(pre_hook, with_kwargs=True)

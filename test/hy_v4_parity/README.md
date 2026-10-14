@@ -36,8 +36,11 @@ Callable sub-blocks are hooked with their named activation argument, including
 keyword-only calls. Parameter-only iHC boundaries are observed at the actual
 `ihc_pre`/`ihc_fused_hc` operation, without replacing the fused calculation.
 For the fused operation, the recorded input is its returned, updated residual
-channels, the input of the next pre boundary. Missing expected taps fail at
-collection completion. iHC token counts exclude the residual-channel axis.
+channels, the input of the next pre boundary. Both engines record the iHC
+output at the following attention/MLP input, after RMSNorm whether it is fused
+or separate. Raw pre-normalization output is not compared with normalized
+input. Missing expected taps fail at collection completion. iHC token counts
+exclude the residual-channel axis.
 
 Per decoder layer, in execution order: `hc_attn`, `attn`, `hc_mlp`, `mlp`, each
 as input and output. That ordering matters when diagnosing:

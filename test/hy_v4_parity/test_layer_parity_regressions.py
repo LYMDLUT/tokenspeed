@@ -369,3 +369,40 @@ def test_worker_artifact_mismatch_is_rejected(tmp_path, corruption):
     with pytest.raises(RuntimeError):
         finish_collected_dump(target, run_id="current", prompt_ids=[3], num_layers=1)
     assert not target.exists()
+
+
+def test_hc_output_is_measured_after_a_separate_norm():
+    from test.hy_v4_parity.hy_v4_parity_hook import LayerDumper
+
+    class SeparateNormLayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.hc_attn_layer = _Mlp()
+            self.hc_mlp_layer = _Mlp()
+            self.self_attn = _Attention()
+            self.mlp = _Mlp()
+
+        def forward(self, hidden_states):
+            x = self.hc_attn_layer(hidden_states)
+            x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + 1e-5)
+            x = self.self_attn(positions=torch.arange(x.shape[0]), hidden_states=x)
+            x = self.hc_mlp_layer(x)
+            x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + 1e-5)
+            return self.mlp(x)
+
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList([SeparateNormLayer()])
+    x = torch.tensor([[1.0, 2.0, 4.0], [3.0, 1.0, 2.0]])
+    expected = model.layers[0](x)
+    dumper = LayerDumper()
+    try:
+        dumper.attach(model, num_layers=1)
+        torch.testing.assert_close(model.layers[0](x), expected, rtol=0, atol=0)
+        dumper.validate_complete()
+        for stage in ("attn", "mlp"):
+            assert (
+                dumper.records[f"p0_layer0_hc_{stage}_out"]
+                == dumper.records[f"p0_layer0_{stage}_in"]
+            )
+    finally:
+        dumper.detach()
