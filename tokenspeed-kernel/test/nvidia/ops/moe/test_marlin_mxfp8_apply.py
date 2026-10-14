@@ -369,6 +369,108 @@ def test_dense_prefill_path_matches_reference(
     _assert_close(dense, marlin)
 
 
+def test_prepared_dense_apply_preserves_dequant_launch(monkeypatch):
+    """CPU launch spy: prepared storage is reused, with the same half-swap order."""
+    num_experts, hidden, ispp = 2, 256, 128
+    w = SimpleNamespace(
+        w13_weight=torch.empty(num_experts, hidden // 16, 8 * ispp, dtype=torch.int32),
+        w13_weight_scale_inv=torch.empty(
+            num_experts, hidden // BLOCK, 2 * ispp, dtype=torch.float8_e8m0fnu
+        ),
+        w2_weight=torch.empty(num_experts, ispp // 16, 4 * hidden, dtype=torch.int32),
+        w2_weight_scale_inv=torch.empty(
+            num_experts, ispp // BLOCK, hidden, dtype=torch.float8_e8m0fnu
+        ),
+        ep_size=1,
+        ep_rank=0,
+        tp_size=1,
+        tp_rank=0,
+    )
+    state = mxfp8._MarlinMxfp8State(
+        expert_start=0,
+        hidden_size=hidden,
+        ispp=ispp,
+        cutlass_swiglu_limit=None,
+        dense_prefill=True,
+    )
+    x = torch.ones(3, hidden, dtype=torch.bfloat16)
+    ids = torch.zeros(3, 1, dtype=torch.int32)
+    weights = torch.ones(3, 1)
+    calls = []
+    # Do not keep a CPU allocation in the module's serving scratch cache.
+    monkeypatch.setattr(mxfp8, "_DENSE_SCRATCH", {})
+
+    def forbidden_validation(*args):
+        pytest.fail("prepared dense apply repeated fixed-storage validation")
+
+    class DequantLaunch:
+        def __getitem__(self, grid):
+            def launch(qweight, scales, out, **kwargs):
+                calls.append((grid, qweight.data_ptr(), out, kwargs))
+                out.fill_(2 if kwargs["ROW_SHIFT"] else 3)
+
+            return launch
+
+    def cutlass(plan, inputs, w13, w2, route_weights, route_ids, **kwargs):
+        assert torch.all(w13 == 2) and torch.all(w2 == 3)
+        assert route_weights is weights and route_ids is ids
+        return inputs + 1
+
+    monkeypatch.setattr(mxfp8, "_validate_dequant_storage", forbidden_validation)
+    monkeypatch.setattr(mxfp8, "_marlin_mxfp8_to_bf16_kernel", DequantLaunch())
+    monkeypatch.setattr(mxfp8, "cutlass_unquant_fused_moe", cutlass)
+    for _ in range(2):
+        actual = mxfp8._dense_bf16_apply({}, x, w, state, weights, ids)
+        torch.testing.assert_close(actual, x + 1, rtol=0, atol=0)
+    assert [call[3]["ROW_SHIFT"] for call in calls] == [ispp, 0, ispp, 0]
+    assert [call[1] for call in calls] == [
+        w.w13_weight.data_ptr(),
+        w.w2_weight.data_ptr(),
+    ] * 2
+    assert calls[0][2] is calls[2][2] and calls[1][2] is calls[3][2]
+    for grid, _, out, kwargs in calls:
+        assert grid == (out.shape[1] // 64, out.shape[2] // 128, num_experts)
+        assert (kwargs["N"], kwargs["K"], kwargs["K_TILES"], kwargs["num_warps"]) == (
+            out.shape[1],
+            out.shape[2],
+            8,
+            8,
+        )
+
+
+def test_dense_prefill_validates_storage_at_weight_preparation(monkeypatch):
+    """Check prepared storage once; repeated numerical forwards need no recheck."""
+    _requires_sm90()
+    generator = torch.Generator(device="cuda").manual_seed(59)
+    experts, hidden, ispp, tokens = 4, 256, 128, 192
+    raw = _make_weights(experts, hidden, ispp, generator)
+    w = _Experts({k: v.clone() for k, v in raw.items()}, 1, 0, None)
+    plan = {"activation": "swiglu", "deterministic_finalize": True}
+    validate = mxfp8._validate_dequant_storage
+    checked = []
+
+    def record_validation(qweight, scales, out):
+        validate(qweight, scales, out)
+        checked.append(tuple(out.shape))
+
+    monkeypatch.setattr(mxfp8, "_validate_dequant_storage", record_validation)
+    marlin_mxfp8_moe_weights(plan, w)
+    assert checked == [(experts, 2 * ispp, hidden), (experts, hidden, ispp)]
+
+    def forbidden_validation(*args):
+        pytest.fail("forward repeated fixed-storage validation")
+
+    monkeypatch.setattr(mxfp8, "_validate_dequant_storage", forbidden_validation)
+    x = torch.randn(tokens, hidden, generator=generator, device="cuda").bfloat16()
+    ids, weights = _routing(tokens, experts, experts, generator)
+    expected = _reference(x, raw, ids, weights, None)
+    for _ in range(2):
+        actual = marlin_mxfp8_precomputed_moe_apply(
+            plan, x, w, None, topk_weights=weights, topk_ids=ids
+        )
+        _assert_close(actual, expected)
+
+
 def test_dense_prefill_path_shares_the_bf16_cutlass_call(monkeypatch):
     """The dense path calls CUTLASS as the BF16 CUTLASS apply does: PDL off
     even when the caller asks for it, on that apply's persistent workspace."""

@@ -81,11 +81,15 @@ minimum package version; do not declare an unpublished version available.
 
 The MXFP8 dequantization helper wraps every output row when swapping the
 gate/up halves, including matrices with an odd count of 64-row tiles.
-Destination guard tests cover these non-production helper shapes.
+Destination guard tests cover these non-production helper shapes. Prepared
+MoE gate/up weights have `N = 2 * ispp` with `ispp % 64 == 0`, so their half
+swap is already tile-aligned.
 
 `dequantize_marlin_mxfp8` requires contiguous int32 packed weights,
 float8_e8m0fnu scales and a BF16 destination on one CUDA device. It validates
-storage dtypes, dimensions, shapes, tile alignment, strides and devices before
-launching. These checks read metadata only; they do not copy tensors or
-synchronize a captured forward. Raw scale bytes belong to the loader, not
-this post-repacking interface.
+storage dtypes, dimensions, shapes, tile alignment, strides and devices for
+independent callers. The MoE preprocessor validates its repacked weights and
+shared BF16 scratch once; dense forwards use the same dequantization launch
+without repeating those fixed-storage checks. Dynamic activation and routing
+layout handling is unchanged. Raw scale bytes belong to the loader, not this
+post-repacking interface.
