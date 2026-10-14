@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -104,6 +105,27 @@ def _run_engine(
 def _compare_outputs(
     reference: dict, candidate: dict, *, atol: float
 ) -> tuple[bool, str]:
+    if not math.isfinite(atol) or atol < 0:
+        raise ValueError("logprob tolerance must be finite and non-negative")
+    for name, summary in (("reference", reference), ("candidate", candidate)):
+        if not isinstance(summary, dict):
+            return False, f"{name}: missing output summary"
+        ids, logprobs = summary.get("output_ids"), summary.get("logprobs")
+        if (
+            not isinstance(ids, list)
+            or not ids
+            or any(type(token) is not int or token < 0 for token in ids)
+        ):
+            return False, f"{name}: missing or invalid generated token ids"
+        if (
+            not isinstance(logprobs, list)
+            or len(logprobs) != len(ids)
+            or any(
+                not isinstance(lp, (int, float)) or not math.isfinite(lp)
+                for lp in logprobs
+            )
+        ):
+            return False, f"{name}: require one finite logprob per generated token"
     lines: list[str] = []
     ok = True
     if reference["output_ids"] != candidate["output_ids"]:

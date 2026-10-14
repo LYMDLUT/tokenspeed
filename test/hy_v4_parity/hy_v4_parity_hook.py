@@ -37,6 +37,7 @@ separates them.
 from __future__ import annotations
 
 import json
+import math
 import os
 from collections.abc import Iterable
 from pathlib import Path
@@ -212,6 +213,13 @@ def first_divergence(
         One entry per compared key, ordered by decreasing error.
     """
     norm_rtol = rtol if norm_rtol is None else norm_rtol
+    for value in (atol, rtol, norm_rtol):
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("comparison tolerances must be finite and non-negative")
+    if not isinstance(reference, dict) or not isinstance(candidate, dict):
+        return [_invalid_record("<dump>", "layer dumps must be mappings")]
+    if not reference and not candidate:
+        return [_invalid_record("<dump>", "no layer evidence was recorded")]
     report: list[dict] = []
     for key in sorted(set(reference) | set(candidate)):
         left, right = reference.get(key), candidate.get(key)
@@ -225,19 +233,34 @@ def first_divergence(
                 }
             )
             continue
-        if left["shape"] != right["shape"]:
+        if (
+            isinstance(left, dict)
+            and isinstance(right, dict)
+            and left.get("shape") != right.get("shape")
+        ):
             report.append(
                 {
                     "key": key,
                     "status": "shape",
                     "error": float("inf"),
-                    "detail": f"{left['shape']} vs {right['shape']}",
+                    "detail": f"{left.get('shape')} vs {right.get('shape')}",
                 }
             )
             continue
-
-        left_sample = torch.tensor(left["sample"], dtype=torch.float32)
-        right_sample = torch.tensor(right["sample"], dtype=torch.float32)
+        try:
+            left_sample = _sample_evidence(left)
+            right_sample = _sample_evidence(right)
+            if (
+                left_sample.shape != right_sample.shape
+                or left["sample_tokens"] != right["sample_tokens"]
+                or left["sample_channels"] != right["sample_channels"]
+            ):
+                raise ValueError("sample coordinates or shapes differ")
+            if left["dtype"] != right["dtype"]:
+                raise ValueError("activation dtypes differ")
+        except (KeyError, TypeError, ValueError, RuntimeError) as error:
+            report.append(_invalid_record(key, str(error)))
+            continue
         deviation = (left_sample - right_sample).abs()
         tolerance = atol + rtol * left_sample.abs()
         sample_excess = float((deviation - tolerance).max())
@@ -248,16 +271,10 @@ def first_divergence(
         # badly each one exceeded, not which units it happens to be in.
         magnitude = max(abs(left["abs_mean"]), 1e-6)
         sample_score = float(deviation.max()) / magnitude if sample_excess > 0 else 0.0
-        score = max(
-            sample_score,
-            norm_delta / norm_rtol if norm_delta > norm_rtol else 0.0,
-            peak_delta / norm_rtol if peak_delta > norm_rtol else 0.0,
-        )
         breached = sample_excess > 0 or norm_delta > norm_rtol or peak_delta > norm_rtol
-        if not breached:
-            error = max(sample_score, norm_delta / norm_rtol, peak_delta / norm_rtol)
-        else:
-            error = max(score, 1e-12)
+        error = max(
+            sample_score, _ratio(norm_delta, norm_rtol), _ratio(peak_delta, norm_rtol)
+        )
         report.append(
             {
                 "key": key,
@@ -273,6 +290,43 @@ def first_divergence(
         )
     report.sort(key=lambda entry: -entry["error"])
     return report
+
+
+def _invalid_record(key: str, detail: str) -> dict:
+    return {"key": key, "status": "invalid", "error": float("inf"), "detail": detail}
+
+
+def _sample_evidence(record: dict) -> torch.Tensor:
+    shape = record["shape"]
+    if not shape or any(type(dim) is not int or dim <= 0 for dim in shape):
+        raise ValueError("missing or invalid activation shape")
+    if not isinstance(record["dtype"], str) or not record["dtype"]:
+        raise ValueError("missing activation dtype")
+    for name in ("norm", "abs_max", "abs_mean"):
+        value = record[name]
+        if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise ValueError(f"invalid/non-finite {name}")
+    sample = torch.tensor(record["sample"], dtype=torch.float64)
+    if sample.ndim != 2 or sample.numel() == 0 or not torch.isfinite(sample).all():
+        raise ValueError("empty, malformed or non-finite activation sample")
+    for axis, name, bound in (
+        (0, "sample_tokens", math.prod(shape[:-1])),
+        (1, "sample_channels", shape[-1]),
+    ):
+        indices = record[name]
+        if (
+            len(indices) != sample.shape[axis]
+            or any(type(i) is not int or not 0 <= i < bound for i in indices)
+            or indices != sorted(set(indices))
+        ):
+            raise ValueError(f"invalid {name}")
+    return sample
+
+
+def _ratio(delta: float, tolerance: float) -> float:
+    if tolerance == 0:
+        return 0.0 if delta == 0 else float("inf")
+    return delta / tolerance
 
 
 def _relative_delta(left: float, right: float) -> float:
@@ -303,7 +357,7 @@ def format_report(report: list[dict], *, limit: int = 14) -> str:
 def worst_status(report: list[dict]) -> tuple[str, float, str]:
     """Return ``(status, error, detail)`` of the largest deviation."""
     if not report:
-        return ("ok", 0.0, "no overlapping taps")
+        return ("invalid", float("inf"), "no layer evidence was recorded")
     worst = max(report, key=lambda entry: entry["error"])
     return (worst["status"], worst["error"], worst.get("detail", ""))
 

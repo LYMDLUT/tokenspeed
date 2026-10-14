@@ -42,8 +42,12 @@ as input and output. That ordering matters when diagnosing:
 - `mlp` divergence — the clamped SwiGLU on the routed experts, or the router.
 
 Each tap stores its shape, whole-tensor norm and peak, and an 8x8 corner sample.
-The comparison checks all three signals, because a sample alone can miss a
-divergence concentrated elsewhere in the tensor.
+The comparison checks all three signals. Empty or malformed evidence,
+non-finite values and missing per-token logprobs fail. Tolerances must be
+finite and non-negative; zero requests an exact comparison. Samples and
+statistics are diagnostic, not proof of full-tensor equality: an unsampled
+permutation can preserve all three. Use complete tensor comparisons for a
+bitwise or elementwise guarantee.
 
 ## Dumping a live server
 
