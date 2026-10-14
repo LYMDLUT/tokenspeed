@@ -281,7 +281,11 @@ def build_truncated_checkpoint(
     (target / "model.safetensors.index.json").write_text(
         json.dumps(
             {
-                "metadata": {"total_size": sum(t.numel() for t in tensors.values())},
+                "metadata": {
+                    "total_size": sum(
+                        t.numel() * t.element_size() for t in tensors.values()
+                    )
+                },
                 "weight_map": {key: shard_name for key in sorted(tensors)},
             },
             indent=2,

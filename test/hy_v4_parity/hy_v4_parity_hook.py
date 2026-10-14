@@ -20,12 +20,10 @@
 
 """Dump per-layer activations from either engine, then compare them.
 
-The hook is engine-agnostic: it attaches to whatever module tree is handed to it
-and wraps the sub-blocks of each decoder layer whose names it is told to look
-for. TokenSpeed and vLLM name those sub-modules
-``self_attn``/``mlp`` and ``hc_attn_layer``/``hc_mlp_layer`` identically, so one
-implementation covers both and a dump cannot silently come from a different
-place than the other engine's.
+The collector records named computation boundaries. Callable sub-blocks use
+forward hooks; parameter-only iHC containers are mapped to the residual
+operations that actually consume them. Unknown layouts and incomplete
+collections are errors, not evidence that two engines agree.
 
 Why per-layer dumps rather than only end-to-end logits: a full-stack logprob
 comparison tells you *that* something diverged, while the first diverging layer
@@ -36,9 +34,13 @@ separates them.
 
 from __future__ import annotations
 
+import functools
+import inspect
 import json
+import math
 import os
-from collections.abc import Iterable
+import sys
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 import torch
@@ -73,6 +75,9 @@ class LayerDumper:
         self.records: dict[str, dict] = {}
         self._handles: list[torch.utils.hooks.RemovableHandle] = []
         self._pass_index = 0
+        self.enabled = True
+        self._restorers: list[Callable[[], None]] = []
+        self._expected_taps: set[tuple[int, str, str]] = set()
 
     # -- attachment --------------------------------------------------------
     def attach(
@@ -92,19 +97,94 @@ class LayerDumper:
             layer_container: Attribute holding the layer list; the MTP draft puts
                 its single block at ``model.decoder``, hence the override.
         """
-        layers = self._resolve_layers(root, layer_container)
+        layers = list(self._resolve_layers(root, layer_container))
+        if not 0 < num_layers <= len(layers):
+            raise ValueError("requested layer count is not present in the model")
         self.detach()
-        for layer_id, layer in enumerate(list(layers)[:num_layers]):
-            for attribute, stage in taps:
-                target = layer
-                for part in attribute.split("."):
-                    target = getattr(target, part, None)
+        self.records.clear()
+        self._expected_taps.clear()
+        taps = tuple(taps)
+        functional = {}
+        try:
+            for layer_id, layer in enumerate(layers[:num_layers]):
+                for attribute, stage in taps:
+                    target = layer
+                    for part in attribute.split("."):
+                        target = getattr(target, part, None)
+                        if target is None:
+                            break
                     if target is None:
-                        break
-                if target is None:
-                    # iHC boundaries are absent when the model runs without them.
-                    continue
-                self._wrap(target, layer_id, stage)
+                        if stage.startswith("hc_") and not getattr(
+                            getattr(root, "config", None), "enable_ihc", False
+                        ):
+                            continue
+                        raise ValueError(
+                            f"layer {layer_id} has no {attribute} boundary"
+                        )
+                    self._expected_taps.update(
+                        (layer_id, stage, side) for side in ("in", "out")
+                    )
+                    if type(target).forward is torch.nn.Module.forward:
+                        # HY's iHC objects hold parameters; their forward is never called.
+                        module = sys.modules[type(layer).__module__]
+                        ops = getattr(module, "residual_ops", None)
+                        if not stage.startswith("hc_") or ops is None:
+                            raise ValueError(
+                                f"unsupported functional boundary: {attribute}"
+                            )
+                        _, targets = functional.setdefault(id(ops), (ops, []))
+                        targets.append((target, layer_id, stage))
+                    else:
+                        self._wrap(target, layer_id, stage)
+            for ops, targets in functional.values():
+                self._wrap_ihc_operation(ops, "ihc_pre", targets)
+                if callable(getattr(ops, "ihc_fused_hc", None)):
+                    self._wrap_ihc_operation(ops, "ihc_fused_hc", targets)
+        except Exception:
+            self.detach()
+            raise
+
+    def expected_keys(self) -> set[str]:
+        return {
+            f"p{self._pass_index}_layer{layer}_{stage}_{side}"
+            for layer, stage, side in self._expected_taps
+        }
+
+    def validate_complete(self) -> None:
+        expected = self.expected_keys()
+        missing = expected - self.records.keys()
+        if not expected or missing:
+            raise RuntimeError(
+                f"incomplete layer collection; missing taps: {sorted(missing)}"
+            )
+
+    def _wrap_ihc_operation(self, ops, name, targets) -> None:
+        original = getattr(ops, name)
+        signature = inspect.signature(original)
+
+        @functools.wraps(original)
+        def traced(*args, **kwargs):
+            bound = signature.bind(*args, **kwargs).arguments
+            target = next(
+                (
+                    (layer, stage)
+                    for boundary, layer, stage in targets
+                    if bound["fn"] is boundary.hc_fn
+                ),
+                None,
+            )
+            if target is not None and name == "ihc_pre":
+                self._record(*target, "in", bound["residual"])
+            output = original(*args, **kwargs)
+            if target is not None:
+                if name == "ihc_fused_hc":
+                    # Observe the updated channels the fused operation returns;
+                    # never split or recompute its post/pre operations to dump.
+                    self._record(*target, "in", output[0])
+            return output
+
+        setattr(ops, name, traced)
+        self._restorers.append(lambda: setattr(ops, name, original))
 
     @staticmethod
     def _resolve_layers(root: torch.nn.Module, container: str) -> torch.nn.ModuleList:
@@ -114,23 +194,48 @@ class LayerDumper:
         return node
 
     def _wrap(self, module: torch.nn.Module, layer_id: int, stage: str) -> None:
-        def pre_hook(_module, args, layer_id=layer_id, stage=stage):
-            if args:
-                self._record(layer_id, stage, "in", args[0])
+        signature = inspect.signature(module.forward)
+        input_name = next(
+            (
+                name
+                for name in ("hidden_states", "residual", "x", "input")
+                if name in signature.parameters
+            ),
+            None,
+        )
+        if input_name is None:
+            raise ValueError(f"no known activation argument for {stage}: {signature}")
 
-        def post_hook(_module, _args, output, layer_id=layer_id, stage=stage):
-            self._record(layer_id, stage, "out", output)
+        def pre_hook(_module, args, kwargs):
+            value = signature.bind(*args, **kwargs).arguments[input_name]
+            self._record(layer_id, stage, "in", value)
+            # Engines may fuse RMSNorm into iHC or run it separately. The
+            # comparable iHC output is the actual input to its consumer.
+            boundary = (layer_id, f"hc_{stage}", "out")
+            if boundary in self._expected_taps:
+                self._record(*boundary, value)
 
-        self._handles.append(module.register_forward_pre_hook(pre_hook))
+        def post_hook(_module, _args, output):
+            if not stage.startswith("hc_"):
+                self._record(layer_id, stage, "out", output)
+
+        self._handles.append(
+            module.register_forward_pre_hook(pre_hook, with_kwargs=True)
+        )
         self._handles.append(module.register_forward_hook(post_hook))
 
     def detach(self) -> None:
         for handle in self._handles:
             handle.remove()
         self._handles.clear()
+        for restore in reversed(self._restorers):
+            restore()
+        self._restorers.clear()
 
     # -- recording ---------------------------------------------------------
     def _record(self, layer_id: int, stage: str, position: str, value) -> None:
+        if not self.enabled:
+            return
         if isinstance(value, (tuple, list)):
             if not value:
                 return
@@ -142,7 +247,10 @@ class LayerDumper:
         # Engines also run warmup / autotune / graph-capture forwards on dummy
         # batches; keep only the real prompt prefill when its length is known.
         only_tokens = int(os.environ.get("HY_V4_DUMP_ONLY_TOKENS", "0") or 0)
-        if only_tokens and tensor.reshape(-1, tensor.shape[-1]).shape[0] != only_tokens:
+        token_shape = tensor.shape[:-1]
+        if stage.startswith("hc_") and position == "in" and tensor.ndim >= 3:
+            token_shape = tensor.shape[:-2]
+        if only_tokens and math.prod(token_shape) != only_tokens:
             return
         if only_tokens and key in self.records:
             return
@@ -212,6 +320,13 @@ def first_divergence(
         One entry per compared key, ordered by decreasing error.
     """
     norm_rtol = rtol if norm_rtol is None else norm_rtol
+    for value in (atol, rtol, norm_rtol):
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("comparison tolerances must be finite and non-negative")
+    if not isinstance(reference, dict) or not isinstance(candidate, dict):
+        return [_invalid_record("<dump>", "layer dumps must be mappings")]
+    if not reference and not candidate:
+        return [_invalid_record("<dump>", "no layer evidence was recorded")]
     report: list[dict] = []
     for key in sorted(set(reference) | set(candidate)):
         left, right = reference.get(key), candidate.get(key)
@@ -225,19 +340,32 @@ def first_divergence(
                 }
             )
             continue
-        if left["shape"] != right["shape"]:
+        if (
+            isinstance(left, dict)
+            and isinstance(right, dict)
+            and left.get("shape") != right.get("shape")
+        ):
             report.append(
                 {
                     "key": key,
                     "status": "shape",
                     "error": float("inf"),
-                    "detail": f"{left['shape']} vs {right['shape']}",
+                    "detail": f"{left.get('shape')} vs {right.get('shape')}",
                 }
             )
             continue
-
-        left_sample = torch.tensor(left["sample"], dtype=torch.float32)
-        right_sample = torch.tensor(right["sample"], dtype=torch.float32)
+        try:
+            left_sample = _sample_evidence(left)
+            right_sample = _sample_evidence(right)
+            if (
+                left_sample.shape != right_sample.shape
+                or left["sample_tokens"] != right["sample_tokens"]
+                or left["sample_channels"] != right["sample_channels"]
+            ):
+                raise ValueError("sample coordinates or shapes differ")
+        except (KeyError, TypeError, ValueError, RuntimeError) as error:
+            report.append(_invalid_record(key, str(error)))
+            continue
         deviation = (left_sample - right_sample).abs()
         tolerance = atol + rtol * left_sample.abs()
         sample_excess = float((deviation - tolerance).max())
@@ -248,16 +376,10 @@ def first_divergence(
         # badly each one exceeded, not which units it happens to be in.
         magnitude = max(abs(left["abs_mean"]), 1e-6)
         sample_score = float(deviation.max()) / magnitude if sample_excess > 0 else 0.0
-        score = max(
-            sample_score,
-            norm_delta / norm_rtol if norm_delta > norm_rtol else 0.0,
-            peak_delta / norm_rtol if peak_delta > norm_rtol else 0.0,
-        )
         breached = sample_excess > 0 or norm_delta > norm_rtol or peak_delta > norm_rtol
-        if not breached:
-            error = max(sample_score, norm_delta / norm_rtol, peak_delta / norm_rtol)
-        else:
-            error = max(score, 1e-12)
+        error = max(
+            sample_score, _ratio(norm_delta, norm_rtol), _ratio(peak_delta, norm_rtol)
+        )
         report.append(
             {
                 "key": key,
@@ -273,6 +395,43 @@ def first_divergence(
         )
     report.sort(key=lambda entry: -entry["error"])
     return report
+
+
+def _invalid_record(key: str, detail: str) -> dict:
+    return {"key": key, "status": "invalid", "error": float("inf"), "detail": detail}
+
+
+def _sample_evidence(record: dict) -> torch.Tensor:
+    shape = record["shape"]
+    if not shape or any(type(dim) is not int or dim <= 0 for dim in shape):
+        raise ValueError("missing or invalid activation shape")
+    if not isinstance(record["dtype"], str) or not record["dtype"]:
+        raise ValueError("missing activation dtype")
+    for name in ("norm", "abs_max", "abs_mean"):
+        value = record[name]
+        if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise ValueError(f"invalid/non-finite {name}")
+    sample = torch.tensor(record["sample"], dtype=torch.float64)
+    if sample.ndim != 2 or sample.numel() == 0 or not torch.isfinite(sample).all():
+        raise ValueError("empty, malformed or non-finite activation sample")
+    for axis, name, bound in (
+        (0, "sample_tokens", math.prod(shape[:-1])),
+        (1, "sample_channels", shape[-1]),
+    ):
+        indices = record[name]
+        if (
+            len(indices) != sample.shape[axis]
+            or any(type(i) is not int or not 0 <= i < bound for i in indices)
+            or indices != sorted(set(indices))
+        ):
+            raise ValueError(f"invalid {name}")
+    return sample
+
+
+def _ratio(delta: float, tolerance: float) -> float:
+    if tolerance == 0:
+        return 0.0 if delta == 0 else float("inf")
+    return delta / tolerance
 
 
 def _relative_delta(left: float, right: float) -> float:
@@ -303,7 +462,7 @@ def format_report(report: list[dict], *, limit: int = 14) -> str:
 def worst_status(report: list[dict]) -> tuple[str, float, str]:
     """Return ``(status, error, detail)`` of the largest deviation."""
     if not report:
-        return ("ok", 0.0, "no overlapping taps")
+        return ("invalid", float("inf"), "no layer evidence was recorded")
     worst = max(report, key=lambda entry: entry["error"])
     return (worst["status"], worst["error"], worst.get("detail", ""))
 

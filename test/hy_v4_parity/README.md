@@ -30,7 +30,23 @@ Useful switches:
 - `--skip-reference` — smoke-test the harness with only TokenSpeed.
 - `--rebuild` — rebuild the truncated checkpoint instead of reusing the cache.
 
+Both engines receive fixed token ids and skip tokenizer initialization. The
+reference also disables detokenization; the truncated checkpoint therefore
+needs no vocabulary or tokenizer model files for this comparison. Dtype labels
+remain diagnostic; finite activation values are judged using the explicit
+numerical tolerances, not a new cross-engine storage-dtype equality rule.
+
 ## Which taps are compared
+
+Callable sub-blocks are hooked with their named activation argument, including
+keyword-only calls. Parameter-only iHC boundaries are observed at the actual
+`ihc_pre`/`ihc_fused_hc` operation, without replacing the fused calculation.
+For the fused operation, the recorded input is its returned, updated residual
+channels, the input of the next pre boundary. Both engines record the iHC
+output at the following attention/MLP input, after RMSNorm whether it is fused
+or separate. Raw pre-normalization output is not compared with normalized
+input. Missing expected taps fail at collection completion. iHC token counts
+exclude the residual-channel axis.
 
 Per decoder layer, in execution order: `hc_attn`, `attn`, `hc_mlp`, `mlp`, each
 as input and output. That ordering matters when diagnosing:
@@ -42,8 +58,12 @@ as input and output. That ordering matters when diagnosing:
 - `mlp` divergence — the clamped SwiGLU on the routed experts, or the router.
 
 Each tap stores its shape, whole-tensor norm and peak, and an 8x8 corner sample.
-The comparison checks all three signals, because a sample alone can miss a
-divergence concentrated elsewhere in the tensor.
+The comparison checks all three signals. Empty or malformed evidence,
+non-finite values and missing per-token logprobs fail. Tolerances must be
+finite and non-negative; zero requests an exact comparison. Samples and
+statistics are diagnostic, not proof of full-tensor equality: an unsampled
+permutation can preserve all three. Use complete tensor comparisons for a
+bitwise or elementwise guarantee.
 
 ## Dumping a live server
 
@@ -58,14 +78,24 @@ PYTHONPATH=/tmp/hy4inject:$PYTHONPATH \
   ./your_normal_launch.sh
 ```
 
-Every engine subprocess attaches a dumper as soon as its HY V4 model is
-constructed (a patch in the parent process cannot reach spawned workers) and
-writes the dump at interpreter exit. The instrumentation is inert unless
-`HY_V4_DUMP_PATH` is set.
+The launcher installs this injection for the parent and spawned workers,
+preserving additional `PYTHONPATH` entries. Each worker writes
+`<stem>.worker-<pid>.json` and a completion sidecar before its selected forward
+returns; it does not rely on interpreter exit. Direct `.forward()` calls are
+covered too. `HY_V4_DUMP_PROMPT_IDS` selects exact token ids rather than a
+warmup batch of the same length. Without that filter, live-server dumps are
+diagnostic snapshots of the latest complete forward.
+
+Every harness invocation creates a fresh engine-run directory. The default
+single-GPU check requires exactly one complete worker dump, the requested
+layers and input, and a summary with the same run identity. Missing evidence
+cannot reuse an older dump, and multiple worker dumps are not silently merged.
+The instrumentation is inert unless `HY_V4_DUMP_PATH` is set.
 
 | Variable | Meaning |
 | --- | --- |
-| `HY_V4_DUMP_PATH` | Dump destination. Unset means disabled. |
+| `HY_V4_DUMP_PATH` | Base dump name; each worker appends its pid. Unset means disabled. |
+| `HY_V4_DUMP_PROMPT_IDS` | JSON token-id list selecting one exact prefill; the harness sets it. |
 | `HY_V4_DUMP_LAYERS` | Layers to tap; default is all in the config. |
 | `HY_V4_DUMP_TAG` | Free-form label written to `<path>.meta.json`. |
 | `HY_V4_DUMP_TARGETS` | Extra `module:class` targets, for a reference checkout laid out differently. |
@@ -201,3 +231,6 @@ incomplete marker is rejected instead of silently overwriting files. An empty
 directory may be used for a first export. Configuration and selected source
 tensors are validated before an existing output is removed. `--rebuild`
 replaces an export, never its source checkpoint; use a separate output path.
+
+The exported index's `metadata.total_size` counts tensor storage bytes,
+including the different element sizes of BF16, FP32 and FP8 weights.

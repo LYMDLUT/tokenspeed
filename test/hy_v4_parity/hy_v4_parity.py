@@ -37,9 +37,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
@@ -63,8 +65,25 @@ def _run_engine(
     num_layers: int,
     extra: list[str],
 ) -> tuple[dict, Path]:
-    dump_path = workdir / f"{engine}.dump.json"
-    summary_path = workdir / f"{engine}.summary.json"
+    from test.hy_v4_parity.run_engine_dump import worker_environment
+
+    workdir.mkdir(parents=True, exist_ok=True)
+    run_dir = Path(tempfile.mkdtemp(prefix=f"{engine}-", dir=workdir)).resolve()
+    run_id = run_dir.name
+    dump_path = run_dir / f"{engine}.dump.json"
+    summary_path = run_dir / f"{engine}.summary.json"
+    reference_parser = argparse.ArgumentParser(add_help=False)
+    reference_parser.add_argument(
+        "--reference-repo", default=os.environ.get("HY_V4_REFERENCE_REPO", "")
+    )
+    reference_args, _ = reference_parser.parse_known_args(extra)
+    env = worker_environment(
+        dump_path=dump_path,
+        run_id=run_id,
+        num_layers=num_layers,
+        engine=engine,
+        reference_repo=reference_args.reference_repo if engine == "reference" else "",
+    )
     command = [
         python,
         "-m",
@@ -72,7 +91,9 @@ def _run_engine(
         "--engine",
         engine,
         "--model-path",
-        str(model_path),
+        str(model_path.resolve()),
+        "--run-id",
+        run_id,
         "--dump-path",
         str(dump_path),
         "--summary-path",
@@ -85,7 +106,7 @@ def _run_engine(
     completed = subprocess.run(
         command,
         cwd=str(_REPO_ROOT),
-        env={**os.environ, "PYTHONPATH": str(_REPO_ROOT)},
+        env=env,
         text=True,
     )
     if completed.returncode != 0:
@@ -98,12 +119,46 @@ def _run_engine(
             "have been attached: confirm the checkpoint exposes model_type=hy_v4 "
             "and that BaseCausalLM.post_init ran."
         )
-    return json.loads(summary_path.read_text()), dump_path
+    summary = json.loads(summary_path.read_text())
+    metadata = json.loads(
+        dump_path.with_suffix(dump_path.suffix + ".meta.json").read_text()
+    )
+    if (
+        summary.get("run_id") != run_id
+        or metadata.get("run_id") != run_id
+        or metadata.get("complete") is not True
+    ):
+        raise RuntimeError("dump and summary do not belong to this completed run")
+    valid, detail = _compare_outputs(summary, summary, atol=0)
+    if not valid:
+        raise RuntimeError(detail)
+    return summary, dump_path
 
 
 def _compare_outputs(
     reference: dict, candidate: dict, *, atol: float
 ) -> tuple[bool, str]:
+    if not math.isfinite(atol) or atol < 0:
+        raise ValueError("logprob tolerance must be finite and non-negative")
+    for name, summary in (("reference", reference), ("candidate", candidate)):
+        if not isinstance(summary, dict):
+            return False, f"{name}: missing output summary"
+        ids, logprobs = summary.get("output_ids"), summary.get("logprobs")
+        if (
+            not isinstance(ids, list)
+            or not ids
+            or any(type(token) is not int or token < 0 for token in ids)
+        ):
+            return False, f"{name}: missing or invalid generated token ids"
+        if (
+            not isinstance(logprobs, list)
+            or len(logprobs) != len(ids)
+            or any(
+                not isinstance(lp, (int, float)) or not math.isfinite(lp)
+                for lp in logprobs
+            )
+        ):
+            return False, f"{name}: require one finite logprob per generated token"
     lines: list[str] = []
     ok = True
     if reference["output_ids"] != candidate["output_ids"]:
