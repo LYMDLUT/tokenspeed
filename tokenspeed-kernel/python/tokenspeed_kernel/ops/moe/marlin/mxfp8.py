@@ -207,9 +207,18 @@ def dequantize_marlin_mxfp8(
         TypeError: A tensor has the wrong storage dtype.
         ValueError: Shapes, alignment, strides or devices violate the layout.
 
-    Validation reads tensor metadata only and is safe during graph capture.
-    Scale encodings are validated once by the weight loader before repacking.
+    Independent callers are checked here. The MoE weight preprocessor checks
+    its fixed storage once and uses the same launch without repeating checks.
+    Scale encodings are validated before repacking.
     """
+    _validate_dequant_storage(qweight, scales, out)
+    return _launch_marlin_mxfp8_dequant(qweight, scales, out, swap_halves=swap_halves)
+
+
+def _validate_dequant_storage(
+    qweight: torch.Tensor, scales: torch.Tensor, out: torch.Tensor
+) -> None:
+    """Check the fixed storage contract, without reading tensor values."""
     if qweight.dtype != torch.int32:
         raise TypeError("qweight must be int32 Marlin-packed storage")
     if scales.dtype != torch.float8_e8m0fnu:
@@ -240,6 +249,18 @@ def dequantize_marlin_mxfp8(
         raise ValueError("qweight, scales and out must share a device")
     if out.device.type != "cuda":
         raise ValueError("Marlin MXFP8 dequantization requires CUDA tensors")
+
+
+def _launch_marlin_mxfp8_dequant(
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    swap_halves: bool,
+) -> torch.Tensor:
+    """Launch over storage checked by the public helper or weight preprocessor."""
+    num_experts, size_n, size_k = out.shape
+    k_width = _DEQUANT_K_TILES * _TILE_K
     _marlin_mxfp8_to_bf16_kernel[(size_n // _TILE_N, size_k // k_width, num_experts)](
         qweight.view(torch.uint8),
         scales.view(torch.uint8),
@@ -768,7 +789,10 @@ def marlin_mxfp8_moe_weights(plan: dict, w: torch.nn.Module) -> None:
     dense_prefill = ispp % (_DEQUANT_K_TILES * _TILE_K) == 0
     if dense_prefill:
         # Allocated with the weights so KV sizing sees it and no graph pool owns it.
-        _dense_scratch(device, num_experts, hidden, ispp)
+        w13_dense, w2_dense = _dense_scratch(device, num_experts, hidden, ispp)
+        # Repacking and scratch allocation fix these layouts for every forward.
+        _validate_dequant_storage(w.w13_weight, w.w13_weight_scale_inv, w13_dense)
+        _validate_dequant_storage(w.w2_weight, w.w2_weight_scale_inv, w2_dense)
     w._moe_backend_state = _MarlinMxfp8State(
         # EP ranks own contiguous expert ranges. Routes to any other expert
         # land in the align kernel's invalid lane, which the GEMMs skip.
@@ -1003,8 +1027,12 @@ def _dense_bf16_apply(
 ) -> torch.Tensor:
     num_local_experts = int(w.w13_weight.shape[0])
     w13, w2 = _dense_scratch(x.device, num_local_experts, state.hidden_size, state.ispp)
-    dequantize_marlin_mxfp8(w.w13_weight, w.w13_weight_scale_inv, w13, swap_halves=True)
-    dequantize_marlin_mxfp8(w.w2_weight, w.w2_weight_scale_inv, w2, swap_halves=False)
+    _launch_marlin_mxfp8_dequant(
+        w.w13_weight, w.w13_weight_scale_inv, w13, swap_halves=True
+    )
+    _launch_marlin_mxfp8_dequant(
+        w.w2_weight, w.w2_weight_scale_inv, w2, swap_halves=False
+    )
     return cutlass_unquant_fused_moe(
         plan,
         x,
