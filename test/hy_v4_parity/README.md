@@ -231,3 +231,6 @@ incomplete marker is rejected instead of silently overwriting files. An empty
 directory may be used for a first export. Configuration and selected source
 tensors are validated before an existing output is removed. `--rebuild`
 replaces an export, never its source checkpoint; use a separate output path.
+
+The exported index's `metadata.total_size` counts tensor storage bytes,
+including the different element sizes of BF16, FP32 and FP8 weights.

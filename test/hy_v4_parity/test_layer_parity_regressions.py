@@ -458,3 +458,33 @@ def test_numeric_tolerance_does_not_require_identical_storage_dtypes():
         worst_status(first_divergence(reference, candidate, atol=0.01, rtol=0.01))[0]
         == "ok"
     )
+
+
+def test_export_index_counts_tensor_bytes_for_mixed_dtypes(tmp_path):
+    from test.hy_v4_parity.hy_v4_fixtures import Truncation, build_truncated_checkpoint
+
+    from safetensors.torch import load_file, save_file
+
+    source = tmp_path / "source"
+    source.mkdir()
+    tensors = {
+        "model.embed_tokens.weight": torch.ones(2, 2, dtype=torch.bfloat16),
+        "model.norm.weight": torch.ones(2, dtype=torch.float32),
+        "lm_head.weight": torch.ones(2, 2).to(torch.float8_e4m3fn),
+    }
+    (source / "config.json").write_text(
+        json.dumps({"num_hidden_layers": 1, "n_routed_experts": 8})
+    )
+    save_file(tensors, str(source / "weights.safetensors"))
+    (source / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {name: "weights.safetensors" for name in tensors}})
+    )
+    target = build_truncated_checkpoint(
+        tmp_path / "output", Truncation(1, None), repo_id=str(source)
+    )
+    index = json.loads((target / "model.safetensors.index.json").read_text())
+    assert index["metadata"]["total_size"] == 20
+    loaded = load_file(str(target / "model.safetensors"))
+    for name, value in tensors.items():
+        assert loaded[name].dtype == value.dtype
+        assert torch.equal(loaded[name].view(torch.uint8), value.view(torch.uint8))
