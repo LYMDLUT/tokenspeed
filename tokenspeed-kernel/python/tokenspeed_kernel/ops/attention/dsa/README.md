@@ -174,10 +174,9 @@ and pass their count as `topk_lens`, so the kernel walks only those columns.
 FlashMLA sparse prefill attends each query row with one CTA per 64 padded
 heads (128 on Blackwell); each CTA walks the row's selected columns serially,
 so a launch with fewer CTAs than SMs (regular-KV decode and verify, short
-prompts) is bound by one row's walk while most SMs idle. Such launches split
+prompts) is bound by one row's walk while most SMs idle. Sinkless launches split
 every row's columns into slices that keep the kernel's 128-column alignment,
-run the slices as independent rows and merge them by their LSE; the sink is
-applied once, to the merged softmax. The split count is the largest power of
+run the slices as independent rows and merge them by their LSE. The split count is the largest power of
 two for which the split launch, `rows * ctas_per_row * splits` CTAs, fits one
 wave of the device's SMs and every slice keeps that alignment; launches that
 cannot take two splits stay whole. HY V4 at TP32 runs 2 heads padded to one CTA
@@ -185,6 +184,12 @@ per row. The partials are rounded to BF16 before the FP32 merge, so results
 match a single launch to within that rounding. Because the split count follows
 the launch's row count, results are reproducible run to run but not
 batch-invariant.
+
+FlashMLA calls with a sink stay whole so the vendor kernel applies the sink
+before casting its output to BF16. Merging BF16 partials would introduce an
+extra rounding before sink normalization, including when only one split has
+live keys. This applies to prefill and the regular-KV FlashMLA decode wrapper;
+sinkless context-parallel partials retain the split path.
 
 Sink decode over a regular BF16 KV cache with at most 16 heads per row runs
 `triton_dsa_split_decode` on Hopper instead. Even split, FlashMLA spends a

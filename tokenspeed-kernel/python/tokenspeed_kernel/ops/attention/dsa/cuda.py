@@ -546,8 +546,15 @@ if platform.is_nvidia and platform.is_hopper_plus:
         q_kernel, actual_heads = _pad_prefill_query(q)
         kv = _flatten_regular_kv_cache(kv_cache, page_size)
         slots = _mask_sparse_slots(topk_slots, topk_lens)
-        splits = _flashmla_sparse_column_splits(
-            q_kernel.shape[0], q_kernel.shape[1], slots.shape[-1], q_kernel.device
+        # Keep sink normalization inside FlashMLA before its BF16 output cast.
+        # Merging BF16 partials would round once before applying the sink and
+        # once again afterwards, even when only one split has live keys.
+        splits = (
+            1
+            if attn_sink is not None
+            else _flashmla_sparse_column_splits(
+                q_kernel.shape[0], q_kernel.shape[1], slots.shape[-1], q_kernel.device
+            )
         )
         if splits > 1:
             return _flashmla_sparse_prefill_split(
