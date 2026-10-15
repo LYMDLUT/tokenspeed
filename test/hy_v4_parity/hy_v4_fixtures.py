@@ -52,8 +52,8 @@ _GLOBAL_PREFIXES = (
     "lm_head.",
 )
 _MTP_PREFIX = "model.mtp_layers."
-# Small files an engine may read; the tokenizer is deliberately not included
-# because callers drive the engines with token ids (``--skip-tokenizer-init``).
+# Keep the export small; TokenSpeed receives the original tokenizer separately
+# for its scheduler, even when the engines are driven with fixed token IDs.
 _SIDE_FILES = (
     "generation_config.json",
     "special_tokens_map.json",

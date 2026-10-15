@@ -121,10 +121,26 @@ class LayerDumper:
                         raise ValueError(
                             f"layer {layer_id} has no {attribute} boundary"
                         )
+                    if stage.startswith("hc_") and (
+                        getattr(target, "enable_ihc", None) is False
+                        or getattr(getattr(root, "config", None), "enable_ihc", None)
+                        is False
+                    ):
+                        continue
                     self._expected_taps.update(
                         (layer_id, stage, side) for side in ("in", "out")
                     )
                     if type(target).forward is torch.nn.Module.forward:
+                        # vLLM's method-only wrapper calls its hc_pre submodule.
+                        # Observe that call; keep output at the normalized consumer.
+                        hc_pre = getattr(target, "hc_pre", None)
+                        if (
+                            stage.startswith("hc_")
+                            and isinstance(hc_pre, torch.nn.Module)
+                            and type(hc_pre).forward is not torch.nn.Module.forward
+                        ):
+                            self._wrap(hc_pre, layer_id, stage)
+                            continue
                         # HY's iHC objects hold parameters; their forward is never called.
                         module = sys.modules[type(layer).__module__]
                         ops = getattr(module, "residual_ops", None)

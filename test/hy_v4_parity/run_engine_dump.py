@@ -107,12 +107,39 @@ def worker_environment(
     return env
 
 
+def _tokenspeed_engine_kwargs(
+    tokenizer: str | None, *, default_tokenizer: str | None
+) -> dict:
+    """Keep an explicit scheduler tokenizer separate from truncated weights."""
+    kwargs = json.loads(os.environ.get("HY_V4_TS_ENGINE_KWARGS", "{}"))
+    if not isinstance(kwargs, dict):
+        raise ValueError("HY_V4_TS_ENGINE_KWARGS must be a JSON object")
+    if tokenizer is not None:
+        if "tokenizer" in kwargs and kwargs["tokenizer"] != tokenizer:
+            raise ValueError(
+                "--tokenizer and HY_V4_TS_ENGINE_KWARGS tokenizer disagree"
+            )
+        kwargs["tokenizer"] = tokenizer
+    elif "tokenizer" not in kwargs and default_tokenizer is not None:
+        kwargs["tokenizer"] = default_tokenizer
+    if "tokenizer" not in kwargs:
+        raise ValueError(
+            "--tokenizer must identify the original checkpoint's tokenizer; "
+            "skip_tokenizer_init does not disable the scheduler tokenizer"
+        )
+    if not isinstance(kwargs["tokenizer"], str) or not kwargs["tokenizer"].strip():
+        raise ValueError("TokenSpeed tokenizer must be a nonempty path or model ID")
+    return kwargs
+
+
 def run_tokenspeed(args, dump_path: Path) -> dict:
     """Boot TokenSpeed's engine and dump the truncated model.
 
     The launcher installs sitecustomize for spawned workers; this call also
     arms model construction in the current interpreter.
     """
+    engine_kwargs = _tokenspeed_engine_kwargs(args.tokenizer, default_tokenizer=None)
+
     from test.hy_v4_parity.hy_v4_dump import instrument_hy_v4_classes
 
     from tokenspeed.runtime.entrypoints.engine import Engine
@@ -145,7 +172,8 @@ def run_tokenspeed(args, dump_path: Path) -> dict:
         gpu_memory_utilization=args.gpu_memory_utilization,
         enable_output_logprobs=True,
         log_level="warning",
-        **json.loads(os.environ.get("HY_V4_TS_ENGINE_KWARGS", "{}")),
+        # Raw token IDs bypass frontend tokenization, not the scheduler tokenizer.
+        **engine_kwargs,
     )
     try:
         output = engine.generate(
@@ -204,7 +232,7 @@ def run_reference(args, dump_path: Path) -> dict:
         gpu_memory_utilization=args.gpu_memory_utilization,
         dtype="bfloat16",
         disable_log_stats=True,
-        # Both engines receive token ids; the truncated export has no tokenizer.
+        # The reference receives token IDs and does not need a tokenizer.
         skip_tokenizer_init=True,
     )
     outputs = llm.generate(
@@ -240,6 +268,11 @@ def main() -> int:
         help="Which engine this process runs.",
     )
     parser.add_argument("--model-path", required=True, help="Truncated checkpoint.")
+    parser.add_argument(
+        "--tokenizer",
+        help="Original checkpoint tokenizer path or model ID (TokenSpeed only); "
+        "may also be supplied in HY_V4_TS_ENGINE_KWARGS.",
+    )
     parser.add_argument("--dump-path", required=True, help="Layer dump output.")
     parser.add_argument("--summary-path", required=True, help="Run summary output.")
     parser.add_argument(
@@ -276,6 +309,8 @@ def main() -> int:
         help="Reference engine's attention backend for the sink-capable MLA path.",
     )
     args = parser.parse_args()
+    if args.engine == "reference" and args.tokenizer is not None:
+        parser.error("--tokenizer is only supported for --engine tokenspeed")
 
     dump_path = Path(args.dump_path).resolve()
     summary_path = Path(args.summary_path).resolve()

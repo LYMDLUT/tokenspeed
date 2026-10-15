@@ -25,9 +25,9 @@
         --reference-python /path/to/vllm-venv/bin/python
 
 Steps: build a truncated checkpoint from the released weights (bit-identical on
-the layers it keeps), run each engine over a fixed prompt dumping every
-sub-block's input and output, then compare the dumps and the generated token
-logprobs.
+the layers it keeps), run each engine over a fixed prompt collecting sampled
+sub-block activation summaries, then compare those summaries and the generated
+token logprobs. The summaries do not establish full-tensor equality.
 
 Exit status is 0 only when both the layer dumps and the logprobs are within
 tolerance, so this doubles as a regression gate for the HY V4 port.
@@ -51,6 +51,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from test.hy_v4_parity.hy_v4_dump import compare_dumps  # noqa: E402
 from test.hy_v4_parity.hy_v4_fixtures import (  # noqa: E402
+    HY_V4_REPO_ID,
     Truncation,
     build_truncated_checkpoint,
 )
@@ -191,6 +192,16 @@ def _compare_outputs(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--source",
+        default=HY_V4_REPO_ID,
+        help="Original checkpoint path or model ID used to build the truncation.",
+    )
+    parser.add_argument(
+        "--tokenizer",
+        help="TokenSpeed scheduler tokenizer; defaults to an explicit "
+        "HY_V4_TS_ENGINE_KWARGS tokenizer, otherwise --source.",
+    )
+    parser.add_argument(
         "--truncation",
         default="3:8",
         help="LAYERS:EXPERTS to keep, e.g. '3:8'. Use 'all' for all experts.",
@@ -235,6 +246,18 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    extra = args.tokenspeed_args.split()
+    extra_parser = argparse.ArgumentParser(add_help=False)
+    extra_parser.add_argument("--tokenizer")
+    forwarded, _ = extra_parser.parse_known_args(extra)
+    if forwarded.tokenizer is not None:
+        parser.error("pass --tokenizer directly, not inside --tokenspeed-args")
+
+    from test.hy_v4_parity.run_engine_dump import _tokenspeed_engine_kwargs
+
+    engine_kwargs = _tokenspeed_engine_kwargs(
+        args.tokenizer, default_tokenizer=args.source
+    )
     layers, _, experts = args.truncation.partition(":")
     truncation = Truncation(
         num_layers=int(layers),
@@ -245,6 +268,7 @@ def main() -> int:
     model_path = build_truncated_checkpoint(
         workdir / f"hy4-{truncation.describe().replace('/', '-')}",
         truncation,
+        repo_id=args.source,
         overwrite=args.rebuild,
         log=lambda message: print(f"[fixture] {message}"),
     )
@@ -255,7 +279,11 @@ def main() -> int:
         model_path=model_path,
         workdir=workdir,
         num_layers=truncation.num_layers,
-        extra=args.tokenspeed_args.split(),
+        extra=[
+            "--tokenizer",
+            engine_kwargs["tokenizer"],
+            *extra,
+        ],
     )
     if args.skip_reference:
         print(f"\n[skip] reference run skipped; TokenSpeed dump at {candidate_dump}")

@@ -5,9 +5,9 @@ Compares TokenSpeed against vLLM 0.29.0, the first vLLM release that ships
 
 A full 78-layer HY V4 is ~1.5 TB in BF16, so the harness builds a checkpoint
 that is bit-identical to the released weights on the layers it keeps (see
-`hy_v4_fixtures.py`) and runs both engines on it. Every sub-block's input and
-output is dumped, so a mismatch is reported at the first sub-block that produced
-it rather than only at the final logits.
+`hy_v4_fixtures.py`) and runs both engines on it. Sampled activation summaries
+are recorded at each configured sub-block input and output to identify
+divergent taps. They do not establish full-tensor equality.
 
 ## Quick start
 
@@ -23,6 +23,10 @@ within tolerance, so this can be wired into CI as a gate for the HY V4 port.
 
 Useful switches:
 
+- `--source /path/to/original-checkpoint` — source weights for the truncation;
+  defaults to `tencent/Hy4-preview`.
+- `--tokenizer /path/to/original-tokenizer` — TokenSpeed scheduler tokenizer;
+  defaults to an explicit `HY_V4_TS_ENGINE_KWARGS` tokenizer, otherwise `--source`.
 - `--truncation 3:8` — layers to keep : experts to keep (`all` for all 256).
   Layer 0 is dense, layer 1 the first MoE layer, layer 2 the first shared
   indexer, so 3 layers cover every layer kind.
@@ -30,17 +34,31 @@ Useful switches:
 - `--skip-reference` — smoke-test the harness with only TokenSpeed.
 - `--rebuild` — rebuild the truncated checkpoint instead of reusing the cache.
 
-Both engines receive fixed token ids and skip tokenizer initialization. The
-reference also disables detokenization; the truncated checkpoint therefore
-needs no vocabulary or tokenizer model files for this comparison. Dtype labels
-remain diagnostic; finite activation values are judged using the explicit
-numerical tolerances, not a new cross-engine storage-dtype equality rule.
+Both engines receive fixed token IDs. TokenSpeed's `skip_tokenizer_init=True`
+skips frontend tokenization; its scheduler still loads the original tokenizer
+for grammar handling. The model stays the truncated checkpoint. The reference
+skips tokenizer initialization and detokenization. Tokenizer model files are
+therefore not copied into the truncated export.
+
+When invoking `run_engine_dump --engine tokenspeed` directly, pass
+`--model-path /path/to/truncated --tokenizer /path/to/original-checkpoint`.
+The existing `HY_V4_TS_ENGINE_KWARGS` tokenizer remains supported; specifying
+both forms with different values is an error. A matching tokenizer is required
+for the checkpoint's vocabulary even though prompts use fixed IDs.
+Pass the parent harness's `--tokenizer` directly; embedding it in
+`--tokenspeed-args` is rejected before checkpoint export.
+
+Dtype labels remain diagnostic; finite activation values are judged using the
+explicit numerical tolerances, not a new cross-engine storage-dtype equality
+rule.
 
 ## Which taps are compared
 
 Callable sub-blocks are hooked with their named activation argument, including
 keyword-only calls. Parameter-only iHC boundaries are observed at the actual
 `ihc_pre`/`ihc_fused_hc` operation, without replacing the fused calculation.
+Method-only iHC wrappers are observed through their callable `hc_pre` submodule;
+explicitly disabled iHC wrappers add no taps.
 For the fused operation, the recorded input is its returned, updated residual
 channels, the input of the next pre boundary. Both engines record the iHC
 output at the following attention/MLP input, after RMSNorm whether it is fused
@@ -189,6 +207,10 @@ on a much lighter stack than the full runtime:
 PYTHONPATH=$PWD/tokenspeed-kernel/python:$PWD/python \
   python test/hy_v4_parity/gpu_kernel_check.py --tokens 128 --hc 4 --hidden 6144
 ```
+
+The oversized-channel kernel check forces `triton_ihc_pre` and accepts only its
+expected `ValueError` channel-limit message. Unrelated errors do not satisfy the
+refusal check; the public fallback is checked separately against the reference.
 
 Notes on the tolerances, since they are deliberate:
 
