@@ -468,7 +468,8 @@ def test_dense_prefill_validates_storage_at_weight_preparation(monkeypatch):
         actual = marlin_mxfp8_precomputed_moe_apply(
             plan, x, w, None, topk_weights=weights, topk_ids=ids
         )
-        _assert_close(actual, expected)
+        assert actual.dtype == x.dtype
+        _assert_close(actual.float(), expected)
 
 
 def test_dense_prefill_path_shares_the_bf16_cutlass_call(monkeypatch):
