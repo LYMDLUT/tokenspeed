@@ -682,6 +682,10 @@ rows from the live `gather_ids` (eager, so the gather is never baked), and
 the decoder is `o_proj` + MoE + final norm on one row per request
 (`max_decoder_rows_per_request = 1`). An 8K draft ladder cost it about 2 GB
 per GPU of pool scratch and per-bucket outputs.
+The decoder's `o_proj` is an eager break that projects only the live narrowed
+rows. Padding this BF16 GEMM can change its reduction and the downstream MoE
+output. The break hands the live result back to the fixed-row decoder buffer
+and clears its tail, retaining the same projection as eager execution.
 
 Both steps run unconditionally — there is no per-drafter opt-out. What makes
 that safe is the slot discipline: init writes prefill-slot metadata, refresh

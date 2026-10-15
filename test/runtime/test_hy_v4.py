@@ -948,6 +948,58 @@ class HYV4NextNPrefillStagesTests(unittest.TestCase):
         self.assertEqual(captured, [])
         self.assertIsNone(ctx.collective_num_tokens)
 
+    def test_decoder_projection_uses_only_the_live_rows(self):
+        inner = HYV4ModelNextN.__new__(HYV4ModelNextN)
+        seen = []
+        weight = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+
+        def project(hidden):
+            seen.append(hidden.shape[0])
+            return torch.nn.functional.linear(hidden, weight), None
+
+        inner.decoder = SimpleNamespace(self_attn=SimpleNamespace(o_proj=project))
+        hidden = torch.arange(64, dtype=torch.float32).reshape(16, 4)
+        for rows in (None, 3, 16, 0):
+            with (
+                self.subTest(rows=rows),
+                mock.patch.object(hy_v4_nextn, "current_valid_rows", return_value=rows),
+            ):
+                result = inner._project_attention(hidden)
+                expected = torch.nn.functional.linear(hidden[:rows], weight)
+                torch.testing.assert_close(result, expected, rtol=0, atol=0)
+        self.assertEqual(seen, [16, 3, 16, 0])
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA graph replay required")
+    def test_decoder_projection_break_replays_live_rows_and_clears_tail(self):
+        from tokenspeed.runtime.execution.breakable_cuda_graph import BreakableCapture
+
+        inner = HYV4ModelNextN.__new__(HYV4ModelNextN)
+        seen = []
+        weight = torch.randn(6, 4, device="cuda", dtype=torch.bfloat16)
+
+        def project(hidden):
+            seen.append(hidden.shape[0])
+            return torch.nn.functional.linear(hidden, weight), None
+
+        inner.decoder = SimpleNamespace(self_attn=SimpleNamespace(o_proj=project))
+        hidden = torch.randn(16, 4, device="cuda", dtype=torch.bfloat16)
+        cap = BreakableCapture()
+        cap.stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(cap.stream):
+            inner._project_attention(hidden)
+        cap.stream.synchronize()
+        with cap:
+            output = inner._project_attention(hidden) + 1
+        self.assertEqual(cap.num_segments, 3)
+        for rows in (3, 16, 1):
+            with self.subTest(rows=rows):
+                hidden.normal_()
+                cap.replay(valid_rows=rows)
+                expected = torch.nn.functional.linear(hidden[:rows], weight) + 1
+                torch.testing.assert_close(output[:rows], expected, rtol=0, atol=0)
+                self.assertTrue(bool((output[rows:] == 1).all()))
+                self.assertEqual(seen[-1], rows)
+
 
 class HYV4RuntimeCapabilityTests(unittest.TestCase):
     def test_pipeline_is_rejected_before_embeddings_or_layers(self):

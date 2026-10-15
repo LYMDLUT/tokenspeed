@@ -37,6 +37,11 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    break_point,
+    current_valid_rows,
+    slice_to_real_tokens,
+)
 from tokenspeed.runtime.execution.context import (
     ForwardContext,
     report_collective_sizing,
@@ -221,6 +226,16 @@ class HYV4ModelNextN(nn.Module):
             None if residual is None else residual.index_select(0, gather_ids),
         )
 
+    @break_point
+    def _project_attention(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Project live rows with the same GEMM shape as eager narrowing."""
+        valid_rows = current_valid_rows()
+        if valid_rows is not None:
+            (hidden,) = slice_to_real_tokens(valid_rows, hidden)
+        # Padding can select a different BF16 GEMM reduction. The break lands
+        # these live outputs into the decoder's fixed-row handoff buffer.
+        return self.decoder.self_attn.o_proj(hidden)[0]
+
     def decoder_forward(
         self, state: NextNRowState, ctx: ForwardContext
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
@@ -233,7 +248,7 @@ class HYV4ModelNextN(nn.Module):
         layer = self.decoder
         with report_collective_sizing(ctx, state.rows, ctx.global_bs):
             if not ctx.forward_mode.is_idle():
-                hidden, _ = layer.self_attn.o_proj(hidden)
+                hidden = self._project_attention(hidden)
                 hidden, residual = layer.post_attention_norm(hidden, residual, ctx)
             num_global, max_per_gpu = layer.comm_manager.get_num_tokens(ctx)
             hidden = layer.comm_manager.pre_mlp_comm(hidden, ctx)
