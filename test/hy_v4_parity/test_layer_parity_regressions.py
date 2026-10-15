@@ -408,6 +408,130 @@ def test_hc_output_is_measured_after_a_separate_norm():
         dumper.detach()
 
 
+class _PreModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+        self.last_output = None
+
+    def forward(self, x):
+        self.calls += 1
+        self.last_output = x.sum(dim=1)
+        return self.last_output, torch.ones_like(x[..., 0])
+
+
+class _MethodBoundary(torch.nn.Module):
+    """Match vLLM's prepare_input/pre/post wrapper, which has no forward."""
+
+    def __init__(self, enabled):
+        super().__init__()
+        self.enable_ihc = enabled
+        self.pre_calls = 0
+        if enabled:
+            self.hc_pre = _PreModule()
+
+    def prepare_input(self, hidden_states):
+        if self.enable_ihc and hidden_states.ndim == 2:
+            return hidden_states[:, None, :].repeat(1, 2, 1)
+        return hidden_states
+
+    def pre(self, hidden_states):
+        self.pre_calls += 1
+        if not self.enable_ihc:
+            return hidden_states, None, hidden_states
+        reduced, gates = self.hc_pre(hidden_states)
+        return reduced, gates, hidden_states
+
+    def post(self, output, residual, gates):
+        if not self.enable_ihc:
+            return output + residual
+        return residual + output[:, None, :] * gates[..., None]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_method_ihc_wrapper_uses_pre_module_and_normalized_consumer(enabled):
+    from test.hy_v4_parity.hy_v4_parity_hook import LayerDumper
+
+    class MethodLayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.hc_attn_layer = _MethodBoundary(enabled)
+            self.hc_mlp_layer = _MethodBoundary(enabled)
+            self.self_attn = _Attention()
+            self.mlp = _Mlp()
+            self.consumer_inputs = {}
+
+        def forward(self, hidden_states):
+            for stage, boundary, consumer in (
+                ("attn", self.hc_attn_layer, self.self_attn),
+                ("mlp", self.hc_mlp_layer, self.mlp),
+            ):
+                prepared = boundary.prepare_input(hidden_states)
+                x, gates, residual = boundary.pre(prepared)
+                x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + 1e-5)
+                self.consumer_inputs[stage] = x.detach().clone()
+                if stage == "attn":
+                    x = consumer(positions=torch.arange(x.shape[0]), hidden_states=x)
+                else:
+                    x = consumer(hidden_states=x)
+                hidden_states = boundary.post(x, residual, gates)
+            return hidden_states
+
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList([MethodLayer()])
+    layer = model.layers[0]
+    inputs = torch.tensor([[1.0, 2.0, 4.0], [3.0, 1.0, 2.0]])
+    expected = layer(inputs)
+    before_calls = [
+        boundary.pre_calls for boundary in (layer.hc_attn_layer, layer.hc_mlp_layer)
+    ]
+    dumper = LayerDumper()
+    try:
+        dumper.attach(model, num_layers=1)
+        torch.testing.assert_close(layer(inputs), expected, rtol=0, atol=0)
+        dumper.validate_complete()
+        assert len(dumper.records) == (8 if enabled else 4)
+        for i, stage in enumerate(("attn", "mlp")):
+            boundary = getattr(layer, f"hc_{stage}_layer")
+            assert boundary.pre_calls == before_calls[i] + 1
+            if enabled:
+                assert boundary.hc_pre.calls == before_calls[i] + 1
+                assert dumper.records[f"p0_layer0_hc_{stage}_in"]["shape"] == [2, 2, 3]
+                assert (
+                    dumper.records[f"p0_layer0_hc_{stage}_out"]
+                    == dumper.records[f"p0_layer0_{stage}_in"]
+                )
+                torch.testing.assert_close(
+                    torch.tensor(dumper.records[f"p0_layer0_hc_{stage}_out"]["sample"]),
+                    layer.consumer_inputs[stage],
+                    rtol=0,
+                    atol=0,
+                )
+                assert not torch.equal(
+                    boundary.hc_pre.last_output, layer.consumer_inputs[stage]
+                )
+    finally:
+        dumper.detach()
+    before = copy.deepcopy(dumper.records)
+    layer(inputs * 7)
+    assert dumper.records == before
+
+
+def test_unknown_method_boundary_is_rejected():
+    from test.hy_v4_parity.hy_v4_parity_hook import LayerDumper
+
+    class UnknownMethodLayer(torch.nn.Module):
+        __module__ = "torch.nn"
+
+    model = torch.nn.Module()
+    layer = UnknownMethodLayer()
+    # No residual_ops or known hc_pre module means this layout is unsupported.
+    layer.hc_attn_layer = torch.nn.Module()
+    model.layers = torch.nn.ModuleList([layer])
+    with pytest.raises(ValueError, match="unsupported functional boundary"):
+        LayerDumper().attach(model, num_layers=1)
+
+
 def test_reference_uses_token_ids_without_loading_a_tokenizer(tmp_path, monkeypatch):
     import sys
     import types

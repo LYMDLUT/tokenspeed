@@ -81,6 +81,7 @@ def _run(args) -> int:
 
     engine = Engine(
         model=args.model,
+        seed=args.seed,
         # The scheduler loads a tokenizer even with ids in and out; the
         # truncated checkpoint carries none.
         tokenizer=args.tokenizer,

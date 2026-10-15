@@ -278,10 +278,10 @@ def check_ihc(residual_ops, *, num_tokens: int, hc: int, hidden: int, dtype) -> 
 
 
 def check_ihc_rejects_oversized(residual_ops, *, dtype) -> None:
-    """The fused kernels cap hc_mult at 8 and must refuse larger values loudly.
+    """The forced Triton pre kernel must refuse hc_mult above its limit of 8.
 
-    A kernel that silently mis-computes for an unsupported channel count would be
-    far worse than one that raises, so the refusal is part of the contract.
+    The public dispatcher can select the portable fallback for larger channel
+    counts; this checks the explicit kernel override, not that public contract.
     """
     import torch
 
@@ -292,16 +292,61 @@ def check_ihc_rejects_oversized(residual_ops, *, dtype) -> None:
     base = torch.randn(2 * hc, device="cuda") * 0.1
     try:
         residual_ops.ihc_pre(
-            x, fn, scale, base, 1.7, 0.5, 0.05, norm_weight=None, norm_eps=None
+            x,
+            fn,
+            scale,
+            base,
+            1.7,
+            0.5,
+            0.05,
+            norm_weight=None,
+            norm_eps=None,
+            override="triton_ihc_pre",
         )
     except Exception as error:
         _check(
-            "8" in str(error),
-            "ihc_pre refuses hc_mult > 8 with a clear error",
-            str(error)[:80],
+            isinstance(error, ValueError)
+            and str(error) == f"iHC supports up to 8 channels, got {hc}",
+            "forced triton_ihc_pre refuses hc_mult > 8 with a clear error",
+            f"{type(error).__name__}: {error}"[:160],
         )
         return
-    _check(False, "ihc_pre refuses hc_mult > 8 with a clear error", "no error raised")
+    _check(
+        False,
+        "forced triton_ihc_pre refuses hc_mult > 8 with a clear error",
+        "no error raised",
+    )
+
+
+def check_ihc_oversized_fallback(residual_ops, *, dtype) -> None:
+    """The public hc=16 pre boundary must remain numerically correct."""
+    import torch
+
+    torch.manual_seed(16)
+    hc, hidden = 16, 128
+    x = torch.randn(4, hc, hidden, device="cuda").to(dtype)
+    fn = torch.randn(2 * hc, hc * hidden, device="cuda") * 0.02
+    scale = torch.rand(2, device="cuda") + 0.5
+    base = torch.randn(2 * hc, device="cuda") * 0.1
+    got, got_post = residual_ops.ihc_pre(
+        x, fn, scale, base, 1.7, 0.5, 0.05, norm_weight=None, norm_eps=None
+    )
+    ref, ref_post = _reference_ihc_pre(
+        x.cpu(), fn.cpu(), scale.cpu(), base.cpu(), hc, 1.7, 0.05, 0.5
+    )
+    out_err = (got.cpu().float() - ref.float()).abs().max().item()
+    post_err = (got_post.cpu().float() - ref_post.float()).abs().max().item()
+    tolerance = _bf16_tolerance(ref)
+    _check(
+        torch.isfinite(got).all().item() and out_err <= tolerance,
+        "public ihc_pre hc_mult=16 fallback matches the reference",
+        f"max|diff|={out_err:.3e} tol={tolerance:.3e}",
+    )
+    _check(
+        torch.isfinite(got_post).all().item() and post_err <= 1e-4,
+        "public ihc_pre hc_mult=16 fallback post gates match the reference",
+        f"max|diff|={post_err:.3e}",
+    )
 
 
 def check_ihc_shapes(residual_ops, *, dtype) -> None:
@@ -539,6 +584,7 @@ def main() -> int:
     )
     check_ihc_shapes(residual_ops, dtype=dtype)
     check_ihc_rejects_oversized(residual_ops, dtype=dtype)
+    check_ihc_oversized_fallback(residual_ops, dtype=dtype)
 
     print("\n== learnable sink ==")
     try:
