@@ -106,10 +106,11 @@ __global__ __launch_bounds__(128, 1) void router_gemm_kernel_float_output(float*
 
   __syncthreads();
 
-  if (tid < kNumWarps) {
+  // One thread combines the warp partials and owns the shared result.
+  if (tid == 0) {
 #pragma unroll
     for (int m_idx = 0; m_idx < kNumTokens; m_idx++) {
-      float sum = sm_reduction[m_idx][tid];
+      float sum = sm_reduction[m_idx][0];
       for (int i = 1; i < kNumWarps; i++) {
         sum += sm_reduction[m_idx][i];
       }

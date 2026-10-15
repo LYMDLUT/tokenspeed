@@ -305,6 +305,42 @@ class TestDsv3RouterGemm:
         out = tk_gemm(hidden, weights_fp32, out_dtype=torch.float32)
         assert torch.allclose(out, ref, atol=1e-1, rtol=1e-2)
 
+    @pytest.mark.parametrize("num_tokens", [1, 3, 30, 32])
+    @pytest.mark.parametrize(
+        "weight_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"]
+    )
+    def test_exact_warp_contributions(self, num_tokens, weight_dtype):
+        """Unequal exact contributions exercise the reduction across four warps.
+
+        Run this test under compute-sanitizer --tool racecheck as well: value
+        equality alone can miss a shared-memory write/write race when the
+        correct writer consistently wins.
+        """
+        from tokenspeed_kernel.thirdparty.cuda import dsv3_router_gemm as tk_gemm
+
+        if not current_platform().is_hopper_plus:
+            pytest.skip("Router GEMM requires SM90 or newer")
+
+        # These separated nonzeros contribute different exact integers from
+        # each warp. Token and expert scales also expose row/stride mistakes.
+        columns = [0, 256, 512, 768]
+        hidden_cpu = torch.zeros(num_tokens, 6144, dtype=torch.bfloat16, device="cpu")
+        weights_cpu = torch.zeros(8, 6144, dtype=weight_dtype, device="cpu")
+        token_scale = torch.arange(1, num_tokens + 1, dtype=torch.float32, device="cpu")
+        expert_scale = torch.arange(1, 9, dtype=torch.float32, device="cpu")
+        hidden_cpu[:, columns] = token_scale[:, None].to(torch.bfloat16)
+        contributions = torch.tensor([1, 2, 4, 8], dtype=torch.float32, device="cpu")
+        weights_cpu[:, columns] = (expert_scale[:, None] * contributions[None, :]).to(
+            weight_dtype
+        )
+        expected = (hidden_cpu.double() @ weights_cpu.double().T).float()
+        hidden = hidden_cpu.cuda()
+        weights = weights_cpu.cuda()
+
+        for _ in range(5):
+            actual = tk_gemm(hidden, weights, out_dtype=torch.float32, enable_pdl=False)
+            torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+
     @pytest.mark.parametrize("num_tokens", [1, 8, 16])
     def test_correctness_varied_tokens(self, num_tokens):
         """Matches torch ref at various token counts."""
