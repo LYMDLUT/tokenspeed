@@ -53,7 +53,7 @@ from tokenspeed.runtime.layers.linear import (
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.utils import block_dequant
-from tokenspeed.runtime.layers.rotary_embedding import get_rope
+from tokenspeed.runtime.layers.rotary_embedding import RotaryEmbedding, get_rope
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.base.decoder_layer import capture_layer_input
@@ -207,13 +207,33 @@ class GlmDsaIndexer(nn.Module):
         self.k_norm = LayerNorm(self.index_head_dim, eps=1e-6)
 
         rope_scaling = _glm_dsa_rope_scaling(rope_scaling)
-        self.rotary_emb = get_rope(
-            self.rope_head_dim,
+        self.rotary_emb = self._make_rotary_embedding(
+            head_size=self.rope_head_dim,
             rotary_dim=self.rope_head_dim,
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
             is_neox_style=not getattr(config, "indexer_rope_interleave", False),
+        )
+
+    def _make_rotary_embedding(
+        self,
+        *,
+        head_size: int,
+        rotary_dim: int,
+        max_position: int,
+        base: float,
+        rope_scaling: dict[str, Any] | None,
+        is_neox_style: bool,
+    ) -> RotaryEmbedding:
+        """Build RoPE with the existing GLM indexer cache and scaling contract."""
+        return get_rope(
+            head_size,
+            rotary_dim=rotary_dim,
+            max_position=max_position,
+            base=base,
+            rope_scaling=rope_scaling,
+            is_neox_style=is_neox_style,
         )
 
     def set_wk_weights_proj_loaded(self, loaded: bool = True) -> None:

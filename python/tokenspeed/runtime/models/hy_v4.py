@@ -39,11 +39,11 @@ from __future__ import annotations
 import inspect
 from collections.abc import Iterable
 from dataclasses import replace
-from typing import NamedTuple
+from functools import lru_cache
+from typing import Any, NamedTuple
 
 import torch
 from tokenspeed_kernel.ops import residual as residual_ops
-from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
 from tokenspeed_kernel.ops.attention import dsa as dsa_ops
 from torch import nn
 from transformers import PretrainedConfig
@@ -72,6 +72,7 @@ from tokenspeed.runtime.layers.quantization.modelopt_mxfp8 import (
     ModelOptMxfp8Config,
     preprocess_modelopt_mxfp8_weights,
 )
+from tokenspeed.runtime.layers.rotary_embedding import RotaryEmbedding
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.deepseek_v3 import (
@@ -154,6 +155,55 @@ def check_hyv4_runtime(mapping: Mapping, *, enable_ihc: bool) -> None:
         )
 
 
+class HYV4RotaryEmbedding(RotaryEmbedding):
+    """Plain RoPE with coefficients rounded to the activation dtype."""
+
+    def _compute_cos_sin_cache(self) -> torch.Tensor:
+        # The prologue stores coefficients in FP32, but HY V4 rotates with
+        # coefficients rounded to the model dtype before FP32 arithmetic.
+        return super()._compute_cos_sin_cache().to(self.dtype).float()
+
+
+@lru_cache(maxsize=16)
+def _cached_hyv4_rope(
+    *,
+    head_size: int,
+    rotary_dim: int,
+    max_position: int,
+    base: float,
+    is_neox_style: bool,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> HYV4RotaryEmbedding:
+    # Keep this cache separate from GLM/DeepSeek, including across devices.
+    with torch.device(device):
+        return HYV4RotaryEmbedding(
+            head_size, rotary_dim, max_position, base, is_neox_style, dtype
+        )
+
+
+def _make_hyv4_rope(
+    *,
+    head_size: int,
+    rotary_dim: int,
+    max_position: int,
+    base: float,
+    rope_scaling: dict[str, Any] | None,
+    is_neox_style: bool,
+) -> HYV4RotaryEmbedding:
+    if rope_scaling is not None:
+        raise ValueError("HY V4 requires plain RoPE")
+    return _cached_hyv4_rope(
+        head_size=head_size,
+        rotary_dim=rotary_dim,
+        max_position=max_position,
+        base=base,
+        is_neox_style=is_neox_style,
+        dtype=torch.get_default_dtype(),
+        device=torch.empty(0).device,
+    )
+
+
 class HYV4DsaIndexer(GlmDsaIndexer):
     """DSA indexer using HY V4's checkpoint layout.
 
@@ -163,6 +213,25 @@ class HYV4DsaIndexer(GlmDsaIndexer):
     first), and rotates it interleaved. Rotating the wrong slice would corrupt
     the sparse selection silently instead of failing loudly.
     """
+
+    def _make_rotary_embedding(
+        self,
+        *,
+        head_size: int,
+        rotary_dim: int,
+        max_position: int,
+        base: float,
+        rope_scaling: dict[str, Any] | None,
+        is_neox_style: bool,
+    ) -> RotaryEmbedding:
+        return _make_hyv4_rope(
+            head_size=head_size,
+            rotary_dim=rotary_dim,
+            max_position=max_position,
+            base=base,
+            rope_scaling=rope_scaling,
+            is_neox_style=is_neox_style,
+        )
 
     def forward(
         self,
@@ -323,6 +392,25 @@ class HYV4Attention(GlmMoeDsaAttention):
             return
         self.attn_mqa.attn_sink = self.learnable_sink_param.detach()
 
+    def _make_rotary_embedding(
+        self,
+        *,
+        head_size: int,
+        rotary_dim: int,
+        max_position: int,
+        base: float,
+        rope_scaling: dict[str, Any] | None,
+        is_neox_style: bool,
+    ) -> RotaryEmbedding:
+        return _make_hyv4_rope(
+            head_size=head_size,
+            rotary_dim=rotary_dim,
+            max_position=max_position,
+            base=base,
+            rope_scaling=rope_scaling,
+            is_neox_style=is_neox_style,
+        )
+
     def _apply_output_gate(
         self,
         attn_output: torch.Tensor,
@@ -338,11 +426,10 @@ class HYV4Attention(GlmMoeDsaAttention):
         gate = self.linear_gate(hidden_states)[0]
         if self.gate_size_per_head == 1:
             shaped = attn_output.view(attn_output.shape[0], -1, self.v_head_dim)
-            shaped = shaped * torch.sigmoid(gate.float()).to(shaped.dtype).unsqueeze(-1)
+            shaped = shaped * torch.sigmoid(gate).unsqueeze(-1)
             return shaped.reshape(attn_output.shape[0], -1)
-        # One fused pass instead of a sigmoid plus a multiply.
-        sigmoid_mul(attn_output, gate)
-        return attn_output
+        # Materialize the sigmoid in the gate dtype before the product.
+        return attn_output * torch.sigmoid(gate)
 
     def forward(
         self,
@@ -807,7 +894,7 @@ class HYV4DecoderLayer(nn.Module):
                 ctx=ctx,
                 comm_manager=self.comm_manager,
             )
-            hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
+            hidden_states, residual = self.post_attention_norm(
                 hidden_states, residual, ctx
             )
         hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
@@ -818,6 +905,19 @@ class HYV4DecoderLayer(nn.Module):
             hidden_states, residual, ctx
         )
         return hidden_states, residual
+
+    def post_attention_norm(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Materialize the attention residual before its separate RMSNorm."""
+        hidden_states, residual = self.comm_manager.post_attn_comm(
+            hidden_states, residual, ctx
+        )
+        residual = hidden_states + residual
+        return self.post_attention_layernorm(residual), residual
 
     def _run_mlp(
         self,
@@ -977,13 +1077,9 @@ class HYV4Model(nn.Module):
         )
         residual = None
         if self.hc_head is not None:
-            # One embedding row seeds every channel, as in the reference. The
-            # channels stay FP32 across layers: rounding them to BF16 at every
-            # sub-block boundary compounds into a visible logit drift, while
-            # FP32 channels round only each sub-block's input.
-            hidden_states = (
-                hidden_states.float().unsqueeze(1).repeat(1, self.config.hc_mult, 1)
-            )
+            # Keep the embedding dtype across channels so every sub-block
+            # materializes its residual before the next pre boundary.
+            hidden_states = hidden_states.unsqueeze(1).repeat(1, self.config.hc_mult, 1)
 
         for layer in self.layers:
             hidden_states, residual = layer(positions, hidden_states, ctx, residual)

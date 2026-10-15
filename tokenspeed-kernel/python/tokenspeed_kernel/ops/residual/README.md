@@ -14,8 +14,9 @@ iHC keeps `hc_mult` parallel residual channels shaped
   `ihc_pre` as one boundary, returning the updated channels with the next
   sub-block's input and post gates.
 
-The channels may be BF16 or FP32; HY V4 keeps them in FP32 across the decoder
-stack. The projection `fn`, scales `hc_scale` and biases `hc_base` are FP32,
+The channels may be BF16 or FP32; HY V4 keeps the embedding dtype across the
+decoder stack, rounding BF16 channels at each sub-block boundary.
+The projection `fn`, scales `hc_scale` and biases `hc_base` are FP32,
 and every gate is evaluated in FP32. A pre boundary has `2 * hc_mult` gates
 (pre, then post) and two scales; the head has `hc_mult` gates and one scale.
 

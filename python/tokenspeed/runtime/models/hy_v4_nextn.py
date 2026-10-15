@@ -234,9 +234,7 @@ class HYV4ModelNextN(nn.Module):
         with report_collective_sizing(ctx, state.rows, ctx.global_bs):
             if not ctx.forward_mode.is_idle():
                 hidden, _ = layer.self_attn.o_proj(hidden)
-                hidden, residual = layer.comm_manager.post_attn_reduce_norm(
-                    hidden, residual, ctx
-                )
+                hidden, residual = layer.post_attention_norm(hidden, residual, ctx)
             num_global, max_per_gpu = layer.comm_manager.get_num_tokens(ctx)
             hidden = layer.comm_manager.pre_mlp_comm(hidden, ctx)
             hidden = layer._run_mlp(hidden, num_global, max_per_gpu)

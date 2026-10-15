@@ -52,6 +52,15 @@ Dtype labels remain diagnostic; finite activation values are judged using the
 explicit numerical tolerances, not a new cross-engine storage-dtype equality
 rule.
 
+HY V4 keeps its iHC channels in the embedding dtype. Its pre boundary rounds
+the channel reduction before RMSNorm, and each post boundary materializes the
+updated channels. RoPE coefficients and the attention sigmoid round to the
+model dtype before their following arithmetic. The MTP attention residual is
+materialized before its post-attention RMSNorm; its final add+RMSNorm remains
+fused. These model boundaries also apply when generic execution kernels fuse
+other operations. Precision-changing diagnostic interventions must be reported
+separately from an unmodified reference parity run.
+
 ## Which taps are compared
 
 Callable sub-blocks are hooked with their named activation argument, including

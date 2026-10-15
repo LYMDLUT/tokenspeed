@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""HY V4 config, weight-loading and iHC numerics tests (cheap, no GPU)."""
+"""HY V4 config, weight-loading, iHC and attention regression tests."""
 
 from __future__ import annotations
 
@@ -48,11 +48,14 @@ from tokenspeed.runtime.configs.model_config import (
     _resolve_attention_family,
     configure_dsa_attention,
 )
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.model_runner import ModelRunner
+from tokenspeed.runtime.layers.linear import ColumnParallelLinear
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config, Mxfp8Config
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
 from tokenspeed.runtime.layers.quantization.modelopt_mxfp8 import ModelOptMxfp8Config
 from tokenspeed.runtime.layers.quantization.w8a8_fp8 import W8A8Fp8Config
+from tokenspeed.runtime.layers.rotary_embedding import RotaryEmbedding, get_rope
 from tokenspeed.runtime.model_loader import loader as model_loader
 from tokenspeed.runtime.models import hy_v4, hy_v4_nextn
 from tokenspeed.runtime.models.base.weight_update import weight_update_session
@@ -60,6 +63,7 @@ from tokenspeed.runtime.models.hy_v4 import (
     HYV4Attention,
     HYV4ForCausalLM,
     HYV4Model,
+    HYV4RotaryEmbedding,
     check_hyv4_quant_config,
     check_hyv4_speculative_algorithm,
     load_hyv4_weights,
@@ -681,40 +685,149 @@ class HYV4SpeculativeCaptureTests(unittest.TestCase):
                     setter(SimpleNamespace(), [1])
 
 
-class HYV4OutputGateTests(unittest.TestCase):
-    @staticmethod
-    def _attention(gate: torch.Tensor, gate_size_per_head: int) -> SimpleNamespace:
-        return SimpleNamespace(
-            linear_gate=lambda _hidden_states: (gate,),
-            gate_size_per_head=gate_size_per_head,
-            v_head_dim=4,
-        )
-
-    def test_elementwise_gate_runs_the_fused_kernel_in_place(self):
-        attn_output, gate = torch.randn(3, 8), torch.randn(3, 8)
-        expected = attn_output * torch.sigmoid(gate)
-        with mock.patch.object(
-            hy_v4, "sigmoid_mul", side_effect=lambda x, g: x.mul_(torch.sigmoid(g))
-        ) as fused:
-            out = HYV4Attention._apply_output_gate(
-                self._attention(gate, 4), attn_output, torch.empty(3, 16)
+class _HYV4AttentionFixture(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(
+            mock.patch.dict(
+                hy_v4.global_server_args_dict,
+                {
+                    "tp_batch_invariant": "none",
+                    "numerics": "auto",
+                    "dense_gemm_backend": "auto",
+                    "attention_backend": "dsa",
+                },
             )
-        fused.assert_called_once()
-        (x, g), _ = fused.call_args
-        self.assertIs(x, attn_output)
-        self.assertIs(g, gate)
-        self.assertIs(out, attn_output)
-        torch.testing.assert_close(out, expected)
-
-    def test_headwise_gate_scales_each_head(self):
-        attn_output, gate = torch.randn(3, 8), torch.randn(3, 2)
-        expected = (
-            attn_output.view(3, 2, 4) * torch.sigmoid(gate).unsqueeze(-1)
-        ).reshape(3, 8)
-        out = HYV4Attention._apply_output_gate(
-            self._attention(gate, 1), attn_output, torch.empty(3, 16)
         )
-        torch.testing.assert_close(out, expected)
+        self.addCleanup(torch.set_default_dtype, torch.get_default_dtype())
+        torch.set_default_dtype(torch.bfloat16)
+
+    def _attention(self, *, gating_type: str, device: str):
+        config = HYV4Config(
+            hidden_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            q_lora_rank=8,
+            kv_lora_rank=4,
+            qk_nope_head_dim=4,
+            qk_rope_head_dim=4,
+            v_head_dim=4,
+            index_n_heads=2,
+            index_head_dim=8,
+            index_topk=2,
+            max_position_embeddings=32,
+            mlp_layer_types=["dense"],
+            indexer_types=["full"],
+            gating_type=gating_type,
+        )
+        with torch.device(device):
+            return HYV4Attention(
+                config, Mapping(rank=0, world_size=1), layer_id=0, is_nextn=False
+            )
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "real linear gate requires a GPU")
+class HYV4OutputGateTests(_HYV4AttentionFixture):
+    def _inputs(self, attention):
+        self.assertIsInstance(attention.linear_gate, ColumnParallelLinear)
+        weight = attention.linear_gate.weight
+        self.assertEqual(weight.dtype, torch.bfloat16)
+        with torch.no_grad():
+            weight.zero_()
+            indices = torch.arange(weight.shape[0], device=weight.device)
+            weight[indices, indices] = 1
+        hidden = (
+            torch.linspace(-2, 2, 48, dtype=torch.float32, device=weight.device)
+            .reshape(3, 16)
+            .bfloat16()
+        )
+        output = (
+            torch.linspace(-2, 2, 24, dtype=torch.float32, device=weight.device)
+            .reshape(3, 8)
+            .bfloat16()
+        )
+        # This pair distinguishes a BF16 sigmoid boundary from one final
+        # BF16 cast after a fused FP32 sigmoid and multiplication.
+        hidden[0, 0], output[0, 0] = 0.5, 1.5
+        gate, _ = attention.linear_gate(hidden)
+        torch.testing.assert_close(gate, hidden[:, : weight.shape[0]], rtol=0, atol=0)
+        return hidden, output, gate
+
+    def test_elementwise_gate_rounds_sigmoid_before_multiplication(self):
+        attention = self._attention(gating_type="elementwise", device="cuda")
+        hidden, output, gate = self._inputs(attention)
+        expected = output * torch.sigmoid(gate)
+        fused_fp32 = (output.float() * torch.sigmoid(gate.float())).bfloat16()
+        self.assertNotEqual(expected[0, 0].item(), fused_fp32[0, 0].item())
+
+        actual = attention._apply_output_gate(output.clone(), hidden)
+
+        self.assertEqual(actual.dtype, torch.bfloat16)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_headwise_gate_rounds_sigmoid_before_scaling_each_head(self):
+        attention = self._attention(gating_type="headwise", device="cuda")
+        hidden, output, gate = self._inputs(attention)
+        expected = (
+            output.reshape(3, 2, 4) * torch.sigmoid(gate).unsqueeze(-1)
+        ).reshape(3, 8)
+
+        actual = attention._apply_output_gate(output.clone(), hidden)
+
+        self.assertEqual(actual.dtype, torch.bfloat16)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+class HYV4RotaryEmbeddingTests(_HYV4AttentionFixture):
+    def test_coefficients_round_through_bf16_but_stay_in_fp32_storage(self):
+        with torch.device("cpu"):
+            generic = RotaryEmbedding(4, 4, 32, 1e7, False, torch.bfloat16)
+            original = generic.cos_sin_cache.clone()
+            rotary = HYV4RotaryEmbedding(4, 4, 32, 1e7, False, torch.bfloat16)
+
+        self.assertEqual(rotary.cos_sin_cache.dtype, torch.float32)
+        self.assertEqual(generic.cos_sin_cache.dtype, torch.float32)
+        torch.testing.assert_close(
+            rotary.cos_sin_cache, original.bfloat16().float(), rtol=0, atol=0
+        )
+        self.assertFalse(torch.equal(original, rotary.cos_sin_cache))
+        torch.testing.assert_close(generic.cos_sin_cache, original, rtol=0, atol=0)
+
+    def test_main_and_indexer_use_the_same_hyv4_cache(self):
+        attention = self._attention(gating_type="elementwise", device="cpu")
+        repeated = self._attention(gating_type="elementwise", device="cpu")
+
+        self.assertIsInstance(attention.rotary_emb, HYV4RotaryEmbedding)
+        self.assertIsNotNone(attention.indexer)
+        self.assertIsInstance(attention.indexer, hy_v4.HYV4DsaIndexer)
+        self.assertIs(attention.indexer.rotary_emb, attention.rotary_emb)
+        self.assertIs(attention.attn_mqa.rotary_emb, attention.rotary_emb)
+        self.assertIs(attention.attn_mha.rotary_emb, attention.rotary_emb)
+        self.assertIs(repeated.rotary_emb, attention.rotary_emb)
+        self.assertEqual(attention.rotary_emb.dtype, torch.bfloat16)
+        self.assertEqual(attention.rotary_emb.cos_sin_cache.dtype, torch.float32)
+
+    def test_hyv4_factory_does_not_replace_the_generic_rope_cache(self):
+        kwargs = dict(
+            head_size=4,
+            rotary_dim=4,
+            max_position=32,
+            base=1e7,
+            is_neox_style=False,
+            dtype=torch.bfloat16,
+        )
+        with torch.device("cpu"):
+            generic = get_rope(**kwargs)
+            original = generic.cos_sin_cache.clone()
+            attention = self._attention(gating_type="elementwise", device="cpu")
+            generic_again = get_rope(**kwargs)
+
+        self.assertIs(type(generic), RotaryEmbedding)
+        self.assertIs(generic_again, generic)
+        self.assertIsNot(attention.rotary_emb, generic)
+        self.assertEqual(generic.cos_sin_cache.dtype, torch.float32)
+        torch.testing.assert_close(generic.cos_sin_cache, original, rtol=0, atol=0)
+        self.assertFalse(torch.equal(original, original.bfloat16().float()))
 
 
 class HYV4NextNPrefillStagesTests(unittest.TestCase):
@@ -818,8 +931,8 @@ class HYV4NextNPrefillStagesTests(unittest.TestCase):
         inner.final_layernorm = object()
         inner.decoder = SimpleNamespace(
             self_attn=SimpleNamespace(o_proj=lambda h: note("o_proj", (wide, None))),
+            post_attention_norm=lambda h, r, c: note("post_attn", (h, r)),
             comm_manager=SimpleNamespace(
-                post_attn_reduce_norm=lambda h, r, c: note("post_attn", (h, r)),
                 get_num_tokens=lambda c: note("num_tokens", (2, 2)),
                 pre_mlp_comm=lambda h, c: note("pre_mlp", h),
                 post_mlp_fused=lambda h, r, c: note("post_mlp", (h, r)),

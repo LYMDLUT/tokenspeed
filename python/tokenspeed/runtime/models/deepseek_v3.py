@@ -113,7 +113,7 @@ from tokenspeed.runtime.layers.quantization.utils import (
     block_dequant,
     should_exclude_quant_module,
 )
-from tokenspeed.runtime.layers.rotary_embedding import get_rope
+from tokenspeed.runtime.layers.rotary_embedding import RotaryEmbedding, get_rope
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -726,8 +726,8 @@ class DeepseekV3AttentionMLA(nn.Module):
             )
 
         if not skip_rope:
-            self.rotary_emb = get_rope(
-                qk_rope_head_dim,
+            self.rotary_emb = self._make_rotary_embedding(
+                head_size=qk_rope_head_dim,
                 rotary_dim=qk_rope_head_dim,
                 max_position=max_position_embeddings,
                 base=rope_theta,
@@ -775,6 +775,26 @@ class DeepseekV3AttentionMLA(nn.Module):
 
         self.w_kc = None
         self.w_vc = None
+
+    def _make_rotary_embedding(
+        self,
+        *,
+        head_size: int,
+        rotary_dim: int,
+        max_position: int,
+        base: float,
+        rope_scaling: dict[str, Any] | None,
+        is_neox_style: bool,
+    ) -> RotaryEmbedding:
+        """Build RoPE with the existing DeepSeek cache and scaling contract."""
+        return get_rope(
+            head_size,
+            rotary_dim=rotary_dim,
+            max_position=max_position,
+            base=base,
+            rope_scaling=rope_scaling,
+            is_neox_style=is_neox_style,
+        )
 
     def _make_qkv_a_projection(
         self, *, quant_config: QuantizationConfig | None, prefix: str
