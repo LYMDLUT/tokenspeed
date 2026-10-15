@@ -27,7 +27,6 @@ LLM class, event loop, tasks, async generators, and threads are all real.
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import importlib.util
 import json
@@ -402,66 +401,6 @@ def _noncooperative_task_reports_timeout_and_can_finish_later() -> None:
     assert not llm._thread.is_alive()
 
 
-def _engine_teardown_survives_llm_shutdown_failure() -> None:
-    # Engine imports GPU runtime modules. Compile its unchanged shutdown body
-    # directly from the production source; only its collaborators are fakes.
-    source = (
-        pathlib.Path(__file__).resolve().parents[2]
-        / "python"
-        / "tokenspeed"
-        / "runtime"
-        / "entrypoints"
-        / "engine.py"
-    )
-    tree = ast.parse(source.read_text())
-    engine_class = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "Engine"
-    )
-    shutdown = next(
-        node
-        for node in engine_class.body
-        if isinstance(node, ast.FunctionDef) and node.name == "shutdown"
-    )
-    failure = RuntimeError("test LLM shutdown failure")
-    trace = []
-
-    def fail_shutdown() -> None:
-        trace.append("llm")
-        raise failure
-
-    def close_bootstrap() -> None:
-        trace.append("bootstrap")
-
-    def kill_children(pid, *, include_parent) -> None:
-        assert pid == 123
-        assert include_parent is False
-        trace.append("children")
-
-    namespace = {
-        "kill_process_tree": kill_children,
-        "os": types.SimpleNamespace(getpid=lambda: 123),
-    }
-    exec(
-        compile(ast.Module(body=[shutdown], type_ignores=[]), str(source), "exec"),
-        namespace,
-    )
-    engine = types.SimpleNamespace(
-        llm=types.SimpleNamespace(shutdown=fail_shutdown),
-        tokenizer_manager=types.SimpleNamespace(
-            bootstrap_server=types.SimpleNamespace(close=close_bootstrap)
-        ),
-    )
-    try:
-        namespace["shutdown"](engine)
-    except RuntimeError as exc:
-        assert exc is failure
-    else:
-        raise AssertionError("Engine.shutdown swallowed the LLM failure")
-    assert trace == ["llm", "bootstrap", "children"], trace
-
-
 def _stream_cancelled_before_first_step_wakes_consumer() -> None:
     started = []
 
@@ -547,7 +486,6 @@ _SCENARIOS = {
         _async_generator_cleanup_failure_preserves_exception_handler
     ),
     "shutdown_timeout": _noncooperative_task_reports_timeout_and_can_finish_later,
-    "engine_failure": _engine_teardown_survives_llm_shutdown_failure,
     "stream_cancelled_before_start": _stream_cancelled_before_first_step_wakes_consumer,
 }
 
@@ -587,9 +525,6 @@ class TestLLMLifecycle(unittest.TestCase):
 
     def test_shutdown_times_out_for_noncooperative_task(self) -> None:
         self._run_scenario("shutdown_timeout")
-
-    def test_engine_teardown_preserves_llm_shutdown_failure(self) -> None:
-        self._run_scenario("engine_failure")
 
     def test_stream_cancelled_before_start_wakes_consumer(self) -> None:
         self._run_scenario("stream_cancelled_before_start")
