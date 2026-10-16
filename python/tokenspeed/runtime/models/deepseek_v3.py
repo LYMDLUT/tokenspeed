@@ -323,10 +323,12 @@ class DeepseekV3MLP(nn.Module):
 class MoEGate(nn.Module):
     _DSV3_ROUTER_GEMM_HIDDEN = (3072, 6144, 7168)
 
-    def __init__(self, config, prefix: str = ""):
+    def __init__(self, config, prefix: str = "", *, params_dtype: torch.dtype):
         super().__init__()
         self.weight = nn.Parameter(
-            torch.empty((config.n_routed_experts, config.hidden_size))
+            torch.empty(
+                (config.n_routed_experts, config.hidden_size), dtype=params_dtype
+            )
         )
         if config.topk_method == "noaux_tc":
             self.e_score_correction_bias = nn.Parameter(
@@ -342,14 +344,18 @@ class MoEGate(nn.Module):
         )
 
     def forward(self, hidden_states):
-        if self.use_dsv3_router_gemm and hidden_states.size(0) > 0:
+        if (
+            self.use_dsv3_router_gemm
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.size(0) > 0
+        ):
             logits = dsv3_router_gemm(
                 hidden_states,
                 self.weight,
                 out_dtype=torch.float32,
             )
         else:
-            logits = F.linear(hidden_states, self.weight, None)
+            logits = F.linear(hidden_states.to(self.weight.dtype), self.weight, None)
         return logits
 
 
@@ -379,7 +385,11 @@ class DeepseekV3MoE(nn.Module):
                 f"Unsupported activation: {config.hidden_act}. Only silu is supported for now."
             )
 
-        self.gate = MoEGate(config=config, prefix=add_prefix("gate", prefix))
+        self.gate = MoEGate(
+            config=config,
+            prefix=add_prefix("gate", prefix),
+            params_dtype=torch.get_default_dtype(),
+        )
 
         if config.n_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts

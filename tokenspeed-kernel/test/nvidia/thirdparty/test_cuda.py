@@ -243,7 +243,7 @@ class TestApplyRopeWithCosSinCacheInplace:
 class TestDsv3RouterGemm:
     """dsv3_router_gemm
 
-    Supports num_tokens > 16 via cuBLAS fallback.
+    Supports num_tokens > 32 via cuBLAS fallback.
 
     Signature:
       dsv3_router_gemm(hidden_states, router_weights, out_dtype=torch.float32)
@@ -286,7 +286,7 @@ class TestDsv3RouterGemm:
         assert torch.allclose(out, ref, atol=1e-1, rtol=1e-2)
 
     def test_large_batch(self):
-        """Supports num_tokens > 16 (cuBLAS fallback)."""
+        """Supports num_tokens > 32 (cuBLAS fallback)."""
         from tokenspeed_kernel.thirdparty.cuda import dsv3_router_gemm as tk_gemm
 
         hidden, weights = self._make_inputs(num_tokens=64)
@@ -304,6 +304,53 @@ class TestDsv3RouterGemm:
         ref = self._torch_ref(hidden, weights_fp32)
         out = tk_gemm(hidden, weights_fp32, out_dtype=torch.float32)
         assert torch.allclose(out, ref, atol=1e-1, rtol=1e-2)
+
+    @pytest.mark.parametrize("num_tokens", [1, 30, 32, 33])
+    @pytest.mark.parametrize("enable_pdl", [False, True])
+    def test_fp32_weight_precision_eager_and_graph(self, num_tokens, enable_pdl):
+        """Preserve FP32 weight fractions on both sides of the dispatch boundary."""
+        from tokenspeed_kernel.thirdparty.cuda import dsv3_router_gemm as tk_gemm
+
+        if not current_platform().is_hopper_plus:
+            pytest.skip("Router GEMM requires SM90 or newer")
+
+        columns = [0, 256, 512, 768]
+        hidden_cpu = torch.zeros(num_tokens, 6144, dtype=torch.bfloat16, device="cpu")
+        weights_cpu = torch.zeros(8, 6144, dtype=torch.float32, device="cpu")
+        token_scale = torch.arange(1, num_tokens + 1, dtype=torch.float32, device="cpu")
+        expert_scale = torch.arange(1, 9, dtype=torch.float32, device="cpu")
+        hidden_cpu[:, columns] = token_scale[:, None].to(torch.bfloat16)
+        fractions = torch.tensor([1, 2, 4, 8], dtype=torch.float32, device="cpu")
+        weights_cpu[:, columns] = expert_scale[:, None] * fractions * (1 + 2**-12)
+        expected = (hidden_cpu.double() @ weights_cpu.double().T).float()
+        rounded = (hidden_cpu.double() @ weights_cpu.bfloat16().double().T).float()
+        assert not torch.equal(expected, rounded)
+        hidden, weights = hidden_cpu.cuda(), weights_cpu.cuda()
+
+        def project():
+            return tk_gemm(
+                hidden, weights, out_dtype=torch.float32, enable_pdl=enable_pdl
+            )
+
+        actual = project()
+        assert actual.dtype == torch.float32 and actual.shape == (num_tokens, 8)
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            project()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            captured = project()
+        for scale in (1, 2):
+            replay_input = hidden_cpu * scale
+            hidden.copy_(replay_input)
+            captured.fill_(float("nan"))
+            graph.replay()
+            torch.testing.assert_close(captured.cpu(), expected * scale, rtol=0, atol=0)
+            torch.testing.assert_close(hidden.cpu(), replay_input, rtol=0, atol=0)
+        torch.testing.assert_close(weights.cpu(), weights_cpu, rtol=0, atol=0)
 
     @pytest.mark.parametrize("num_tokens", [1, 3, 30, 32])
     @pytest.mark.parametrize(

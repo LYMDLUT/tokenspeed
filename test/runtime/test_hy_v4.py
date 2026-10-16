@@ -57,7 +57,7 @@ from tokenspeed.runtime.layers.quantization.modelopt_mxfp8 import ModelOptMxfp8C
 from tokenspeed.runtime.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 from tokenspeed.runtime.layers.rotary_embedding import RotaryEmbedding, get_rope
 from tokenspeed.runtime.model_loader import loader as model_loader
-from tokenspeed.runtime.models import hy_v4, hy_v4_nextn
+from tokenspeed.runtime.models import deepseek_v3, glm53_flash, hy_v4, hy_v4_nextn
 from tokenspeed.runtime.models.base.weight_update import weight_update_session
 from tokenspeed.runtime.models.hy_v4 import (
     HYV4Attention,
@@ -315,6 +315,117 @@ class HYV4IHCNumericsTests(unittest.TestCase):
                 None,
                 None,
             )
+
+
+class HYV4RouterDtypeTests(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(torch.set_default_dtype, torch.get_default_dtype())
+        torch.set_default_dtype(torch.bfloat16)
+        self.enterContext(torch.device("cpu"))
+        self.enterContext(mock.patch.object(deepseek_v3, "_is_hopper_plus", False))
+        self.config = SimpleNamespace(
+            hidden_size=4,
+            n_routed_experts=2,
+            num_experts_per_tok=1,
+            n_shared_experts=None,
+            moe_intermediate_size=4,
+            hidden_act="silu",
+            topk_method="noaux_tc",
+            n_group=1,
+            topk_group=1,
+            norm_topk_prob=True,
+            routed_scaling_factor=1.0,
+            swiglu_limit=10.0,
+        )
+        self.mapping = SimpleNamespace(
+            moe=SimpleNamespace(tp_rank=0, tp_size=1, ep_rank=0, ep_size=1)
+        )
+        self.checkpoint_weight = (
+            torch.arange(8, dtype=torch.float32).reshape(2, 4) + 2**-12
+        )
+
+    def _make_gate(self, module, moe_class):
+        class StopAfterGate(Exception):
+            pass
+
+        # Keep the real router while avoiding unrelated expert backend setup.
+        moe = moe_class.__new__(moe_class)
+        with mock.patch.object(module, "MoELayer", side_effect=StopAfterGate):
+            with self.assertRaises(StopAfterGate):
+                moe_class.__init__(moe, self.config, self.mapping, alt_stream=None)
+        self.assertIsInstance(moe.gate.weight, torch.nn.Parameter)
+        return moe.gate
+
+    def _load_gate(self, gate, weight):
+        owner = torch.nn.Module()
+        owner.config = self.config
+        owner.mapping = self.mapping
+        owner.quant_config = None
+        owner.model = torch.nn.Module()
+        owner.model.gate = gate
+        load_hyv4_weights(
+            owner,
+            [
+                ("model.gate.weight", weight),
+                (
+                    "model.gate.e_score_correction_bias",
+                    torch.zeros_like(gate.e_score_correction_bias),
+                ),
+            ],
+            module_prefix="model",
+            checkpoint_prefix="model",
+        )
+
+    def test_model_router_dtype_policies(self):
+        for default_dtype in (torch.bfloat16, torch.float32):
+            torch.set_default_dtype(default_dtype)
+            for module, moe_class, expected in (
+                (hy_v4, hy_v4.HYV4MoE, torch.float32),
+                (deepseek_v3, deepseek_v3.DeepseekV3MoE, default_dtype),
+                (glm53_flash, glm53_flash.Glm53FlashMoE, default_dtype),
+            ):
+                with self.subTest(model=moe_class.__name__, dtype=default_dtype):
+                    gate = self._make_gate(module, moe_class)
+                    self.assertEqual(gate.weight.dtype, expected)
+                    self.assertEqual(gate.e_score_correction_bias.dtype, torch.float32)
+
+    def test_hy_router_load_preserves_checkpoint_precision(self):
+        self.assertFalse(
+            torch.equal(
+                self.checkpoint_weight, self.checkpoint_weight.bfloat16().float()
+            )
+        )
+        for source_dtype in (torch.float32, torch.bfloat16):
+            with self.subTest(source_dtype=source_dtype):
+                gate = self._make_gate(hy_v4, hy_v4.HYV4MoE)
+                source = self.checkpoint_weight.to(source_dtype)
+                self._load_gate(gate, source)
+                self.assertEqual(gate.weight.dtype, torch.float32)
+                torch.testing.assert_close(gate.weight, source.float(), rtol=0, atol=0)
+
+    def test_hy_router_fallback_and_specialized_input_dtype(self):
+        gate = self._make_gate(hy_v4, hy_v4.HYV4MoE)
+        self._load_gate(gate, self.checkpoint_weight)
+        hidden = torch.eye(4, dtype=torch.bfloat16)
+        actual = gate(hidden)
+        self.assertEqual(actual.dtype, torch.float32)
+        torch.testing.assert_close(actual, self.checkpoint_weight.T, rtol=0, atol=0)
+
+        gate.use_dsv3_router_gemm = True
+        with mock.patch.object(
+            deepseek_v3,
+            "dsv3_router_gemm",
+            return_value=torch.empty(4, 2, dtype=torch.float32),
+        ) as specialized:
+            self.assertIs(gate(hidden), specialized.return_value)
+            specialized.assert_called_once_with(
+                hidden, gate.weight, out_dtype=torch.float32
+            )
+            specialized.reset_mock()
+            actual = gate(hidden.float())
+            specialized.assert_not_called()
+        self.assertEqual(actual.dtype, torch.float32)
+        torch.testing.assert_close(actual, self.checkpoint_weight.T, rtol=0, atol=0)
 
 
 def _owner_with_params(names: list[str]) -> tuple[torch.nn.Module, list]:

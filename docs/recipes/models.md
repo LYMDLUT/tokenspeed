@@ -476,10 +476,13 @@ Constraints that follow from the architecture:
   is rejected at startup.
 * `enable_lm_head_fp32` is honored by accumulating the LM head GEMM in FP32
   with the BF16 weight, so no FP32 copy of the head is kept.
-* The iHC residual channels are carried in FP32 from the embedding to the
-  head; each sub-block still runs in BF16 on its reduced input. Rounding the
-  channels to BF16 at every sub-block boundary compounds across the layers
-  into a logit drift large enough to flip greedy answers.
+* The iHC residual channels retain the embedding dtype, including BF16 for a
+  BF16 model. Gates and reductions use FP32; the updated residual returns to
+  the channel dtype. Sub-block inputs and the merged iHC head output use BF16.
+* MoE router weights, correction biases and logits use FP32, including in the
+  MTP layer. Loading a router checkpoint preserves its FP32 values even when
+  the model uses BF16; BF16 router weights are promoted without changing their
+  values.
 * The routed experts require a MoE kernel that sums each token's expert
   outputs in a fixed order (`requires_deterministic_finalize`), so outputs are
   reproducible run to run. The FlashInfer cutlass kernels (BF16 and block-FP8)

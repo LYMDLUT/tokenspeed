@@ -676,7 +676,12 @@ class HYV4MoE(DeepseekV3MoE):
                 f"Unsupported activation: {config.hidden_act}. Only silu is supported."
             )
 
-        self.gate = MoEGate(config=config, prefix=add_prefix("gate", prefix))
+        # Router parameters and logits stay in FP32 even for a BF16 model.
+        self.gate = MoEGate(
+            config=config,
+            prefix=add_prefix("gate", prefix),
+            params_dtype=torch.float32,
+        )
         self.experts = MoELayer(
             top_k=config.num_experts_per_tok,
             num_experts=config.n_routed_experts,

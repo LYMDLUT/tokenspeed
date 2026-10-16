@@ -471,7 +471,11 @@ class Glm53FlashMoE(DeepseekV3MoE):
                 f"EP size {mapping.moe.ep_size} is greater than the number of "
                 f"experts {config.n_routed_experts}."
             )
-        self.gate = MoEGate(config=config, prefix=add_prefix("gate", prefix))
+        self.gate = MoEGate(
+            config=config,
+            prefix=add_prefix("gate", prefix),
+            params_dtype=torch.get_default_dtype(),
+        )
         self.experts = MoELayer(
             top_k=config.num_experts_per_tok,
             num_experts=config.n_routed_experts,
