@@ -475,6 +475,16 @@ def _gemv_silu_and_mul_kernel(
 
 
 @triton.jit
+def _marlin_weighted_route(value, route_weight):
+    # Marlin stages its GEMM2 fragment and route weight in BF16, then
+    # multiplies them in BF16 before the FP32 top-k sum. Preserve all three
+    # rounding boundaries instead of rounding a single FP32 product.
+    value = value.to(tl.bfloat16).to(tl.float32)
+    route_weight = route_weight.to(tl.bfloat16).to(tl.float32)
+    return (value * route_weight).to(tl.bfloat16).to(tl.float32)
+
+
+@triton.jit
 def _gemv_topk_sum_kernel(
     partial_ptr,
     weights_ptr,
@@ -505,9 +515,7 @@ def _gemv_topk_sum_kernel(
                     mask=cmask,
                     other=0.0,
                 )
-            # Marlin's GEMM2 writes each weighted route in bf16.
-            weighted = y * tl.load(weights_ptr + route)
-            acc += weighted.to(tl.bfloat16).to(tl.float32)
+            acc += _marlin_weighted_route(y, tl.load(weights_ptr + route))
     tl.store(out_ptr + token.to(tl.int64) * HIDDEN + cols, acc, mask=cmask)
 
 
