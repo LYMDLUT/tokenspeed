@@ -31,12 +31,18 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 platform = current_platform()
 
+_has_flashmla = False
 if platform.is_hopper_plus:
-    from tokenspeed_kernel.ops.attention.mla.cuda import (
-        flash_mla_sparse_fwd,
-        flash_mla_with_kvcache,
-        get_mla_metadata,
-    )
+    try:
+        from tokenspeed_kernel.ops.attention.mla.cuda import (
+            flash_mla_sparse_fwd,
+            flash_mla_with_kvcache,
+            get_mla_metadata,
+        )
+    except ImportError:
+        pass
+    else:
+        _has_flashmla = True
 
 try:
     from tokenspeed_kernel.thirdparty.cuda.dsv4_attention import (
@@ -195,7 +201,7 @@ def _dsv4_fp8_row_bytes(head_dim: int, rope_dim: int = 64) -> int:
     return nope_dim + 2 * int(rope_dim) + nope_dim // 64 + 1
 
 
-if platform.is_nvidia and platform.is_hopper_plus:
+if platform.is_nvidia and platform.is_hopper_plus and _has_flashmla:
 
     @register_kernel(
         "attention",
@@ -289,7 +295,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         return (result, lse) if return_lse else result
 
 
-if platform.is_nvidia and platform.is_hopper_plus:
+if platform.is_nvidia and platform.is_hopper_plus and _has_flashmla:
 
     @register_kernel(
         "attention",

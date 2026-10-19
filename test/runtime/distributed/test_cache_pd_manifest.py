@@ -805,6 +805,7 @@ def test_pd_derives_ordinary_transfer_metadata_from_physical_plan(
             index_head_dim=128,
             index_n_heads=1,
             index_k_format="fp8_scaled",
+            core_kernel_solution=None,
         )
     spec = classes[family](
         **common,

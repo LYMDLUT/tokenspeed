@@ -76,6 +76,7 @@ def _backend(
     backend = object.__new__(dsa.DSABackend)
     backend.kernel_page_size = PAGE
     backend.kernel_solution = None
+    backend.core_kernel_solution = None
     backend.slot_order = "selection"
     backend.data_type = torch.bfloat16
     backend.q_data_type = torch.bfloat16
@@ -102,6 +103,7 @@ def _backend(
     backend.kvp_virtual_block_count = None
     backend.qcp_group = tuple(range(WORLD)) if qcp else (0,)
     backend.qcp_rank = rank if qcp else 0
+    backend.token_parallel_group = (0,)
     backend.query_shard_metadata = None
     backend._prefill_page_table = None
     backend._history_workspace = None

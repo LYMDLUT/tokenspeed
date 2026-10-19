@@ -450,20 +450,53 @@ ts serve zai-org/GLM-5.3 \
 
 ## HY V4 (Hy4-preview)
 
-HY V4 currently requires pipeline-parallel size 1; unsupported PP layouts are
-rejected before allocating model layers. Use a `tokenspeed-kernel` build from
-the same source revision, or a release containing iHC, DSA attention sinks and
-MXFP8 MoE. Older kernel packages remain usable by unrelated models; HY V4
-reports missing capabilities explicitly instead of breaking model discovery.
-The runtime dependency floor must be raised to the containing kernel release
-when that wheel is published, not to an invented or unpublished version.
-
+HY V4 requires pipeline-parallel size 1 and checks its kernel capabilities
+before allocating layers. Model discovery imports the residual module rather
+than new iHC symbols, so an older kernel package does not prevent unrelated
+models from being discovered. Use a matching runtime/kernel source build or
+a release containing the required iHC and DSA sink APIs.
+The fused-boundary model also requires `ihc_fused_hc`; it rejects older
+iHC-only kernels before model allocation rather than on its first forward.
 
 `tencent/Hy4-preview` (`HYV4ForCausalLM`, 770B total / 49B active) runs on the
 GLM-DSA serving path with four additions: a gated MLA output, a per-head
 learnable attention sink, independent Hyper-Connections (iHC, four residual
 channels) and a clamped SwiGLU on the routed experts. The base checkpoint ships
 one MTP layer (`model.mtp_layers.0`), so MTP needs no separate draft checkpoint.
+
+`--hyv4-numerics staged-bf16` explicitly selects a separate numerical
+implementation for unquantized BF16 checkpoints on NVIDIA. The default `auto`
+keeps the existing implementation. The opt-in materializes iHC reductions and
+residual additions before standalone CUDA RMSNorm, including Q/KV latent norms
+and every MTP norm; Q has its own output and KV normalization leaves RoPE
+channels intact. Dense/shared SwiGLU rounds SiLU to BF16 before the up product.
+Routed experts use `triton_staged` with explicit BF16 stages and a fixed local
+slot reduction. Routing pins `cuda_public_v029_sigmoid_bias_topk`, the public
+single-group implementation, for every forward. An explicit padding count
+masks output IDs after routing, with route weights unchanged; ordinary HY
+forwards currently supply no such count or placement/load observer.
+
+The option requires MoE TP 1, equally sized contiguous EP shards, rank-order
+host combination, and no quantization, all-to-all, expert placement or EPLB.
+Routing requires one group, at most 1024 experts, and at most 22 selected
+experts for up to 512 experts (16 above 512). It resolves the target and draft
+MoE backend to `triton_staged`, selects unfused boundary norms and disables
+all-reduce/norm fusion. Workers configure FP32 matmul to IEEE/highest before
+warmup. Inherited `NVIDIA_TF32_OVERRIDE` and
+`TORCH_ALLOW_TF32_CUBLAS_OVERRIDE` must be unset or `0`; conflicting MoE
+backends or iHC/TopK/MoE kernel overrides are rejected. Sparse attention retains
+the original DSA scheduling and cache path, with its core explicitly selected
+from the pinned public FlashMLA source through `flashmla_public`. This core
+requires SM90 and a regular BF16 KV cache (`--kv-cache-dtype auto` or
+`bfloat16`, with `--kv-cache-quant-method none`); FP8 KV, per-token-head KV
+and SM100 are refused. The sparse indexer retains its existing kernel
+selection. Prefill and BF16 decode use the same sparse core and preserve
+head padding, length masking, sink normalization and returned LSE semantics.
+Eager, prefill graph, decode graph and MTP use
+the same model call sites. This option is not the `rl-bitwise` envelope and
+makes no batch-invariance or cross-framework bitwise claim. Validate the
+complete deployment before benchmarking it; a BF16 result does not validate
+the MXFP8 checkpoint.
 
 Constraints that follow from the architecture:
 
@@ -477,10 +510,13 @@ Constraints that follow from the architecture:
   is rejected at startup.
 * `enable_lm_head_fp32` is honored by accumulating the LM head GEMM in FP32
   with the BF16 weight, so no FP32 copy of the head is kept.
-* The iHC residual channels are carried in FP32 from the embedding to the
-  head; each sub-block still runs in BF16 on its reduced input. Rounding the
-  channels to BF16 at every sub-block boundary compounds across the layers
-  into a logit drift large enough to flip greedy answers.
+* The iHC residual channels retain the embedding dtype, including BF16 for a
+  BF16 model. Gates and reductions use FP32; the updated residual returns to
+  the channel dtype. Sub-block inputs and the merged iHC head output use BF16.
+* MoE router projections use FP32 inputs, weights and logits; correction biases
+  also use FP32, including in the MTP layer. Loading a router checkpoint
+  preserves its FP32 values even when the model uses BF16; BF16 router weights
+  are promoted without changing their values.
 * The routed experts require a MoE kernel that sums each token's expert
   outputs in a fixed order (`requires_deterministic_finalize`), so outputs are
   reproducible run to run. The FlashInfer cutlass kernels (BF16 and block-FP8)
@@ -499,10 +535,12 @@ Constraints that follow from the architecture:
   16 routes with expert parallelism take a Triton GEMV over the same Marlin
   layout instead: Marlin's split-K lock chain is bandwidth-starved at one
   or two local routes, and counting those routes on the device would break
-  decode CUDA graphs. Dense projections are
-  dequantized to BF16 while loading; an E4M3 value times a power of two is
-  exact in BF16, so this matches a weight-only MXFP8 GEMM up to accumulation
-  order.
+  decode CUDA graphs. Ordinary dense projections retain E4M3/E8M0 weights
+  and execute weight-only Marlin with BF16 activations. The indexer is an
+  explicit exception: its `wk` is dequantized once during loading and fused
+  with the BF16 `weights_proj`, matching the reference model. Absorbed MLA
+  separately materializes BF16 K/V contraction weights. See
+  [the MXFP8 recipe](hyv4-mxfp8-marlin.md) for loading and validation details.
 * Startup rejects what HY V4 cannot load or route: quantization other than
   ModelOpt MXFP8 (such as `--quantization fp8`, block-scaled or W8A8 FP8
   checkpoints), speculative algorithms other than MTP (speculative decoding
@@ -519,11 +557,17 @@ Constraints that follow from the architecture:
   the smaller of 2048 and the chunked-prefill size) replay breakable CUDA
   graphs. Only the sparse attention core (cache writes, the indexer top-k and
   FlashMLA) runs eagerly between the graph segments, and it drops the padded
-  rows itself. MTP keeps the target's prefill graphs; the draft's first step
-  after a prefill runs eagerly.
-* Validated so far: the BF16 and MXFP8 checkpoints on four 8x H20 (96 GB)
+  rows itself. MTP keeps the target's prefill graphs. The draft's first step
+  after a prefill is a draft-owned `PrefillGraph` (`draft_first_step=True`)
+  around HY V4 NextN's encoder / eager gather / decoder split, on the
+  target's token ladder: longer forwards run both eager, and when the target
+  graph is off the draft stays eager too. Decode-side draft steps already
+  ride the decode graph.
+* Previously validated configurations (not a quality-parity acceptance of
+  later dense/indexer changes): the BF16 and MXFP8 checkpoints on four 8x H20 (96 GB)
   nodes with attention TP32 and EP32, there also the MXFP8 checkpoint with MTP
-  (one and three draft steps), and the MXFP8 checkpoint on two such nodes with
+  (one and three draft steps) and with attention token parallelism 8, and the
+  MXFP8 checkpoint on two such nodes with
   TP16 and EP16. Keep the KV cache in BF16 unless you have validated FP8 KV
   accuracy on your workload.
 
@@ -554,6 +598,20 @@ prompts, which roughly halves the per-token latency of a lightly loaded server.
 Near the batch limit the verified draft tokens cost about as much as they save:
 at 64 concurrent requests, throughput stays within 3% (one step) to 6% (three
 steps) of decoding without MTP.
+
+At attention TP32 each rank holds two of the 64 query heads, while the FlashMLA
+sparse kernels pad every launch to 64 heads on Hopper. Attending the sparse
+core token-parallel across each node's eight ranks instead removes most of
+that padding; add to every node's command:
+
+```bash
+  --attn-token-parallel-size 8
+```
+
+On the four nodes above this cuts the TTFT of a 32K prompt by about 40% and
+raises the throughput of 64 concurrent requests by about 9%; single-request
+decode stays on its rank and is unchanged. It cannot be combined with KV
+parallelism or query context parallelism.
 
 `ts serve` defaults the reasoning and tool-call parsers to `hy_v4`; the pinned
 gateway (smg 1.11) provides both. The chat template accepts `reasoning_effort`

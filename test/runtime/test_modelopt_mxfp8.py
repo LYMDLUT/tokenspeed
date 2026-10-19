@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""ModelOpt MXFP8 checkpoints: config detection and load-time dense dequant."""
+"""ModelOpt MXFP8 checkpoints: config detection and quantized dense loading."""
 
 from __future__ import annotations
 
@@ -92,7 +92,7 @@ class ModelOptMxfp8ConfigTests(unittest.TestCase):
             "modelopt_mixed",
         )
 
-    def test_routes_experts_to_mxfp8_and_dense_to_bf16(self):
+    def test_routes_experts_and_dense_to_mxfp8(self):
         config = ModelOptMxfp8Config.from_config(_NESTED)
         self.assertEqual(config.exclude_modules, _SECTION["exclude_modules"])
         moe = config.get_moe_quant_config("model.layers.3.mlp")
@@ -101,6 +101,14 @@ class ModelOptMxfp8ConfigTests(unittest.TestCase):
         self.assertEqual(moe.weight_scale_dtype, torch.uint8)
         self.assertEqual(
             type(config.get_quant_method(None, "model.layers.0.o_proj")).__name__,
+            "ModelOptMxfp8LinearMethod",
+        )
+        self.assertEqual(
+            type(config.get_quant_method(None, "lm_head")).__name__,
+            "UnquantizedLinearMethod",
+        )
+        self.assertEqual(
+            type(config.get_quant_method(None, "model.layers.3.mlp.gate")).__name__,
             "UnquantizedLinearMethod",
         )
 
@@ -147,11 +155,16 @@ class ModelOptMxfp8PreprocessTests(unittest.TestCase):
         )
         self.assertEqual(
             [name for name, _ in out],
-            ["a.norm.weight", "a.o_proj.weight", "a.q_a_proj.weight"],
+            [
+                "a.o_proj.weight",
+                "a.norm.weight",
+                "a.q_a_proj.weight_scale",
+                "a.o_proj.weight_scale",
+                "a.q_a_proj.weight",
+            ],
         )
-        self.assertIs(out[0][1], norm)
-        torch.testing.assert_close(out[1][1].cpu(), _reference(w0, s0), rtol=0, atol=0)
-        torch.testing.assert_close(out[2][1].cpu(), _reference(w1, s1), rtol=0, atol=0)
+        for (_, got), expected in zip(out, (w0, norm, s1, s0, w1)):
+            self.assertIs(got, expected)
 
     def test_experts_and_bf16_refits_pass_through(self):
         weight, scale = _mxfp8(4, 64, self.generator)
@@ -188,6 +201,151 @@ class ModelOptMxfp8PreprocessTests(unittest.TestCase):
             )
         )
         self.assertEqual(out, stream)
+
+
+class ModelOptMxfp8DenseLoaderTests(unittest.TestCase):
+    def _config(self):
+        return ModelOptMxfp8Config.from_config(_NESTED)
+
+    def _raw(self, n, k):
+        w = (torch.arange(n * k).reshape(n, k) % 16).float().to(torch.float8_e4m3fn)
+        scale = (torch.arange(n * (k // 32)).reshape(n, k // 32) % 20 + 110).to(
+            torch.uint8
+        )
+        return w, scale
+
+    def test_column_parallel_loads_weight_and_scale_rows(self):
+        from tokenspeed.runtime.layers.linear import ColumnParallelLinear
+
+        layer = ColumnParallelLinear(
+            128,
+            128,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            quant_config=self._config(),
+            prefix="layer.o_proj",
+            tp_rank=1,
+            tp_size=2,
+            tp_group=(0, 1),
+            gather_output=False,
+            use_presharded_weights=False,
+        )
+        w, scale = self._raw(128, 128)
+        layer.weight.weight_loader(layer.weight, w)
+        layer.weight_scale.weight_loader(
+            layer.weight_scale, scale.view(torch.float8_e8m0fnu)
+        )
+        self.assertTrue(
+            torch.equal(layer.weight.view(torch.uint8), w[64:].view(torch.uint8))
+        )
+        self.assertTrue(torch.equal(layer.weight_scale, scale[64:]))
+
+    def test_row_parallel_scales_shard_in_block_units(self):
+        from tokenspeed.runtime.layers.linear import RowParallelLinear
+
+        layer = RowParallelLinear(
+            256,
+            64,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            quant_config=self._config(),
+            prefix="layer.o_proj",
+            tp_rank=1,
+            tp_size=2,
+            tp_group=(0, 1),
+            input_is_parallel=True,
+            reduce_results=False,
+            use_presharded_weights=False,
+        )
+        w, scale = self._raw(64, 256)
+        layer.weight.weight_loader(layer.weight, w)
+        layer.weight_scale.weight_loader(layer.weight_scale, scale)
+        self.assertTrue(
+            torch.equal(layer.weight.view(torch.uint8), w[:, 128:].view(torch.uint8))
+        )
+        self.assertTrue(torch.equal(layer.weight_scale, scale[:, 4:]))
+
+    def test_replicated_fused_qkv_scales_keep_row_offsets(self):
+        from tokenspeed.runtime.layers.linear import ReplicatedLinear
+
+        layer = ReplicatedLinear(
+            64,
+            192,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            quant_config=self._config(),
+            prefix="layer.fused_qkv_a_proj_with_mqa",
+        )
+        w0, s0 = self._raw(128, 64)
+        w1, s1 = self._raw(64, 64)
+        for name, x0, x1 in (("weight", w0, w1), ("weight_scale", s0, s1)):
+            param = layer.get_parameter(name)
+            param.weight_loader(param, x1, begin_size=128)
+            param.weight_loader(param, x0, begin_size=0)
+            self.assertTrue(
+                torch.equal(
+                    param.view(torch.uint8), torch.cat([x0, x1]).view(torch.uint8)
+                )
+            )
+
+    def test_merged_tp_keeps_both_scale_shards(self):
+        from tokenspeed.runtime.layers.linear import MergedColumnParallelLinear
+
+        layer = MergedColumnParallelLinear(
+            64,
+            [128, 64],
+            bias=False,
+            params_dtype=torch.bfloat16,
+            quant_config=self._config(),
+            prefix="layer.gate_up_proj",
+            tp_rank=1,
+            tp_size=2,
+            tp_group=(0, 1),
+            gather_output=False,
+            use_presharded_weights=False,
+        )
+        w0, s0 = self._raw(128, 64)
+        w1, s1 = self._raw(64, 64)
+        for name, x0, x1 in (("weight", w0, w1), ("weight_scale", s0, s1)):
+            param = layer.get_parameter(name)
+            param.weight_loader(param, x0, 0)
+            param.weight_loader(param, x1, 1)
+            expected = torch.cat([x0[64:], x1[32:]])
+            self.assertTrue(
+                torch.equal(param.view(torch.uint8), expected.view(torch.uint8))
+            )
+
+    def test_dense_loader_rejects_silent_bf16_refit(self):
+        from tokenspeed.runtime.layers.linear import ReplicatedLinear
+
+        layer = ReplicatedLinear(
+            64,
+            64,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            quant_config=self._config(),
+            prefix="layer.q_b_proj",
+        )
+        with self.assertRaisesRegex(TypeError, "BF16 refits"):
+            layer.weight.weight_loader(
+                layer.weight, torch.zeros(64, 64, dtype=torch.bfloat16)
+            )
+        with self.assertRaisesRegex(RuntimeError, "prepared"):
+            layer.quant_method.apply(layer, torch.zeros(1, 64, dtype=torch.bfloat16))
+
+    def test_preprocessor_rejects_duplicate_and_mismatched_scales(self):
+        w, scale = self._raw(64, 128)
+        config = self._config()
+        for tensors, pattern in (
+            ([("p.weight", w), ("p.weight", w)], "Duplicate"),
+            ([("p.weight", w), ("p.weight_scale", scale[:, :2])], "1x32"),
+        ):
+            with self.assertRaisesRegex((RuntimeError, ValueError), pattern):
+                list(
+                    preprocess_modelopt_mxfp8_weights(
+                        tensors, config, keeps_mxfp8=lambda _: False
+                    )
+                )
 
 
 if __name__ == "__main__":

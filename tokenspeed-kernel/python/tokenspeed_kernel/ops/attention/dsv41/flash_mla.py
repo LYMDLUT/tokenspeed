@@ -37,8 +37,13 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 _FLASH_MLA_API: ModuleType | None = None
 if current_platform().is_hopper_plus:
-    import flash_mla.flash_mla_interface as _FLASH_MLA_API
-    from flash_mla import fused_norm_rope_attn_rope_cast as _fused_v41  # noqa: F401
+    try:
+        import flash_mla.flash_mla_interface as _flash_mla_api
+        from flash_mla import fused_norm_rope_attn_rope_cast as _fused_v41  # noqa: F401
+    except ImportError:
+        pass
+    else:
+        _FLASH_MLA_API = _flash_mla_api
 
 
 def flash_mla_api() -> ModuleType:

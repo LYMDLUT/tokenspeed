@@ -145,6 +145,8 @@ class DSAConfig(MLAConfig):
     index_n_heads: int
     # Storage of the index-key plane, one of INDEX_K_FORMATS.
     index_k_format: str
+    # Attention core only; index scoring keeps its own selection policy.
+    core_kernel_solution: str | None
     index_kpool: int | None = None
     # The model reads the live metadata (cache writes, the indexer top-k and
     # the sparse kernel) only inside one eager break that drops the padded
@@ -170,6 +172,7 @@ class DSAConfig(MLAConfig):
             # keeps the FP8-with-scale rows every in-tree scoring leaf reads; a
             # plugin that scores the checkpoint's bf16 keys names "bf16".
             index_k_format=model_config.index_k_format,
+            core_kernel_solution=model_config.dsa_core_kernel_solution,
             index_kpool=getattr(model_config, "index_kpool", None),
             padded_prefill_replay=model_config.dsa_padded_prefill_replay,
         )
@@ -182,6 +185,13 @@ class DSAConfig(MLAConfig):
         is_draft: bool = False,
     ) -> AttnConfig:
         config = super().generate(server_args, model_config, is_draft)
+        spec = config.component(DSAConfig)
+        if spec.core_kernel_solution == "flashmla_public" and (
+            config.kv_cache_dtype != torch.bfloat16
+            or config.kv_cache_quant_method != "none"
+            or config.kv_cache_mxfp8
+        ):
+            raise ValueError("HY V4 staged-bf16 requires a BF16 KV cache")
         if config.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
             platform = current_platform()
             if not (platform.is_blackwell_plus or platform.is_cdna4_plus):

@@ -1229,6 +1229,7 @@ def dsa_plan(
 # Backend registration (side-effect imports)
 # isort: off
 import tokenspeed_kernel.ops.attention.dsa.cuda  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.dsa.cuda_public_flashmla  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsa.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsa.deep_gemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsa.flashinfer  # noqa: E402,F401

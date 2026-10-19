@@ -1,0 +1,94 @@
+{
+  "upstream_project": "vllm-project/vllm",
+  "upstream_version": "v0.29.0",
+  "upstream_commit": "98dff2a81d747d1dba01a47f939f48c3526d4206",
+  "upstream_files": [
+    {
+      "path": "csrc/libtorch_stable/moe/grouped_topk_kernels.cu",
+      "url": "https://raw.githubusercontent.com/vllm-project/vllm/98dff2a81d747d1dba01a47f939f48c3526d4206/csrc/libtorch_stable/moe/grouped_topk_kernels.cu",
+      "sha256": "6b025758e54dda2db992cd685ff12f32998085f133feadb081f2af7d108ddc2e",
+      "bytes": 60248,
+      "extracted_line_ranges": [
+        [
+          376,
+          431
+        ],
+        [
+          851,
+          1277
+        ]
+      ],
+      "preserved_header_lines": [
+        1,
+        19
+      ]
+    },
+    {
+      "path": "csrc/libtorch_stable/moe/moeTopKFuncs.cuh",
+      "url": "https://raw.githubusercontent.com/vllm-project/vllm/98dff2a81d747d1dba01a47f939f48c3526d4206/csrc/libtorch_stable/moe/moeTopKFuncs.cuh",
+      "sha256": "b79785b6663ce7d23847675513398138a8ce972b1320701447b09d5ac1be5669",
+      "bytes": 12271,
+      "copied_verbatim": true
+    },
+    {
+      "path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/vllm-project/vllm/98dff2a81d747d1dba01a47f939f48c3526d4206/LICENSE",
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+      "bytes": 11357,
+      "copied_verbatim": true
+    }
+  ],
+  "adaptations": [
+    "Extract the complete single_group_topk namespace, including all tiers, block and warp kernels, and dispatch.",
+    "Retain public WARP_SIZE=32 and PDLEnableTokens=16.",
+    "Replace the PyTorch host boundary with validated FP32-only TVM FFI.",
+    "Check both cudaLaunchKernelEx return values and dispatch success.",
+    "Add explicit CUDA/TVM FFI includes and the original outer namespaces."
+  ],
+  "arithmetic_policy": {
+    "cxx_standard": "c++20",
+    "cuda_standard": "c++20",
+    "use_fast_math": false,
+    "ftz": false,
+    "prec_div": true,
+    "prec_sqrt": true,
+    "fmad": true
+  },
+  "sigmoid_tiers": [
+    [
+      128,
+      8
+    ],
+    [
+      256,
+      8
+    ],
+    [
+      384,
+      8
+    ],
+    [
+      512,
+      8
+    ],
+    [
+      512,
+      22
+    ],
+    [
+      768,
+      16
+    ],
+    [
+      896,
+      16
+    ],
+    [
+      1024,
+      16
+    ]
+  ],
+  "scope": "Contiguous colocated CUDA FP32 single-group sigmoid routing only; weights are FP32 and ids INT32.",
+  "provenance_boundary": "This is a pinned public source adaptation. It does not establish the source revision or build identity of another installed binary.",
+  "adapted_source_sha256": "0da720a32bd6ec25839e6548a02974b2f7cace9d1d4f06681ec23ee588358baf"
+}

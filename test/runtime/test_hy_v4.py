@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""HY V4 config, weight-loading and iHC numerics tests (cheap, no GPU)."""
+"""HY V4 config, weight-loading, iHC and attention regression tests."""
 
 from __future__ import annotations
 
@@ -48,18 +48,22 @@ from tokenspeed.runtime.configs.model_config import (
     _resolve_attention_family,
     configure_dsa_attention,
 )
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.model_runner import ModelRunner
+from tokenspeed.runtime.layers.linear import ColumnParallelLinear
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config, Mxfp8Config
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
 from tokenspeed.runtime.layers.quantization.modelopt_mxfp8 import ModelOptMxfp8Config
 from tokenspeed.runtime.layers.quantization.w8a8_fp8 import W8A8Fp8Config
+from tokenspeed.runtime.layers.rotary_embedding import RotaryEmbedding, get_rope
 from tokenspeed.runtime.model_loader import loader as model_loader
-from tokenspeed.runtime.models import hy_v4, hy_v4_nextn
+from tokenspeed.runtime.models import deepseek_v3, glm53_flash, hy_v4, hy_v4_nextn
 from tokenspeed.runtime.models.base.weight_update import weight_update_session
 from tokenspeed.runtime.models.hy_v4 import (
     HYV4Attention,
     HYV4ForCausalLM,
     HYV4Model,
+    HYV4RotaryEmbedding,
     check_hyv4_quant_config,
     check_hyv4_speculative_algorithm,
     load_hyv4_weights,
@@ -313,6 +317,117 @@ class HYV4IHCNumericsTests(unittest.TestCase):
             )
 
 
+class HYV4RouterDtypeTests(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(torch.set_default_dtype, torch.get_default_dtype())
+        torch.set_default_dtype(torch.bfloat16)
+        self.enterContext(torch.device("cpu"))
+        self.enterContext(mock.patch.object(deepseek_v3, "_is_hopper_plus", False))
+        self.config = SimpleNamespace(
+            hidden_size=4,
+            n_routed_experts=2,
+            num_experts_per_tok=1,
+            n_shared_experts=None,
+            moe_intermediate_size=4,
+            hidden_act="silu",
+            topk_method="noaux_tc",
+            n_group=1,
+            topk_group=1,
+            norm_topk_prob=True,
+            routed_scaling_factor=1.0,
+            swiglu_limit=10.0,
+        )
+        self.mapping = SimpleNamespace(
+            moe=SimpleNamespace(tp_rank=0, tp_size=1, ep_rank=0, ep_size=1)
+        )
+        self.checkpoint_weight = (
+            torch.arange(8, dtype=torch.float32).reshape(2, 4) + 2**-12
+        )
+
+    def _make_gate(self, module, moe_class):
+        class StopAfterGate(Exception):
+            pass
+
+        # Keep the real router while avoiding unrelated expert backend setup.
+        moe = moe_class.__new__(moe_class)
+        with mock.patch.object(module, "MoELayer", side_effect=StopAfterGate):
+            with self.assertRaises(StopAfterGate):
+                moe_class.__init__(moe, self.config, self.mapping, alt_stream=None)
+        self.assertIsInstance(moe.gate.weight, torch.nn.Parameter)
+        return moe.gate
+
+    def _load_gate(self, gate, weight):
+        owner = torch.nn.Module()
+        owner.config = self.config
+        owner.mapping = self.mapping
+        owner.quant_config = None
+        owner.model = torch.nn.Module()
+        owner.model.gate = gate
+        load_hyv4_weights(
+            owner,
+            [
+                ("model.gate.weight", weight),
+                (
+                    "model.gate.e_score_correction_bias",
+                    torch.zeros_like(gate.e_score_correction_bias),
+                ),
+            ],
+            module_prefix="model",
+            checkpoint_prefix="model",
+        )
+
+    def test_model_router_dtype_policies(self):
+        for default_dtype in (torch.bfloat16, torch.float32):
+            torch.set_default_dtype(default_dtype)
+            for module, moe_class, expected in (
+                (hy_v4, hy_v4.HYV4MoE, torch.float32),
+                (deepseek_v3, deepseek_v3.DeepseekV3MoE, default_dtype),
+                (glm53_flash, glm53_flash.Glm53FlashMoE, default_dtype),
+            ):
+                with self.subTest(model=moe_class.__name__, dtype=default_dtype):
+                    gate = self._make_gate(module, moe_class)
+                    self.assertEqual(gate.weight.dtype, expected)
+                    self.assertEqual(gate.e_score_correction_bias.dtype, torch.float32)
+
+    def test_hy_router_load_preserves_checkpoint_precision(self):
+        self.assertFalse(
+            torch.equal(
+                self.checkpoint_weight, self.checkpoint_weight.bfloat16().float()
+            )
+        )
+        for source_dtype in (torch.float32, torch.bfloat16):
+            with self.subTest(source_dtype=source_dtype):
+                gate = self._make_gate(hy_v4, hy_v4.HYV4MoE)
+                source = self.checkpoint_weight.to(source_dtype)
+                self._load_gate(gate, source)
+                self.assertEqual(gate.weight.dtype, torch.float32)
+                torch.testing.assert_close(gate.weight, source.float(), rtol=0, atol=0)
+
+    def test_hy_router_projects_fp32_operands(self):
+        gate = self._make_gate(hy_v4, hy_v4.HYV4MoE)
+        self._load_gate(gate, self.checkpoint_weight)
+        hidden = torch.eye(4, dtype=torch.bfloat16)
+        actual = gate(hidden)
+        self.assertEqual(actual.dtype, torch.float32)
+        torch.testing.assert_close(actual, self.checkpoint_weight.T, rtol=0, atol=0)
+
+        gate.use_dsv3_router_gemm = True
+        with mock.patch.object(
+            deepseek_v3,
+            "dsv3_router_gemm",
+            side_effect=AssertionError("HY router must project FP32 inputs"),
+        ) as specialized:
+            for value in (hidden, hidden.float(), hidden[:0]):
+                with self.subTest(dtype=value.dtype, rows=value.shape[0]):
+                    actual = gate(value)
+                    expected = torch.nn.functional.linear(
+                        value.float(), self.checkpoint_weight
+                    )
+                    self.assertEqual(actual.dtype, torch.float32)
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            specialized.assert_not_called()
+
+
 def _owner_with_params(names: list[str]) -> tuple[torch.nn.Module, list]:
     """Build a module tree holding ``names`` whose loaders record each call."""
     owner = torch.nn.Module()
@@ -453,12 +568,12 @@ class HYV4WeightLoaderTests(unittest.TestCase):
                 self._load(owner, per_expert)
         self.assertEqual(calls, [])
 
-    @unittest.skipUnless(torch.cuda.is_available(), "MXFP8 dequantizes on CUDA")
-    def test_mxfp8_checkpoint_feeds_bf16_dense_and_fp8_experts(self):
+    def test_mxfp8_checkpoint_preserves_dense_and_expert_fp8(self):
         experts = "model.layers.0.mlp.experts."
         owner, calls = _owner_with_params(
             [
                 "model.layers.0.self_attn.o_proj.weight",
+                "model.layers.0.self_attn.o_proj.weight_scale",
                 experts + "w13_weight",
                 experts + "w13_weight_scale_inv",
                 experts + "w2_weight",
@@ -471,6 +586,11 @@ class HYV4WeightLoaderTests(unittest.TestCase):
         received = {}
         owner.get_parameter("model.layers.0.self_attn.o_proj.weight").weight_loader = (
             lambda _param, weight: received.setdefault("o_proj", weight)
+        )
+        owner.get_parameter(
+            "model.layers.0.self_attn.o_proj.weight_scale"
+        ).weight_loader = lambda _param, weight: received.setdefault(
+            "o_proj_scale", weight
         )
         fp8 = torch.ones(2, 4, 64).to(torch.float8_e4m3fn)
         scale = torch.full((2, 4, 2), 127, dtype=torch.uint8)
@@ -486,8 +606,11 @@ class HYV4WeightLoaderTests(unittest.TestCase):
                 (experts + "down_proj_scale", scale),
             ],
         )
-        self.assertEqual(received["o_proj"].dtype, torch.bfloat16)
-        self.assertTrue(bool((received["o_proj"] == 1).all()))
+        self.assertEqual(received["o_proj"].dtype, torch.float8_e4m3fn)
+        self.assertTrue(
+            torch.equal(received["o_proj"].view(torch.uint8), fp8[0].view(torch.uint8))
+        )
+        self.assertTrue(torch.equal(received["o_proj_scale"], scale[0]))
         loaded = {(name, kwargs["shard_id"]) for name, _, kwargs in calls}
         self.assertEqual(
             loaded,
@@ -681,40 +804,320 @@ class HYV4SpeculativeCaptureTests(unittest.TestCase):
                     setter(SimpleNamespace(), [1])
 
 
-class HYV4OutputGateTests(unittest.TestCase):
-    @staticmethod
-    def _attention(gate: torch.Tensor, gate_size_per_head: int) -> SimpleNamespace:
-        return SimpleNamespace(
-            linear_gate=lambda _hidden_states: (gate,),
-            gate_size_per_head=gate_size_per_head,
-            v_head_dim=4,
-        )
-
-    def test_elementwise_gate_runs_the_fused_kernel_in_place(self):
-        attn_output, gate = torch.randn(3, 8), torch.randn(3, 8)
-        expected = attn_output * torch.sigmoid(gate)
-        with mock.patch.object(
-            hy_v4, "sigmoid_mul", side_effect=lambda x, g: x.mul_(torch.sigmoid(g))
-        ) as fused:
-            out = HYV4Attention._apply_output_gate(
-                self._attention(gate, 4), attn_output, torch.empty(3, 16)
+class _HYV4AttentionFixture(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(
+            mock.patch.dict(
+                hy_v4.global_server_args_dict,
+                {
+                    "tp_batch_invariant": "none",
+                    "numerics": "auto",
+                    "dense_gemm_backend": "auto",
+                    "attention_backend": "dsa",
+                },
             )
-        fused.assert_called_once()
-        (x, g), _ = fused.call_args
-        self.assertIs(x, attn_output)
-        self.assertIs(g, gate)
-        self.assertIs(out, attn_output)
-        torch.testing.assert_close(out, expected)
-
-    def test_headwise_gate_scales_each_head(self):
-        attn_output, gate = torch.randn(3, 8), torch.randn(3, 2)
-        expected = (
-            attn_output.view(3, 2, 4) * torch.sigmoid(gate).unsqueeze(-1)
-        ).reshape(3, 8)
-        out = HYV4Attention._apply_output_gate(
-            self._attention(gate, 1), attn_output, torch.empty(3, 16)
         )
-        torch.testing.assert_close(out, expected)
+        self.addCleanup(torch.set_default_dtype, torch.get_default_dtype())
+        torch.set_default_dtype(torch.bfloat16)
+
+    def _attention(self, *, gating_type: str, device: str):
+        config = HYV4Config(
+            hidden_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            q_lora_rank=8,
+            kv_lora_rank=4,
+            qk_nope_head_dim=4,
+            qk_rope_head_dim=4,
+            v_head_dim=4,
+            index_n_heads=2,
+            index_head_dim=8,
+            index_topk=2,
+            max_position_embeddings=32,
+            mlp_layer_types=["dense"],
+            indexer_types=["full"],
+            gating_type=gating_type,
+        )
+        with torch.device(device):
+            return HYV4Attention(
+                config, Mapping(rank=0, world_size=1), layer_id=0, is_nextn=False
+            )
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "real linear gate requires a GPU")
+class HYV4OutputGateTests(_HYV4AttentionFixture):
+    def _inputs(self, attention):
+        self.assertIsInstance(attention.linear_gate, ColumnParallelLinear)
+        weight = attention.linear_gate.weight
+        self.assertEqual(weight.dtype, torch.bfloat16)
+        with torch.no_grad():
+            weight.zero_()
+            indices = torch.arange(weight.shape[0], device=weight.device)
+            weight[indices, indices] = 1
+        hidden = (
+            torch.linspace(-2, 2, 48, dtype=torch.float32, device=weight.device)
+            .reshape(3, 16)
+            .bfloat16()
+        )
+        output = (
+            torch.linspace(-2, 2, 24, dtype=torch.float32, device=weight.device)
+            .reshape(3, 8)
+            .bfloat16()
+        )
+        # This pair distinguishes a BF16 sigmoid boundary from one final
+        # BF16 cast after a fused FP32 sigmoid and multiplication.
+        hidden[0, 0], output[0, 0] = 0.5, 1.5
+        gate, _ = attention.linear_gate(hidden)
+        torch.testing.assert_close(gate, hidden[:, : weight.shape[0]], rtol=0, atol=0)
+        return hidden, output, gate
+
+    def test_elementwise_gate_rounds_sigmoid_before_multiplication(self):
+        attention = self._attention(gating_type="elementwise", device="cuda")
+        hidden, output, gate = self._inputs(attention)
+        expected = output * torch.sigmoid(gate)
+        fused_fp32 = (output.float() * torch.sigmoid(gate.float())).bfloat16()
+        self.assertNotEqual(expected[0, 0].item(), fused_fp32[0, 0].item())
+
+        actual = attention._apply_output_gate(output.clone(), hidden)
+
+        self.assertEqual(actual.dtype, torch.bfloat16)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_headwise_gate_rounds_sigmoid_before_scaling_each_head(self):
+        attention = self._attention(gating_type="headwise", device="cuda")
+        hidden, output, gate = self._inputs(attention)
+        expected = (
+            output.reshape(3, 2, 4) * torch.sigmoid(gate).unsqueeze(-1)
+        ).reshape(3, 8)
+
+        actual = attention._apply_output_gate(output.clone(), hidden)
+
+        self.assertEqual(actual.dtype, torch.bfloat16)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+class HYV4RotaryEmbeddingTests(_HYV4AttentionFixture):
+    def test_coefficients_round_through_bf16_but_stay_in_fp32_storage(self):
+        with torch.device("cpu"):
+            generic = RotaryEmbedding(4, 4, 32, 1e7, False, torch.bfloat16)
+            original = generic.cos_sin_cache.clone()
+            rotary = HYV4RotaryEmbedding(4, 4, 32, 1e7, False, torch.bfloat16)
+
+        self.assertEqual(rotary.cos_sin_cache.dtype, torch.float32)
+        self.assertEqual(generic.cos_sin_cache.dtype, torch.float32)
+        torch.testing.assert_close(
+            rotary.cos_sin_cache, original.bfloat16().float(), rtol=0, atol=0
+        )
+        self.assertFalse(torch.equal(original, rotary.cos_sin_cache))
+        torch.testing.assert_close(generic.cos_sin_cache, original, rtol=0, atol=0)
+
+    def test_main_and_indexer_use_the_same_hyv4_cache(self):
+        attention = self._attention(gating_type="elementwise", device="cpu")
+        repeated = self._attention(gating_type="elementwise", device="cpu")
+
+        self.assertIsInstance(attention.rotary_emb, HYV4RotaryEmbedding)
+        self.assertIsNotNone(attention.indexer)
+        self.assertIsInstance(attention.indexer, hy_v4.HYV4DsaIndexer)
+        self.assertIs(attention.indexer.rotary_emb, attention.rotary_emb)
+        self.assertIs(attention.attn_mqa.rotary_emb, attention.rotary_emb)
+        self.assertIs(attention.attn_mha.rotary_emb, attention.rotary_emb)
+        self.assertIs(repeated.rotary_emb, attention.rotary_emb)
+        self.assertEqual(attention.rotary_emb.dtype, torch.bfloat16)
+        self.assertEqual(attention.rotary_emb.cos_sin_cache.dtype, torch.float32)
+
+    def test_hyv4_factory_does_not_replace_the_generic_rope_cache(self):
+        kwargs = dict(
+            head_size=4,
+            rotary_dim=4,
+            max_position=32,
+            base=1e7,
+            is_neox_style=False,
+            dtype=torch.bfloat16,
+        )
+        with torch.device("cpu"):
+            generic = get_rope(**kwargs)
+            original = generic.cos_sin_cache.clone()
+            attention = self._attention(gating_type="elementwise", device="cpu")
+            generic_again = get_rope(**kwargs)
+
+        self.assertIs(type(generic), RotaryEmbedding)
+        self.assertIs(generic_again, generic)
+        self.assertIsNot(attention.rotary_emb, generic)
+        self.assertEqual(generic.cos_sin_cache.dtype, torch.float32)
+        torch.testing.assert_close(generic.cos_sin_cache, original, rtol=0, atol=0)
+        self.assertFalse(torch.equal(original, original.bfloat16().float()))
+
+
+class HYV4NextNPrefillStagesTests(unittest.TestCase):
+    def test_nextn_declares_the_narrowing_prefill_contract(self):
+        from tokenspeed.runtime.execution.prefill_graph import NarrowingPrefillModel
+
+        inner = HYV4ModelNextN.__new__(HYV4ModelNextN)
+        self.assertIsInstance(inner, NarrowingPrefillModel)
+        self.assertEqual(inner.max_decoder_rows_per_request, 1)
+
+    def test_nextn_row_state_lands_into_a_fixed_row_static(self):
+        from tokenspeed.runtime.models.hy_v4_nextn import NextNRowState
+
+        src = NextNRowState(
+            torch.arange(4, dtype=torch.float32).reshape(2, 2),
+            torch.arange(4, 8, dtype=torch.float32).reshape(2, 2),
+        )
+        dst = NextNRowState(torch.ones(4, 2), torch.ones(4, 2))
+        src.land_into(dst)
+        torch.testing.assert_close(dst.hidden[:2], src.hidden)
+        torch.testing.assert_close(dst.residual[:2], src.residual)
+        self.assertTrue(torch.all(dst.hidden[2:] == 0))
+        self.assertTrue(torch.all(dst.residual[2:] == 0))
+        with self.assertRaisesRegex(ValueError, "disagree on residual"):
+            NextNRowState(torch.ones(1, 2), None).land_into(dst)
+
+    def test_decoder_state_is_sized_like_the_narrowed_encoder_output(self):
+        from tokenspeed.runtime.models.hy_v4_nextn import NextNRowState
+
+        inner = HYV4ModelNextN.__new__(HYV4ModelNextN)
+        inner.config = SimpleNamespace(hidden_size=6)
+        inner.embed_tokens = SimpleNamespace(weight=torch.zeros(1, 6))
+        inner.decoder = SimpleNamespace(
+            self_attn=SimpleNamespace(
+                o_proj=SimpleNamespace(input_size_per_partition=4)
+            )
+        )
+        statics = inner.allocate_decoder_state(3)
+        self.assertEqual(tuple(statics.hidden.shape), (3, 4))
+        self.assertEqual(tuple(statics.residual.shape), (3, 6))
+
+        narrowed = NextNRowState(torch.ones(2, 4), torch.full((2, 6), 2.0))
+        narrowed.land_into(statics)
+        torch.testing.assert_close(statics.hidden[:2], narrowed.hidden)
+        torch.testing.assert_close(statics.residual[:2], narrowed.residual)
+
+    def test_narrowing_gathers_hidden_and_residual(self):
+        from tokenspeed.runtime.models.hy_v4_nextn import (
+            HYV4ModelNextN,
+            NextNRowState,
+        )
+
+        inner = HYV4ModelNextN.__new__(HYV4ModelNextN)
+        state = NextNRowState(
+            torch.arange(8, dtype=torch.float32).reshape(4, 2),
+            torch.arange(8, 16, dtype=torch.float32).reshape(4, 2),
+        )
+        ctx = SimpleNamespace(
+            draft_narrowing=object(),
+            gather_ids=torch.tensor([1, 3], dtype=torch.int64),
+            forward_mode=SimpleNamespace(is_idle=lambda: False),
+        )
+        out = inner.narrowing_forward(state, ctx)
+        self.assertEqual(out.rows, 2)
+        torch.testing.assert_close(out.hidden, state.hidden[[1, 3]])
+        torch.testing.assert_close(out.residual, state.residual[[1, 3]])
+
+    def test_narrowing_is_a_no_op_without_the_step0_handle(self):
+        from tokenspeed.runtime.models.hy_v4_nextn import (
+            HYV4ModelNextN,
+            NextNRowState,
+        )
+
+        inner = HYV4ModelNextN.__new__(HYV4ModelNextN)
+        state = NextNRowState(torch.ones(3, 2), torch.zeros(3, 2))
+        ctx = SimpleNamespace(
+            draft_narrowing=None,
+            gather_ids=torch.tensor([0], dtype=torch.int64),
+            forward_mode=SimpleNamespace(is_idle=lambda: False),
+        )
+        self.assertIs(inner.narrowing_forward(state, ctx), state)
+        self.assertEqual(inner.decoder_rows(SimpleNamespace(bs=7)), 7)
+
+    def test_decoder_sizes_every_collective_by_its_rows(self):
+        from tokenspeed.runtime.models.hy_v4_nextn import NextNRowState
+
+        ctx = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_idle=lambda: False),
+            global_bs=None,
+            collective_num_tokens=None,
+            collective_global_num_tokens=None,
+        )
+        seen = []
+
+        def note(name, out):
+            seen.append((name, ctx.collective_num_tokens))
+            return out
+
+        wide = torch.zeros(2, 6)
+        inner = HYV4ModelNextN.__new__(HYV4ModelNextN)
+        inner.final_layernorm = object()
+        inner.decoder = SimpleNamespace(
+            self_attn=SimpleNamespace(o_proj=lambda h: note("o_proj", (wide, None))),
+            post_attention_norm=lambda h, r, c: note("post_attn", (h, r)),
+            comm_manager=SimpleNamespace(
+                get_num_tokens=lambda c: note("num_tokens", (2, 2)),
+                pre_mlp_comm=lambda h, c: note("pre_mlp", h),
+                post_mlp_fused=lambda h, r, c: note("post_mlp", (h, r)),
+                final_norm=lambda h, r, c, norm: note("final_norm", (h, r)),
+            ),
+            _run_mlp=lambda h, num_global, max_per_gpu: note("mlp", h),
+        )
+        state = NextNRowState(torch.zeros(2, 4), torch.zeros(2, 6))
+        hidden, captured = inner.decoder_forward(state, ctx)
+        steps = "o_proj post_attn num_tokens pre_mlp mlp post_mlp final_norm"
+        self.assertEqual(seen, [(step, 2) for step in steps.split()])
+        self.assertIs(hidden, wide)
+        self.assertEqual(captured, [])
+        self.assertIsNone(ctx.collective_num_tokens)
+
+    def test_decoder_projection_uses_only_the_live_rows(self):
+        inner = HYV4ModelNextN.__new__(HYV4ModelNextN)
+        seen = []
+        weight = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+
+        def project(hidden):
+            seen.append(hidden.shape[0])
+            return torch.nn.functional.linear(hidden, weight), None
+
+        inner.decoder = SimpleNamespace(self_attn=SimpleNamespace(o_proj=project))
+        hidden = torch.arange(64, dtype=torch.float32).reshape(16, 4)
+        for rows in (None, 3, 16, 0):
+            with (
+                self.subTest(rows=rows),
+                mock.patch.object(hy_v4_nextn, "current_valid_rows", return_value=rows),
+            ):
+                result = inner._project_attention(hidden)
+                expected = torch.nn.functional.linear(hidden[:rows], weight)
+                torch.testing.assert_close(result, expected, rtol=0, atol=0)
+        self.assertEqual(seen, [16, 3, 16, 0])
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA graph replay required")
+    def test_decoder_projection_break_replays_live_rows_and_clears_tail(self):
+        from tokenspeed.runtime.execution.breakable_cuda_graph import BreakableCapture
+
+        inner = HYV4ModelNextN.__new__(HYV4ModelNextN)
+        seen = []
+        weight = torch.randn(6, 4, device="cuda", dtype=torch.bfloat16)
+
+        def project(hidden):
+            seen.append(hidden.shape[0])
+            return torch.nn.functional.linear(hidden, weight), None
+
+        inner.decoder = SimpleNamespace(self_attn=SimpleNamespace(o_proj=project))
+        hidden = torch.randn(16, 4, device="cuda", dtype=torch.bfloat16)
+        cap = BreakableCapture()
+        cap.stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(cap.stream):
+            inner._project_attention(hidden)
+        cap.stream.synchronize()
+        with cap:
+            output = inner._project_attention(hidden) + 1
+        self.assertEqual(cap.num_segments, 3)
+        for rows in (3, 16, 1):
+            with self.subTest(rows=rows):
+                hidden.normal_()
+                cap.replay(valid_rows=rows)
+                expected = torch.nn.functional.linear(hidden[:rows], weight) + 1
+                torch.testing.assert_close(output[:rows], expected, rtol=0, atol=0)
+                self.assertTrue(bool((output[rows:] == 1).all()))
+                self.assertEqual(seen[-1], rows)
 
 
 class HYV4RuntimeCapabilityTests(unittest.TestCase):
@@ -756,6 +1159,14 @@ class HYV4RuntimeCapabilityTests(unittest.TestCase):
 
     def test_current_capabilities_are_accepted_without_allocating(self):
         hy_v4.check_hyv4_runtime(SimpleNamespace(has_pp=False), enable_ihc=True)
+
+    def test_missing_fused_boundary_is_rejected_before_allocation(self):
+        available = SimpleNamespace(
+            ihc_pre=lambda: None, ihc_post=lambda: None, ihc_head=lambda: None
+        )
+        with mock.patch.object(hy_v4, "residual_ops", available):
+            with self.assertRaisesRegex(RuntimeError, "ihc_fused_hc"):
+                hy_v4.check_hyv4_runtime(SimpleNamespace(has_pp=False), enable_ihc=True)
 
 
 if __name__ == "__main__":

@@ -30,17 +30,22 @@ the target model, so the draft loads neither.
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    break_point,
+    current_valid_rows,
+    slice_to_real_tokens,
+)
 from tokenspeed.runtime.execution.context import (
     ForwardContext,
     report_collective_sizing,
 )
-from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
@@ -53,7 +58,9 @@ from tokenspeed.runtime.models.hy_v4 import (
     HYV4ForCausalLM,
     check_hyv4_quant_config,
     check_hyv4_runtime,
+    configure_hyv4_numerics,
     finalize_hyv4_attention,
+    hyv4_rmsnorm,
     load_hyv4_weights,
 )
 
@@ -63,8 +70,52 @@ _MTP_CHECKPOINT_PREFIX = "model.mtp_layers.0"
 _MTP_WRAPPER_WEIGHTS = ("enorm", "hnorm", "eh_proj", "final_layernorm")
 
 
+@dataclass
+class NextNRowState:
+    """Token- or request-shaped activations between the NextN prefill stages.
+
+    ``hidden`` is the post-gate attention output before ``o_proj`` (token-shaped
+    out of the encoder, one live row per request after narrowing), as wide as
+    o_proj's head-sharded input. ``residual`` is the matching model-wide
+    residual stream, None on an idle forward. The draft-owned
+    :class:`PrefillGraph` lands a narrowed state into a fixed-row decoder static.
+    """
+
+    hidden: torch.Tensor
+    residual: torch.Tensor | None
+
+    @property
+    def rows(self) -> int:
+        return int(self.hidden.shape[0])
+
+    def land_into(self, dst: NextNRowState) -> None:
+        rows = self.rows
+        if rows > dst.rows:
+            raise ValueError(
+                f"NextN row state of {rows} rows exceeds the {dst.rows}-row target"
+            )
+        if (self.residual is None) != (dst.residual is None):
+            raise ValueError("NextN row states disagree on residual")
+        for src, out in ((self.hidden, dst.hidden), (self.residual, dst.residual)):
+            if src is None:
+                continue
+            out[:rows].copy_(src)
+            if rows < out.shape[0]:
+                out[rows:].zero_()
+
+
 class HYV4ModelNextN(nn.Module):
-    """HY V4 MTP block: fuse the next token with the target hidden state."""
+    """HY V4 MTP block: fuse the next token with the target hidden state.
+
+    The forward is the :class:`~tokenspeed.runtime.execution.prefill_graph.NarrowingPrefillModel`
+    composition: token-shaped encoder (embed + ``eh_proj`` + attention through
+    the output gate), eager narrowing to one live row per request, then
+    ``o_proj`` + MoE + final norm on those rows. Eagle's draft-owned prefill
+    graph captures the encoder and decoder stages around that eager gather.
+    """
+
+    # One live row per request after Eagle step-0 narrowing.
+    max_decoder_rows_per_request = 1
 
     def __init__(
         self,
@@ -75,6 +126,7 @@ class HYV4ModelNextN(nn.Module):
         super().__init__()
         check_hyv4_quant_config(quant_config)
         check_hyv4_runtime(mapping, enable_ihc=False)
+        configure_hyv4_numerics(config, mapping, quant_config)
         self.config = config
         self.mapping = mapping
         self.vocab_size = config.vocab_size
@@ -86,8 +138,8 @@ class HYV4ModelNextN(nn.Module):
             tp_size=mapping.attn.tp_size,
             tp_group=mapping.attn.tp_group,
         )
-        self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.enorm = hyv4_rmsnorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.hnorm = hyv4_rmsnorm(config.hidden_size, eps=config.rms_norm_eps)
         self.eh_proj = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
         self.alt_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
         # The draft owns a single attention layer, so its cache layer id is 0.
@@ -102,7 +154,7 @@ class HYV4ModelNextN(nn.Module):
             is_nextn=True,
             alt_stream=self.alt_stream,
         )
-        self.final_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.final_layernorm = hyv4_rmsnorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -112,6 +164,27 @@ class HYV4ModelNextN(nn.Module):
         input_embeds: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None]:
+        state = self.encoder_forward(
+            input_ids,
+            positions,
+            ctx,
+            input_embeds=input_embeds,
+            captured_hidden_states=captured_hidden_states,
+        )
+        state = self.narrowing_forward(state, ctx)
+        hidden, captured = self.decoder_forward(state, ctx)
+        return self.finish_forward(hidden, captured, ctx)
+
+    def encoder_forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        ctx: ForwardContext,
+        **model_kwargs,
+    ) -> NextNRowState:
+        """Embed, fuse the target hidden, and run attention through the gate."""
+        input_embeds = model_kwargs.get("input_embeds")
+        captured_hidden_states = model_kwargs.get("captured_hidden_states")
         hidden_states = (
             self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         )
@@ -129,12 +202,89 @@ class HYV4ModelNextN(nn.Module):
                 dim=-1,
             )
         )
-        hidden_states, residual = self.decoder(positions, hidden_states, ctx, None)
+        residual = None
         if not ctx.forward_mode.is_idle():
-            hidden_states, _ = self.decoder.comm_manager.final_norm(
-                hidden_states, residual, ctx, self.final_layernorm
+            hidden_states, residual = self.decoder.comm_manager.input_reduce_norm(
+                hidden_states, residual
             )
-        return hidden_states, None
+            hidden_states = self.decoder.self_attn.attend_token_shaped(
+                positions,
+                hidden_states,
+                ctx,
+                self.decoder.comm_manager,
+            )
+        return NextNRowState(hidden_states, residual)
+
+    def narrowing_forward(
+        self, state: NextNRowState, ctx: ForwardContext
+    ) -> NextNRowState:
+        """Gather the live rows; the handle's presence is the step-0 flag."""
+        if ctx.draft_narrowing is None or ctx.forward_mode.is_idle():
+            return state
+        gather_ids = ctx.gather_ids
+        residual = state.residual
+        return NextNRowState(
+            state.hidden.index_select(0, gather_ids),
+            None if residual is None else residual.index_select(0, gather_ids),
+        )
+
+    @break_point
+    def _project_attention(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Project live rows with the same GEMM shape as eager narrowing."""
+        valid_rows = current_valid_rows()
+        if valid_rows is not None:
+            (hidden,) = slice_to_real_tokens(valid_rows, hidden)
+        # Padding can select a different BF16 GEMM reduction. The break lands
+        # these live outputs into the decoder's fixed-row handoff buffer.
+        return self.decoder.self_attn.o_proj(hidden)[0]
+
+    def decoder_forward(
+        self, state: NextNRowState, ctx: ForwardContext
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """``o_proj``, MoE and the final norm on the rows ``state`` describes.
+
+        The collectives are sized by those rows; the token-shaped encoder
+        before this stage keeps the forward's own sizing.
+        """
+        hidden, residual = state.hidden, state.residual
+        layer = self.decoder
+        with report_collective_sizing(ctx, state.rows, ctx.global_bs):
+            if not ctx.forward_mode.is_idle():
+                hidden = self._project_attention(hidden)
+                hidden, residual = layer.post_attention_norm(hidden, residual, ctx)
+            num_global, max_per_gpu = layer.comm_manager.get_num_tokens(ctx)
+            hidden = layer.comm_manager.pre_mlp_comm(hidden, ctx)
+            hidden = layer._run_mlp(hidden, num_global, max_per_gpu)
+            hidden, residual = layer.comm_manager.post_mlp_fused(hidden, residual, ctx)
+            if not ctx.forward_mode.is_idle():
+                hidden, _ = layer.comm_manager.final_norm(
+                    hidden, residual, ctx, self.final_layernorm
+                )
+        return hidden, []
+
+    def finish_forward(
+        self,
+        hidden: torch.Tensor,
+        captured: list[torch.Tensor],
+        ctx: ForwardContext,
+    ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
+        del captured, ctx
+        return hidden, None
+
+    def decoder_rows(self, ctx: ForwardContext) -> int:
+        return int(ctx.bs)
+
+    def allocate_decoder_state(self, rows: int) -> NextNRowState:
+        weight = self.embed_tokens.weight
+        device, dtype = weight.device, weight.dtype
+        # ``hidden`` is o_proj's head-sharded input, narrower than the model
+        # width under attention TP; the residual stays model-wide.
+        attn_width = int(self.decoder.self_attn.o_proj.input_size_per_partition)
+        hidden = int(self.config.hidden_size)
+        return NextNRowState(
+            torch.zeros(rows, attn_width, device=device, dtype=dtype),
+            torch.zeros(rows, hidden, device=device, dtype=dtype),
+        )
 
 
 class HYV4ForCausalLMNextN(HYV4ForCausalLM):
@@ -193,13 +343,12 @@ class HYV4ForCausalLMNextN(HYV4ForCausalLM):
         positions: torch.Tensor,
         captured_hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        with report_collective_sizing(ctx, ctx.bs, ctx.global_bs):
-            hidden_states, _ = self.model(
-                input_ids,
-                positions,
-                ctx,
-                captured_hidden_states=captured_hidden_states,
-            )
+        hidden_states, _ = self.model(
+            input_ids,
+            positions,
+            ctx,
+            captured_hidden_states=captured_hidden_states,
+        )
         logits_metadata = LogitsMetadata.from_forward_context(ctx)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, logits_metadata

@@ -66,6 +66,7 @@ def _dsa_spec(index_k_format: str) -> DSAConfig:
         index_head_dim=HEAD_DIM,
         index_n_heads=4,
         index_k_format=index_k_format,
+        core_kernel_solution=None,
     )
 
 

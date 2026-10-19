@@ -30,7 +30,7 @@ def workspace_indices_to_kv_slots(
     workspace_indices: torch.Tensor,
     kv_workspace_slots: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Map DSA workspace-local top-k indices to global KV cache slot ids.
+    """Map DSA workspace-local top-k indices without modifying the selection.
 
     Args:
         workspace_indices: Top-k indices in the compact DSA prefill workspace.
@@ -46,7 +46,9 @@ def workspace_indices_to_kv_slots(
 
     flat_indices = workspace_indices.reshape(-1)
     valid = flat_indices >= 0
-    flat_slots = flat_indices.to(torch.int64)
+    # The selection may be shared by later layers; int64 inputs must not alias
+    # the destination of this in-place lookup.
+    flat_slots = flat_indices.to(dtype=torch.int64, copy=True)
     if valid.any():
         flat_slots[valid] = kv_workspace_slots.to(
             device=workspace_indices.device,

@@ -158,6 +158,7 @@ from tokenspeed_kernel.ops.moe.triton import (
 from tokenspeed_kernel.ops.moe.triton import mxfp4 as _moe_triton_mxfp4
 from tokenspeed_kernel.ops.quantization import quantize_fp8 as kernel_quantize_fp8
 from tokenspeed_kernel.ops.quantization import quantize_mxfp8 as kernel_quantize_mxfp8
+from tokenspeed_kernel.ops.residual import ihc_fused_hc as kernel_ihc_fused_hc
 from tokenspeed_kernel.ops.residual import ihc_head as kernel_ihc_head
 from tokenspeed_kernel.ops.residual import ihc_post as kernel_ihc_post
 from tokenspeed_kernel.ops.residual import ihc_pre as kernel_ihc_pre
@@ -358,6 +359,7 @@ def test_residual_family_exports_and_modes():
         "attn_res_fwd_available",
         "gated_residual_combine",
         "gated_residual_mix",
+        "ihc_fused_hc",
         "ihc_head",
         "ihc_post",
         "ihc_pre",
@@ -378,6 +380,7 @@ def test_residual_family_exports_and_modes():
         "attn_res_fwd",
         "hyperconnection_combine",
         "hyperconnection_mix",
+        "ihc_fused_hc",
         "ihc_head",
         "ihc_post",
         "ihc_pre",
@@ -3046,6 +3049,28 @@ def _ihc_post() -> object:
     residual = torch.empty((2, 4, 64), dtype=torch.float32)
     gates = torch.empty((2, 4), dtype=torch.float32)
     return kernel_ihc_post(block_output, residual, gates)
+
+
+def _ihc_fused_hc(hc_mult: int) -> object:
+    block_output = torch.empty((2, 64), dtype=torch.bfloat16)
+    residual = torch.empty((2, hc_mult, 64), dtype=torch.float32)
+    gates = torch.empty((2, hc_mult), dtype=torch.float32)
+    fn = torch.empty((2 * hc_mult, hc_mult * 64), dtype=torch.float32)
+    hc_scale = torch.empty((2,), dtype=torch.float32)
+    hc_base = torch.empty((2 * hc_mult,), dtype=torch.float32)
+    return kernel_ihc_fused_hc(
+        block_output,
+        residual,
+        gates,
+        fn,
+        hc_scale,
+        hc_base,
+        2.0,
+        1e-6,
+        1e-6,
+        norm_weight=torch.empty((64,), dtype=torch.bfloat16),
+        norm_eps=1e-6,
+    )
 
 
 def _ihc_head(hc_mult: int) -> object:
@@ -6701,6 +6726,14 @@ _CASES = [
         "triton_ihc_head",
         partial(_ihc_head, hc_mult=4),
     ),
+    _case(
+        _is_supported_gpu,
+        "supported-gpu",
+        "residual",
+        "ihc_fused_hc",
+        "triton_ihc_fused_hc",
+        partial(_ihc_fused_hc, hc_mult=4),
+    ),
     # Past the Triton kernels' 16 gate lanes: pre takes 2 * hc_mult gates and
     # the head hc_mult.
     _case(
@@ -6710,6 +6743,15 @@ _CASES = [
         "ihc_pre",
         "torch_ihc_pre",
         partial(_ihc_pre, hc_mult=9),
+        id_suffix="hc9",
+    ),
+    _case(
+        _is_supported_gpu,
+        "supported-gpu",
+        "residual",
+        "ihc_fused_hc",
+        "torch_ihc_fused_hc",
+        partial(_ihc_fused_hc, hc_mult=9),
         id_suffix="hc9",
     ),
     _case(

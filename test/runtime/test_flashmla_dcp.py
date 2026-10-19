@@ -729,6 +729,7 @@ def test_pure_dsa_kvp_shards_index_and_latent_capacity(degree):
         index_n_heads=16,
         index_head_dim=128,
         index_k_format="fp8_scaled",
+        core_kernel_solution=None,
     )
     config = replace(
         base,
@@ -781,6 +782,7 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(
     backend = object.__new__(dsa.DSABackend)
     backend.kernel_page_size = 64
     backend.kernel_solution = None
+    backend.core_kernel_solution = None
     backend.slot_order = "selection"
     backend.data_type = torch.bfloat16
     backend.kv_lora_rank = 128
@@ -793,6 +795,7 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(
     backend.kvp_block_granularity = 64
     backend.kvp_virtual_block_count = 5
     backend.qcp_group = (0,)
+    backend.token_parallel_group = (0,)
     # The layer holds the attention-TP slice (2 of 8 heads): the sharded-head
     # combine form.
     backend.num_attention_heads = 8

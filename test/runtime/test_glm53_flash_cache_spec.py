@@ -67,6 +67,7 @@ def _recipe(
         index_head_dim=128,
         index_n_heads=32,
         index_k_format=index_k_format,
+        core_kernel_solution=None,
         index_kpool=4,
     )
     linear = LinearAttnConfig(

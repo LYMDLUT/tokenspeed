@@ -24,7 +24,8 @@ A launch with fewer CTAs than SMs attends every row's column slices as rows of
 their own and merges the partials by LSE. It must agree with one launch over
 the whole rows, sink included, on HY V4's TP32 shape: 2 real heads padded to
 the kernel's 64. Launches that fill a wave stay whole and must match an FP32
-reference, sink included.
+reference, sink included. Public FlashMLA calls with a sink stay whole and
+must preserve the single launch's BF16 rounding.
 """
 
 import pytest
@@ -40,7 +41,7 @@ pytestmark = pytest.mark.skipif(
 
 if platform.is_nvidia and platform.is_hopper_plus:
     from tokenspeed_kernel.ops.attention.dsa import cuda as dsa_cuda
-    from tokenspeed_kernel.ops.attention.dsa import dsa_prefill
+    from tokenspeed_kernel.ops.attention.dsa import dsa_decode, dsa_prefill
     from tokenspeed_kernel.ops.attention.dsa._triton.split_partials import (
         merge_split_partials,
     )
@@ -159,6 +160,7 @@ def test_split_matches_one_launch(case, splits, with_sink):
     sink = sink if with_sink else None
     ref_out, ref_lse = _one_launch(q, kv, slots, lens, sink)
     out, lse = dsa_cuda._flashmla_sparse_prefill_split(
+        sparse_fwd=flash_mla_sparse_fwd,
         q=q,
         kv=kv,
         slots=slots,
@@ -181,10 +183,42 @@ def test_split_matches_one_launch(case, splits, with_sink):
     assert (out[~finite.all(dim=1)] == 0).all()
 
 
+@pytest.mark.parametrize("case", sorted(CASES))
+@pytest.mark.parametrize("mode", ["prefill", "decode"])
+def test_sink_preserves_one_launch_rounding(case, mode):
+    spec = CASES[case]
+    q, kv, slots, lens, sink = _inputs(spec["lens"], spec.get("invalid", 0.0))
+    ref_out, ref_lse = _one_launch(q, kv, slots, lens, sink)
+    entry = dsa_prefill if mode == "prefill" else dsa_decode
+    override = (
+        "flashmla_dsa_prefill" if mode == "prefill" else "flashmla_dense_dsa_decode"
+    )
+    out, lse = entry(
+        q=q[:, :HEADS],
+        kv_cache=kv,
+        sparse_kv_cache=None,
+        topk_slots=slots,
+        topk_lens=lens,
+        max_seqlen_k=SLOTS,
+        qk_nope_head_dim=QK_NOPE_HEAD_DIM,
+        kv_lora_rank=KV_LORA_RANK,
+        qk_rope_head_dim=QK_ROPE_HEAD_DIM,
+        softmax_scale=SCALE,
+        page_size=64,
+        override=override,
+        slot_order="selection",
+        attn_sink=sink,
+        return_lse=True,
+    )
+    torch.testing.assert_close(out, ref_out, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(lse, ref_lse, rtol=0.0, atol=0.0)
+
+
 def test_split_writes_the_supplied_output_buffer():
     q, kv, slots, lens, sink = _inputs([TOPK, 900], 0.0)
     out = torch.full((2, HEADS * KV_LORA_RANK), 7.0, device="cuda", dtype=q.dtype)
     result = dsa_cuda._flashmla_sparse_prefill_split(
+        sparse_fwd=flash_mla_sparse_fwd,
         q=q,
         kv=kv,
         slots=slots,
@@ -211,6 +245,7 @@ def test_split_without_topk_lens_spans_the_padded_width(with_sink):
     sink = sink if with_sink else None
     ref_out, ref_lse = _one_launch(q, kv, slots, None, sink)
     out, lse = dsa_cuda._flashmla_sparse_prefill_split(
+        sparse_fwd=flash_mla_sparse_fwd,
         q=q,
         kv=kv,
         slots=slots,

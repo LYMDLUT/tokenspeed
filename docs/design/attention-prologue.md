@@ -100,6 +100,11 @@ Ascend's norm, which forms it in the weight dtype as before. M-RoPE selects
 each rotation pair's position row and then applies the ordinary rotation, so
 text tokens get exactly the bytes of plain RoPE.
 
+The table's storage dtype does not prescribe its coefficient precision. HY V4
+rounds its coefficients to the model dtype before storing them as fp32, in a
+model-specific cache shared by its attention and indexer. Other models retain
+their existing coefficient precision.
+
 The `composite` solution chains the step kernels and rounds between them, as
 models did before the prologue existed. It is the portable path: every GQA
 layer on Ascend, and elsewhere the shapes the fused kernels do not cover, MXFP8

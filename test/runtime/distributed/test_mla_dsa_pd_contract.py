@@ -80,6 +80,7 @@ def _attn_config(family: str, pd_enabled: bool):
             index_head_dim=128,
             index_n_heads=1,
             index_k_format="fp8_scaled",
+            core_kernel_solution=None,
             **common,
         )
     else:

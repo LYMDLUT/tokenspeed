@@ -9,12 +9,16 @@ repos:
     hooks:
       - id: check-symlinks
       - id: trailing-whitespace
+        # Preserve the pinned upstream source bytes and their recorded hashes.
+        exclude: ^tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/(?:flashmla_public_sm90/csrc/(?:flashmla|cutlass)/|cuda/csrc/marlin_mxfp8_dense/(?:dequant\.h|kernel\.h|marlin\.cuh|marlin_dtypes\.cuh|marlin_mma\.h|marlin_template\.h)$)
       - id: end-of-file-fixer
+        exclude: ^tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/(?:flashmla_public_sm90/csrc/(?:flashmla|cutlass)/|cuda/csrc/marlin_mxfp8_dense/(?:dequant\.h|kernel\.h|marlin\.cuh|marlin_dtypes\.cuh|marlin_mma\.h|marlin_template\.h)$)
       - id: check-yaml
         args: [--allow-multiple-documents]
       - id: check-toml
       - id: check-ast
       - id: check-added-large-files
+        exclude: ^tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/flashmla_public_sm90/csrc/(?:flashmla|cutlass)/
       - id: check-merge-conflict
       - id: check-shebang-scripts-are-executable
       - id: detect-private-key

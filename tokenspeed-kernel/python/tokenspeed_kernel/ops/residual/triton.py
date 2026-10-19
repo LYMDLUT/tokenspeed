@@ -1942,6 +1942,13 @@ _IHC_WEIGHT_PARTS = 3
 # Upper bound on the gate count (pre + post gates for hc_mult channels).
 _IHC_MAX_GATES = 16
 _IHC_FP32_ACCUMULATOR = 8192
+# Widest K tile of the FP32 projection; every narrower one divides it.
+_IHC_FP32_MAX_BLOCK_K = 128
+# Largest batch whose post boundary runs inside the next projection. A
+# projection program walks its K tiles one at a time, so past small batches
+# the post pass costs more inside it than as its own fully parallel kernel
+# (H20: 16.4 -> 14.3 us at 64 tokens, but 54 -> 61 us at 256).
+_IHC_FUSED_MAX_TOKENS = 64
 
 
 def _ihc_tile_m(num_tokens: int) -> int:
@@ -1971,7 +1978,7 @@ def _ihc_fp32_tile(num_tokens: int, gate_p2: int) -> tuple[int, int, int]:
     elif num_tokens <= 256:
         block_m, block_k = 16, 64
     else:
-        block_m, block_k = 8, 128 if num_tokens <= 2048 else 64
+        block_m, block_k = 8, _IHC_FP32_MAX_BLOCK_K if num_tokens <= 2048 else 64
     block_k = min(block_k, _IHC_FP32_ACCUMULATOR // (block_m * gate_p2))
     return block_m, block_k, 8 if num_tokens <= 4 else 4
 
@@ -2092,6 +2099,88 @@ def _ihc_project_fp32_kernel(
             mask=m_mask[:, None] & k_mask[None, :],
             other=0.0,
         )
+        weights = tl.load(
+            fn + offs_g[:, None] * total_k + offs_k[None, :],
+            mask=g_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        )
+        mix_acc += values[:, None, :] * weights[None, :, :]
+        square_acc += values * values
+
+    tl.store(
+        out_mix
+        + split_id * num_tokens * GATE_P2
+        + offs_m[:, None] * GATE_P2
+        + offs_g[None, :],
+        tl.sum(mix_acc, axis=2),
+        mask=m_mask[:, None],
+    )
+    tl.store(
+        out_sqrsum + split_id * num_tokens + offs_m,
+        tl.sum(square_acc, axis=1),
+        mask=m_mask,
+    )
+
+
+@triton.jit
+def _ihc_post_project_fp32_kernel(
+    block_output,
+    residual,
+    gates,
+    out,
+    fn,
+    out_mix,
+    out_sqrsum,
+    num_tokens,
+    total_k,
+    split_k,
+    hidden_size: tl.constexpr,
+    hc_mult: tl.constexpr,
+    gate_count: tl.constexpr,
+    GATE_P2: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # _ihc_post_kernel, then _ihc_project_fp32_kernel on its output, in one
+    # pass: each tile of the updated channels is stored and projected from
+    # registers. Both halves keep the two kernels' expressions and the
+    # projection's tile layout, so the updated channels and the partials match
+    # theirs bit for bit. BLOCK_K divides hidden_size, so a K tile lies in one
+    # channel and takes one post gate per token.
+    split_id = tl.program_id(0).to(tl.int64)
+    token_block = tl.program_id(1).to(tl.int64)
+    offs_m = token_block * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_g = tl.arange(0, GATE_P2)
+    m_mask = offs_m < num_tokens
+    g_mask = offs_g < gate_count
+    split_start = split_id * split_k
+
+    mix_acc = tl.zeros((BLOCK_M, GATE_P2, BLOCK_K), dtype=tl.float32)
+    square_acc = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+    for k_start in range(0, split_k, BLOCK_K):
+        tile = split_start + k_start
+        offs_k = tile + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < total_k
+        mask = m_mask[:, None] & k_mask[None, :]
+        # Tiles past the channels, at the end of a ragged split, are masked
+        # out; the clamp keeps their gate load in bounds.
+        channel = tl.minimum(tile // hidden_size, hc_mult - 1)
+        # BF16 loads four wide keep the tile in the FP32 loads' layout; wider
+        # ones can move it, and with it the partials' summation order.
+        hidden = tl.max_contiguous(offs_k - channel * hidden_size, 4)
+        block_values = tl.load(
+            block_output + offs_m[:, None] * hidden_size + hidden[None, :],
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        gate = tl.load(gates + offs_m * hc_mult + channel, mask=m_mask, other=0.0)
+        residual_values = tl.load(
+            residual + offs_m[:, None] * total_k + offs_k[None, :],
+            mask=mask,
+            other=0.0,
+        )
+        values = gate[:, None] * block_values + residual_values
+        tl.store(out + offs_m[:, None] * total_k + offs_k[None, :], values, mask=mask)
         weights = tl.load(
             fn + offs_g[:, None] * total_k + offs_k[None, :],
             mask=g_mask[:, None] & k_mask[None, :],
@@ -2281,8 +2370,18 @@ def _ihc_boundary(
     norm_eps: float | None,
     *,
     has_post: bool,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Run one iHC pre/head boundary: projection, then gates + reduction."""
+    pending: tuple[torch.Tensor, torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    """Run one iHC pre/head boundary: projection, then gates + reduction.
+
+    ``pending`` holds the previous sub-block's output and post gates, flat and
+    contiguous: the projection pass then applies that post boundary to FP32
+    channels whose size its K tile divides, and stores the updated channels,
+    which the reduction reads.
+
+    Returns the sub-block input, the post gates (None without ``has_post``),
+    and the flat channels the boundary read.
+    """
     hc_mult = residual.shape[-2]
     hidden_size = residual.shape[-1]
     total_k = hc_mult * hidden_size
@@ -2322,7 +2421,37 @@ def _ihc_boundary(
         (n_splits, num_tokens, block_n), dtype=torch.float32, device=device
     )
     sqrsum = torch.empty((n_splits, num_tokens), dtype=torch.float32, device=device)
-    if fp32_residual:
+    if pending is not None:
+        if not fp32_residual:
+            raise ValueError("the fused iHC post pass needs FP32 channels")
+        if hidden_size % block_k:
+            raise ValueError(
+                f"the fused iHC post pass needs {block_k}-column K tiles to divide "
+                f"the hidden size, got {hidden_size}"
+            )
+        block_output, gates = pending
+        updated = torch.empty_like(residual_flat)
+        _ihc_post_project_fp32_kernel[(n_splits, token_blocks)](
+            block_output,
+            residual_flat,
+            gates,
+            updated,
+            fn,
+            mix,
+            sqrsum,
+            num_tokens,
+            total_k,
+            split_k,
+            hidden_size=hidden_size,
+            hc_mult=hc_mult,
+            gate_count=gate_count,
+            GATE_P2=gate_p2,
+            BLOCK_M=block_m,
+            BLOCK_K=block_k,
+            num_warps=num_warps,
+        )
+        residual_flat = updated
+    elif fp32_residual:
         _ihc_project_fp32_kernel[(n_splits, token_blocks)](
             residual_flat,
             fn,
@@ -2398,7 +2527,7 @@ def _ihc_boundary(
         SINGLE_PASS=single_pass,
         num_warps=8 if single_pass else 4,
     )
-    return layer_input, post
+    return layer_input, post, residual_flat
 
 
 _IHC_RESIDUAL_DTYPES = (torch.bfloat16, torch.float32)
@@ -2449,7 +2578,7 @@ def triton_ihc_pre(
                 (*outer_shape, hc_mult), dtype=torch.float32, device=residual.device
             ),
         )
-    layer_input, post = _ihc_boundary(
+    layer_input, post, _ = _ihc_boundary(
         residual,
         fn,
         hc_scale,
@@ -2514,6 +2643,101 @@ def triton_ihc_post(
 
 @register_kernel(
     "residual",
+    "ihc_fused_hc",
+    name="triton_ihc_fused_hc",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset(
+        format_signature(
+            x_prev=dense_tensor_format(torch.bfloat16),
+            residual_prev=dense_tensor_format(residual_dtype),
+            post_prev=dense_tensor_format(torch.float32),
+            fn=dense_tensor_format(torch.float32),
+            hc_scale=dense_tensor_format(torch.float32),
+            hc_base=dense_tensor_format(torch.float32),
+        )
+        for residual_dtype in _IHC_RESIDUAL_DTYPES
+    ),
+    traits={"hc_mult": frozenset(range(2, _IHC_MAX_GATES // 2 + 1))},
+    priority=Priority.PERFORMANT,
+)
+def triton_ihc_fused_hc(
+    x_prev: torch.Tensor,
+    residual_prev: torch.Tensor,
+    post_prev: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    magnitude: float,
+    rms_eps: float,
+    hc_eps: float,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the previous iHC post boundary and the next pre boundary in Triton.
+
+    FP32 channels of small batches are updated and projected in one pass when
+    the widest K tile divides them. BF16 channels are rounded between the two
+    boundaries, so they, like larger batches and other channel sizes, run the
+    two kernels in turn.
+    """
+    if (norm_weight is None) != (norm_eps is None):
+        raise ValueError("norm_weight and norm_eps must be provided together")
+    if not residual_prev.is_cuda:
+        raise RuntimeError("fast iHC requires CUDA tensors")
+    hc_mult = residual_prev.shape[-2]
+    hidden_size = residual_prev.shape[-1]
+    outer_shape = residual_prev.shape[:-2]
+    if (
+        residual_prev.dtype != torch.float32
+        or hidden_size % _IHC_FP32_MAX_BLOCK_K
+        or outer_shape.numel() > _IHC_FUSED_MAX_TOKENS
+    ):
+        residual = triton_ihc_post(x_prev, residual_prev, post_prev)
+        layer_input, post = triton_ihc_pre(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            magnitude,
+            rms_eps,
+            hc_eps,
+            norm_weight,
+            norm_eps,
+        )
+        return residual, layer_input, post
+    if residual_prev.numel() == 0:
+        return (
+            torch.empty_like(residual_prev),
+            residual_prev.new_empty((*outer_shape, hidden_size), dtype=torch.bfloat16),
+            residual_prev.new_empty((*outer_shape, hc_mult)),
+        )
+    layer_input, post, residual = _ihc_boundary(
+        residual_prev,
+        fn,
+        hc_scale,
+        hc_base,
+        magnitude,
+        rms_eps,
+        hc_eps,
+        norm_weight,
+        norm_eps,
+        has_post=True,
+        pending=(
+            x_prev.reshape(-1, hidden_size).contiguous(),
+            post_prev.reshape(-1, hc_mult).contiguous(),
+        ),
+    )
+    assert post is not None
+    return (
+        residual.view(residual_prev.shape),
+        layer_input.view(*outer_shape, hidden_size),
+        post.view(*outer_shape, hc_mult),
+    )
+
+
+@register_kernel(
+    "residual",
     "ihc_head",
     name="triton_ihc_head",
     solution="triton",
@@ -2537,7 +2761,7 @@ def triton_ihc_head(
     outer_shape = residual.shape[:-2]
     if residual.numel() == 0:
         return residual.new_empty((*outer_shape, hidden_size), dtype=torch.bfloat16)
-    layer_input, _ = _ihc_boundary(
+    layer_input, _, _ = _ihc_boundary(
         residual,
         fn,
         hc_scale,

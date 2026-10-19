@@ -171,6 +171,17 @@ base and candidate revision. See the
 contract, and the [CI documentation](../test/ci/README.md#registration-level-kernel-benchmarks)
 for workflow behavior and runner requirements.
 
+The DSV3 router's warp reduction has a single shared-memory result writer.
+Numeric agreement alone cannot detect competing writes that happen to return
+the correct result. Run its exact-contribution regression under racecheck as
+well (from the repository root, after rebuilding the CUDA extension):
+
+```bash
+compute-sanitizer --tool racecheck --error-exitcode 1 \
+  python -m pytest tokenspeed-kernel/test/nvidia/thirdparty/test_cuda.py \
+  -k test_exact_warp_contributions
+```
+
 ### JIT compilation while serving
 
 Compile-time kernel parameters (`tl.constexpr`, `gl.constexpr`) key the

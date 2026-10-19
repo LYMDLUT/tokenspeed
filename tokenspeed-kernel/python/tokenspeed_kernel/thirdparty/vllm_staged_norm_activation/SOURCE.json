@@ -1,0 +1,31 @@
+{
+  "project": "vllm-project/vllm",
+  "release": "v0.29.0",
+  "commit": "98dff2a81d747d1dba01a47f939f48c3526d4206",
+  "license": "Apache-2.0",
+  "sources": [
+    {
+      "path": "csrc/libtorch_stable/layernorm_kernels.cu",
+      "url": "https://raw.githubusercontent.com/vllm-project/vllm/98dff2a81d747d1dba01a47f939f48c3526d4206/csrc/libtorch_stable/layernorm_kernels.cu",
+      "sha256": "2041b5da8fa2e2868c1ef6133a46d4ae85ffdbc599a8a5da0c5e66cb91c573f6",
+      "adapted_sections": "rms_norm_kernel aligned BF16 path and default launch"
+    },
+    {
+      "path": "csrc/libtorch_stable/activation_kernels.cu",
+      "url": "https://raw.githubusercontent.com/vllm-project/vllm/98dff2a81d747d1dba01a47f939f48c3526d4206/csrc/libtorch_stable/activation_kernels.cu",
+      "sha256": "d6510ee0271fb6c41b14aae501da53bcd6d5ec3707288c8644c4d3c120f0f4d0",
+      "adapted_sections": "silu_kernel and act_first compute, alpha=1 beta=0 unclamped"
+    }
+  ],
+  "license_url": "https://raw.githubusercontent.com/vllm-project/vllm/98dff2a81d747d1dba01a47f939f48c3526d4206/LICENSE",
+  "license_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+  "changes": [
+    "Standalone lazy FlashInfer gen_jit_spec and TVM-FFI binding; no vLLM binary load",
+    "BF16 rank 2..4 activation inputs; aligned norm widths divisible by eight",
+    "FP32 weight support is an explicit extension of the same-dtype public norm",
+    "Norm output supports row strides and exact full alias; partial overlap rejected",
+    "Scalar SiLU adaptation retains the public intermediate BF16 cast",
+    "Fixed candidate math flags; no claim of matching any reference build flags"
+  ],
+  "reference_numerical_equivalence": "UNVALIDATED"
+}

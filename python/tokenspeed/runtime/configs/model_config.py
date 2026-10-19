@@ -257,6 +257,7 @@ def configure_dsa_attention(model_config, server_args: ServerArgs) -> None:
     # replays a padded breakable graph (DSAConfig.padded_prefill_replay). A
     # model hook that does sets it after this (configure_hyv4_attention).
     model_config.dsa_padded_prefill_replay = False
+    model_config.dsa_core_kernel_solution = None
 
     model_config.scaling = 1 / math.sqrt(
         model_config.qk_nope_head_dim + model_config.qk_rope_head_dim
@@ -273,11 +274,13 @@ def configure_hyv4_attention(model_config, server_args: ServerArgs) -> None:
     """DSA geometry, plus the padded prefill replay HY V4's attention allows.
 
     HY V4's attention break holds every read of the live metadata and slices
-    off the padded rows. The MTP draft shares that attention and replays no
-    prefill graph of its own, so it leaves the target's prefill graph on.
+    off the padded rows. The MTP draft shares that attention and replays it
+    padded in its own step-0 prefill graph.
     """
     configure_dsa_attention(model_config, server_args)
     model_config.dsa_padded_prefill_replay = True
+    if server_args.hyv4_numerics == "staged-bf16":
+        model_config.dsa_core_kernel_solution = "flashmla_public"
 
 
 def configure_mla_attention(model_config, server_args: ServerArgs) -> None:
@@ -734,6 +737,7 @@ class ModelConfig:
         # hook names it (configure_dsa_attention: "fp8_scaled"); None for a
         # model without an indexer, and DSAConfig refuses None.
         self.index_k_format: str | None = None
+        self.dsa_core_kernel_solution: str | None = None
 
         # MLA/DSA families carry per-head dimension metadata that does not
         # follow the standard hidden_size / num_attention_heads derivation above.

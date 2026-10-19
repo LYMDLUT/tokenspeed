@@ -30,9 +30,12 @@ from tokenspeed.runtime.layers.attention.backends.specific import (  # noqa: F40
 )
 
 if platform.is_hopper_plus:
-    from tokenspeed.runtime.layers.attention.backends.paged import (  # noqa: F401
-        flashmla,
-    )
+    from tokenspeed_kernel.ops.attention.mla import cuda as flashmla_kernels
+
+    if "flash_mla_with_kvcache" in flashmla_kernels.__all__:
+        from tokenspeed.runtime.layers.attention.backends.paged import (  # noqa: F401
+            flashmla,
+        )
 
 if platform.is_nvidia:
     from tokenspeed.runtime.layers.attention.backends.paged import trtllm  # noqa: F401

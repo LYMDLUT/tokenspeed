@@ -1047,8 +1047,40 @@ setup(
             "objs/**/*.so",
             # Vendored Lamport protocol and FFI headers for the optional JIT extension.
             "csrc/tvm_ffi_utils.h",
+            # Pinned dense Marlin MXFP8 W8A16 optional-JIT source closure.
+            "csrc/marlin_mxfp8_dense/*.cu",
+            "csrc/marlin_mxfp8_dense/*.h",
+            "csrc/marlin_mxfp8_dense/*.cuh",
+            "csrc/marlin_mxfp8_dense/core/*.hpp",
+            "csrc/marlin_mxfp8_dense/LICENSE",
+            "csrc/marlin_mxfp8_dense/SOURCE.json",
             "csrc/include/**/*.h",
             "csrc/include/**/*.cuh",
+            # Public CUDA TopK sources and provenance for the optional JITs.
+            "csrc/public_grouped_topk.cu",
+            "csrc/public_grouped_topk.LICENSE",
+            "csrc/public_grouped_topk.README.md",
+            "csrc/public_v029_topk.cu",
+            "csrc/public_v029_moeTopKFuncs.cuh",
+            "csrc/public_v029_topk.LICENSE",
+            "csrc/public_v029_topk.SOURCE.json",
+            "csrc/public_v029_topk.README.md",
+        ],
+        # Independent public CUDA norm and activation JIT source.
+        "tokenspeed_kernel.thirdparty.vllm_staged_norm_activation": [
+            "kernels.cu",
+            "LICENSE",
+            "SOURCE.json",
+            "README.md",
+        ],
+        # Fixed public FlashMLA/CUTLASS source closure for the SM90 JIT.
+        "tokenspeed_kernel.thirdparty.flashmla_public_sm90": [
+            "SOURCE.json",
+            "csrc/**/*.cu",
+            "csrc/**/*.cuh",
+            "csrc/**/*.h",
+            "csrc/**/*.hpp",
+            "licenses/*.LICENSE",
         ],
         # Optional JIT adapter for fused AllGather quantization.
         "tokenspeed_kernel.thirdparty.flashinfer": [

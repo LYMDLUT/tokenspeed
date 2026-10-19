@@ -24,6 +24,25 @@ the online softmax; unused entries remain `-1`.
 Portable Triton implementations remain the fallback for trait combinations
 without a matching native registration.
 
+The explicit `flashmla_public` solution builds the SM90 BF16 sparse-prefill
+core from the pinned public FlashMLA source in
+`thirdparty/flashmla_public_sm90`. Its prefill and regular-BF16 decode
+registrations share one implementation. They accept 1..128 query heads,
+padded to 64 or 128, latent rank 512, RoPE width 64, page size 64 and selected
+widths 512/1024/2048. They reject FP8/packed KV, SM100, logit caps and sorted
+slot order. Reference priority keeps the existing automatic winners.
+
+The installed FlashMLA implementation and this source implementation share
+the layout adapter: the same head padding, optional length mask, KV view,
+sink padding, sinkless column splits, output copy and LSE correction. The
+split helper receives its raw provider explicitly, so a public-source call
+never falls back to the installed extension. The raw public entry returns
+BF16 output and FP32 max logits/LSE; sinks affect its output only. The DSA
+adapter adds sinks to returned LSE and maps empty rows to zero output and
+negative-infinite LSE. Its optional installed FlashMLA dependency can be
+absent without preventing public-source registration. Warm the public
+provider before CUDA graph capture.
+
 ## Index-K plane formats
 
 `dsa_prefill_topk` and `dsa_decode_topk` read the storage of the index-key
@@ -174,10 +193,9 @@ and pass their count as `topk_lens`, so the kernel walks only those columns.
 FlashMLA sparse prefill attends each query row with one CTA per 64 padded
 heads (128 on Blackwell); each CTA walks the row's selected columns serially,
 so a launch with fewer CTAs than SMs (regular-KV decode and verify, short
-prompts) is bound by one row's walk while most SMs idle. Such launches split
+prompts) is bound by one row's walk while most SMs idle. Sinkless launches split
 every row's columns into slices that keep the kernel's 128-column alignment,
-run the slices as independent rows and merge them by their LSE; the sink is
-applied once, to the merged softmax. The split count is the largest power of
+run the slices as independent rows and merge them by their LSE. The split count is the largest power of
 two for which the split launch, `rows * ctas_per_row * splits` CTAs, fits one
 wave of the device's SMs and every slice keeps that alignment; launches that
 cannot take two splits stay whole. HY V4 at TP32 runs 2 heads padded to one CTA
@@ -185,6 +203,12 @@ per row. The partials are rounded to BF16 before the FP32 merge, so results
 match a single launch to within that rounding. Because the split count follows
 the launch's row count, results are reproducible run to run but not
 batch-invariant.
+
+FlashMLA calls with a sink stay whole so the vendor kernel applies the sink
+before casting its output to BF16. Merging BF16 partials would introduce an
+extra rounding before sink normalization, including when only one split has
+live keys. This applies to prefill and the regular-KV FlashMLA decode wrapper;
+sinkless context-parallel partials retain the split path.
 
 Sink decode over a regular BF16 KV cache with at most 16 heads per row runs
 `triton_dsa_split_decode` on Hopper instead. Even split, FlashMLA spends a
@@ -222,19 +246,15 @@ when lengths or ownership change during graph replay. Partially valid tiles
 keep the per-entry mask and global forced-window policy. This avoids redundant
 arithmetic without changing the launch grid, logits capacity or Top-K scan.
 
-
-### Runtime/package compatibility
-
-The runtime omits the `attn_sink` keyword for sinkless kernels, including
-context-parallel partials. An independent runtime upgrade therefore keeps
-the previous call signature for models without sinks. A sink-bearing model
-must use a kernel package that implements the sink API; it must never drop a
-nonempty sink to make an older package accept the call.
-
 A strong sink may underflow every selected key probability. Such a row is
 still nonempty: its LSE includes the sink. Empty-row detection uses the
 selected slots, not the accumulated floating-point key mass, for both dense
 and packed Triton caches.
+
+Sinkless runtime calls omit the optional `attn_sink` keyword, including
+context-parallel partials and token-parallel row launches. This preserves
+the older kernel-package signature for unrelated models. An actual sink
+is never discarded for compatibility.
 
 The split Triton decode distinguishes zero softmax mass from non-finite mass.
 Only a truly empty partial receives the `+inf` LSE sentinel. A live partial

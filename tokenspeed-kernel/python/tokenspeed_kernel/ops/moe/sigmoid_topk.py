@@ -229,5 +229,7 @@ def torch_sigmoid_bias_topk(
     return topk_weights.to(weights_dtype), topk_ids.to(torch.int32)
 
 
+import tokenspeed_kernel.ops.moe.cuda_public_topk  # noqa: E402,F401
+import tokenspeed_kernel.ops.moe.cuda_public_v029_topk  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.gluon.sigmoid_topk  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.triton.decode_sigmoid_topk  # noqa: E402,F401

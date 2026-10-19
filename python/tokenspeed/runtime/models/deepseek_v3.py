@@ -113,7 +113,7 @@ from tokenspeed.runtime.layers.quantization.utils import (
     block_dequant,
     should_exclude_quant_module,
 )
-from tokenspeed.runtime.layers.rotary_embedding import get_rope
+from tokenspeed.runtime.layers.rotary_embedding import RotaryEmbedding, get_rope
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -323,10 +323,12 @@ class DeepseekV3MLP(nn.Module):
 class MoEGate(nn.Module):
     _DSV3_ROUTER_GEMM_HIDDEN = (3072, 6144, 7168)
 
-    def __init__(self, config, prefix: str = ""):
+    def __init__(self, config, prefix: str = "", *, params_dtype: torch.dtype):
         super().__init__()
         self.weight = nn.Parameter(
-            torch.empty((config.n_routed_experts, config.hidden_size))
+            torch.empty(
+                (config.n_routed_experts, config.hidden_size), dtype=params_dtype
+            )
         )
         if config.topk_method == "noaux_tc":
             self.e_score_correction_bias = nn.Parameter(
@@ -342,14 +344,18 @@ class MoEGate(nn.Module):
         )
 
     def forward(self, hidden_states):
-        if self.use_dsv3_router_gemm and hidden_states.size(0) > 0:
+        if (
+            self.use_dsv3_router_gemm
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.size(0) > 0
+        ):
             logits = dsv3_router_gemm(
                 hidden_states,
                 self.weight,
                 out_dtype=torch.float32,
             )
         else:
-            logits = F.linear(hidden_states, self.weight, None)
+            logits = F.linear(hidden_states.to(self.weight.dtype), self.weight, None)
         return logits
 
 
@@ -379,7 +385,11 @@ class DeepseekV3MoE(nn.Module):
                 f"Unsupported activation: {config.hidden_act}. Only silu is supported for now."
             )
 
-        self.gate = MoEGate(config=config, prefix=add_prefix("gate", prefix))
+        self.gate = MoEGate(
+            config=config,
+            prefix=add_prefix("gate", prefix),
+            params_dtype=torch.get_default_dtype(),
+        )
 
         if config.n_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
@@ -726,8 +736,8 @@ class DeepseekV3AttentionMLA(nn.Module):
             )
 
         if not skip_rope:
-            self.rotary_emb = get_rope(
-                qk_rope_head_dim,
+            self.rotary_emb = self._make_rotary_embedding(
+                head_size=qk_rope_head_dim,
                 rotary_dim=qk_rope_head_dim,
                 max_position=max_position_embeddings,
                 base=rope_theta,
@@ -775,6 +785,26 @@ class DeepseekV3AttentionMLA(nn.Module):
 
         self.w_kc = None
         self.w_vc = None
+
+    def _make_rotary_embedding(
+        self,
+        *,
+        head_size: int,
+        rotary_dim: int,
+        max_position: int,
+        base: float,
+        rope_scaling: dict[str, Any] | None,
+        is_neox_style: bool,
+    ) -> RotaryEmbedding:
+        """Build RoPE with the existing DeepSeek cache and scaling contract."""
+        return get_rope(
+            head_size,
+            rotary_dim=rotary_dim,
+            max_position=max_position,
+            base=base,
+            rope_scaling=rope_scaling,
+            is_neox_style=is_neox_style,
+        )
 
     def _make_qkv_a_projection(
         self, *, quant_config: QuantizationConfig | None, prefix: str

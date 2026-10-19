@@ -74,6 +74,7 @@ class MoeBackend(Enum):
 
     AUTO = "auto"
     TRITON = "triton"
+    TRITON_STAGED = "triton_staged"
     GLUON = "gluon"
     MARLIN = "marlin"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"

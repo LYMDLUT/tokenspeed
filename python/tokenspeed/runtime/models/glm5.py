@@ -53,7 +53,7 @@ from tokenspeed.runtime.layers.linear import (
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.utils import block_dequant
-from tokenspeed.runtime.layers.rotary_embedding import get_rope
+from tokenspeed.runtime.layers.rotary_embedding import RotaryEmbedding, get_rope
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.base.decoder_layer import capture_layer_input
@@ -157,8 +157,12 @@ class GlmDsaIndexer(nn.Module):
         max_position_embeddings: int,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        fuse_wk_weights_proj: bool,
     ) -> None:
         super().__init__()
+        if not isinstance(fuse_wk_weights_proj, bool):
+            raise TypeError("fuse_wk_weights_proj must be bool")
         self.index_topk = config.index_topk
         self.index_n_heads = config.index_n_heads
         self.index_head_dim = config.index_head_dim
@@ -182,33 +186,41 @@ class GlmDsaIndexer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("wq_b", prefix),
         )
-        self.wk = ReplicatedLinear(
-            hidden_size,
-            self.index_head_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("wk", prefix),
-        )
-        self.weights_proj = ReplicatedLinear(
-            hidden_size,
-            self.index_n_heads,
-            bias=False,
-            quant_config=None,
-            prefix=add_prefix("weights_proj", prefix),
-        )
-        self.wk_weights_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [self.index_head_dim, self.index_n_heads],
-            bias=False,
-            quant_config=None,
-            prefix=add_prefix("wk_weights_proj", prefix),
-        )
+        # A fused indexer owns only the single BF16 projection. In particular,
+        # HY V4's MXFP8 wk is dequantized during load and must not also prepare
+        # a never-executed Marlin weight copy.
+        self.wk: ReplicatedLinear | None = None
+        self.weights_proj: ReplicatedLinear | None = None
+        if not fuse_wk_weights_proj:
+            self.wk = ReplicatedLinear(
+                hidden_size,
+                self.index_head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("wk", prefix),
+            )
+            self.weights_proj = ReplicatedLinear(
+                hidden_size,
+                self.index_n_heads,
+                bias=False,
+                quant_config=None,
+                prefix=add_prefix("weights_proj", prefix),
+            )
+        self.wk_weights_proj: MergedColumnParallelLinear | None = None
+        if fuse_wk_weights_proj:
+            self.wk_weights_proj = MergedColumnParallelLinear(
+                hidden_size,
+                [self.index_head_dim, self.index_n_heads],
+                bias=False,
+                quant_config=None,
+                prefix=add_prefix("wk_weights_proj", prefix),
+            )
         self._wk_weights_proj_loaded = False
         self.k_norm = LayerNorm(self.index_head_dim, eps=1e-6)
 
         rope_scaling = _glm_dsa_rope_scaling(rope_scaling)
-        self.rotary_emb = get_rope(
-            self.rope_head_dim,
+        self.rotary_emb = self._make_rotary_embedding(
+            head_size=self.rope_head_dim,
             rotary_dim=self.rope_head_dim,
             max_position=max_position_embeddings,
             base=rope_theta,
@@ -216,8 +228,33 @@ class GlmDsaIndexer(nn.Module):
             is_neox_style=not getattr(config, "indexer_rope_interleave", False),
         )
 
-    def set_wk_weights_proj_loaded(self, loaded: bool = True) -> None:
-        self._wk_weights_proj_loaded = bool(loaded)
+    def _make_rotary_embedding(
+        self,
+        *,
+        head_size: int,
+        rotary_dim: int,
+        max_position: int,
+        base: float,
+        rope_scaling: dict[str, Any] | None,
+        is_neox_style: bool,
+    ) -> RotaryEmbedding:
+        """Build RoPE with the existing GLM indexer cache and scaling contract."""
+        return get_rope(
+            head_size,
+            rotary_dim=rotary_dim,
+            max_position=max_position,
+            base=base,
+            rope_scaling=rope_scaling,
+            is_neox_style=is_neox_style,
+        )
+
+    def set_wk_weights_proj_loaded(self, loaded: bool) -> None:
+        """Publish loading state only for a projection allocated by this indexer."""
+        if not isinstance(loaded, bool):
+            raise TypeError("loaded must be bool")
+        if loaded and self.wk_weights_proj is None:
+            raise ValueError("Cannot mark an absent fused indexer projection loaded")
+        self._wk_weights_proj_loaded = loaded
 
     def forward(
         self,
@@ -228,12 +265,17 @@ class GlmDsaIndexer(nn.Module):
         index_q = self.wq_b(q_lora)[0]
         index_q = index_q.view(-1, self.index_n_heads, self.index_head_dim)
         if self._wk_weights_proj_loaded:
+            assert self.wk_weights_proj is not None
             key_weights = self.wk_weights_proj(hidden_states)[0]
             index_k, weights = key_weights.split(
                 [self.index_head_dim, self.index_n_heads],
                 dim=-1,
             )
         else:
+            if self.wk is None or self.weights_proj is None:
+                raise RuntimeError(
+                    "Fused indexer weights must be loaded before forward"
+                )
             index_k = self.wk(hidden_states)[0]
             weights = self.weights_proj(hidden_states)[0]
         index_k = self.k_norm(index_k)
@@ -335,6 +377,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
                 max_position_embeddings=max_position_embeddings,
                 quant_config=quant_config,
                 prefix=add_prefix("indexer", prefix),
+                fuse_wk_weights_proj=True,
             )
         self._decode_topk_indices_buffer: torch.Tensor | None = None
         self._decode_topk_lens_buffer: torch.Tensor | None = None
@@ -1416,7 +1459,7 @@ class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
 
         module = modules_dict.get(module_name)
         if isinstance(module, GlmDsaIndexer):
-            module.set_wk_weights_proj_loaded()
+            module.set_wk_weights_proj_loaded(True)
 
     def _load_fused_indexer_projection_shard(
         self,
@@ -1484,26 +1527,36 @@ class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
         modules_dict: dict[str, nn.Module],
         pending_fp8_wk: dict[str, dict[str, torch.Tensor]],
         loaded_shards: dict[str, set[int]],
-    ) -> None:
-        if ".indexer.wk_weights_proj." in name:
-            return
+    ) -> str | None:
+        """Load or buffer a checkpoint shard for a present fused indexer.
 
-        if ".indexer.weights_proj.weight" in name:
+        Returns the fused parameter name when the tensor was consumed, even
+        if its FP8 partner or the other projection shard has not arrived yet.
+        A missing target returns None without retaining checkpoint tensors.
+        """
+        if ".indexer.wk_weights_proj." in name:
+            return None
+
+        if name.endswith(".indexer.weights_proj.weight"):
             module_name = name.rsplit(".weights_proj.weight", 1)[0]
-            self._load_fused_indexer_projection_shard(
+            if self._load_fused_indexer_projection_shard(
                 module_name=module_name,
                 shard_id=1,
                 loaded_weight=loaded_weight,
                 params_dict=params_dict,
                 modules_dict=modules_dict,
                 loaded_shards=loaded_shards,
-            )
-            return
+            ):
+                return f"{module_name}.wk_weights_proj.weight"
+            return None
 
         if ".indexer.wk." not in name:
-            return
+            return None
 
         module_name = name.rsplit(".wk.", 1)[0]
+        fused_name = f"{module_name}.wk_weights_proj.weight"
+        if fused_name not in params_dict:
+            return None
         if name.endswith(".weight") and loaded_weight.dtype in (
             torch.float8_e4m3fn,
             torch.float8_e4m3fnuz,
@@ -1516,7 +1569,7 @@ class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
                 modules_dict=modules_dict,
                 loaded_shards=loaded_shards,
             )
-            return
+            return fused_name
 
         if name.endswith(".weight"):
             self._load_fused_indexer_projection_shard(
@@ -1527,9 +1580,9 @@ class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
                 modules_dict=modules_dict,
                 loaded_shards=loaded_shards,
             )
-            return
+            return fused_name
 
-        if "weight_scale_inv" in name:
+        if name.endswith(".weight_scale_inv"):
             pending_fp8_wk.setdefault(module_name, {})["scale"] = loaded_weight
             self._flush_fused_indexer_fp8_wk(
                 module_name=module_name,
@@ -1538,6 +1591,8 @@ class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
                 modules_dict=modules_dict,
                 loaded_shards=loaded_shards,
             )
+            return fused_name
+        return None
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params_dict = dict(self.named_parameters())
@@ -1561,13 +1616,10 @@ class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
 
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                param = self.get_param(params_dict, name)
-                if param is None:
-                    continue
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-                loaded.add(param_names[id(param)])
-                self._try_load_fused_indexer_projection(
+                # A fused-only indexer has no standalone wk/weights_proj
+                # parameters. Consume its checkpoint shards before deciding
+                # whether an absent direct parameter should be skipped.
+                fused_name = self._try_load_fused_indexer_projection(
                     name=name,
                     loaded_weight=loaded_weight,
                     params_dict=params_dict,
@@ -1575,6 +1627,27 @@ class GlmMoeDsaForCausalLM(DeepseekV3ForCausalLM):
                     pending_fp8_wk=pending_fp8_wk,
                     loaded_shards=loaded_fused_indexer_shards,
                 )
+                if fused_name is not None:
+                    module_name = fused_name.removesuffix(".wk_weights_proj.weight")
+                    if loaded_fused_indexer_shards.get(module_name) == {0, 1}:
+                        loaded.add(fused_name)
+                    param = params_dict.get(name)
+                else:
+                    param = self.get_param(params_dict, name)
+                if param is None:
+                    continue
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded.add(param_names[id(param)])
+                if name.endswith(".indexer.wk_weights_proj.weight"):
+                    module_name = name.removesuffix(".wk_weights_proj.weight")
+                    for shard_id in (0, 1):
+                        self._record_fused_indexer_projection_shard(
+                            module_name=module_name,
+                            shard_id=shard_id,
+                            loaded_shards=loaded_fused_indexer_shards,
+                            modules_dict=modules_dict,
+                        )
 
         loaded |= super().load_weights(base_weights())
         self._pad_fused_qkv_a_proj_for_fp8_blockscale()

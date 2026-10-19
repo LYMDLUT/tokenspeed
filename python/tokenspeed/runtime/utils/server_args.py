@@ -504,6 +504,9 @@ class ServerArgs:
     # forward's rows over the attention TP group (1 = off; equals
     # kv_parallel_size when on).
     query_context_parallel_size: int = 1
+    # Attention token parallelism: DSA sparse attention attends query rows
+    # spread over consecutive intra-node groups of attention TP ranks (1 = off).
+    attn_token_parallel_size: int = 1
     deepseek_v4_mega_moe_max_num_tokens: int = 0
     deepseek_v4_indexer_prefill_max_logits_mb: int = 512
     deepseek_v4_prefill_chunk_size: int = 4
@@ -579,6 +582,8 @@ class ServerArgs:
     # switches below (resolve_numerics). Each folded switch can still be set
     # individually; the umbrella only ever tightens.
     numerics: str = "auto"
+    # HY V4's explicit BF16 materialization order; not a bitwise envelope.
+    hyv4_numerics: str = "auto"
     # Trainer-operation-order switches (docs/design/numerics.md,
     # alignment.trainer). Each keeps the engine's own form by default and is
     # folded to the trainer's form by --numerics rl-bitwise.
@@ -987,6 +992,7 @@ class ServerArgs:
             attn_head_tp_size=self.attn_head_tp_size,
             lm_head_tp_size=self.lm_head_tp_size,
             attn_qcp_size=self.query_context_parallel_size,
+            attn_token_parallel_size=self.attn_token_parallel_size,
             dense_tp_size=dense_tp_size,
             dense_dp_size=dense_dp_size,
             moe_tp_size=moe_tp_size,
@@ -1513,6 +1519,9 @@ class ServerArgs:
         all-reduce that resolver auto-enables.
         """
         _require_choice("--numerics", self.numerics, NUMERICS_ENVELOPES)
+        _require_choice("--hyv4-numerics", self.hyv4_numerics, ("auto", "staged-bf16"))
+        if self.hyv4_numerics == "staged-bf16":
+            self._resolve_hyv4_staged_bf16()
         if self.numerics != "auto":
             self._resolve_rl_bitwise()
         # Individual switches that veto a fusion resolve_communication may
@@ -1544,6 +1553,54 @@ class ServerArgs:
                     "EP group inside the MoE leaf; --all2all-backend deepep "
                     "performs that exchange itself and cannot be combined with it"
                 )
+
+    def _resolve_hyv4_staged_bf16(self):
+        """Pin the launch prerequisites of HY V4's staged BF16 implementation."""
+        if self.numerics != "auto":
+            raise ValueError("--hyv4-numerics staged-bf16 requires --numerics auto")
+        if self.dtype not in ("auto", "bfloat16") or self.quantization is not None:
+            raise ValueError("--hyv4-numerics staged-bf16 requires unquantized BF16")
+        if (
+            self.kv_cache_dtype not in ("auto", "bfloat16")
+            or self.kv_cache_quant_method != "none"
+        ):
+            raise ValueError("--hyv4-numerics staged-bf16 requires a BF16 KV cache")
+        if self.mapping.moe.tp_size != 1 or self.all2all_backend != "none":
+            raise ValueError(
+                "--hyv4-numerics staged-bf16 requires MoE TP 1 and no all-to-all"
+            )
+        if (
+            self.moe_combine_order != "rank"
+            or self.init_expert_location != "trivial"
+            or self.ep_num_redundant_experts != 0
+            or self.enable_eplb
+            or self.ep_dispatch_algorithm is not None
+        ):
+            raise ValueError(
+                "--hyv4-numerics staged-bf16 requires rank-order combination "
+                "and contiguous experts without placement or rebalancing"
+            )
+        for flag, backend in (
+            ("--moe-backend", self.moe_backend),
+            ("--draft-moe-backend", self.draft_moe_backend),
+        ):
+            if backend not in (None, "auto", "triton_staged"):
+                raise ValueError(
+                    f"--hyv4-numerics staged-bf16 requires {flag} triton_staged; "
+                    f"got {backend!r}"
+                )
+        for key in ("NVIDIA_TF32_OVERRIDE", "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE"):
+            if os.environ.get(key) not in (None, "0"):
+                raise ValueError(
+                    f"--hyv4-numerics staged-bf16 conflicts with {key}="
+                    f"{os.environ[key]!r}; unset it or set it to 0 before launch"
+                )
+        self.moe_backend = "triton_staged"
+        if self.draft_moe_backend is not None:
+            self.draft_moe_backend = "triton_staged"
+        self.layer_boundary_norm = "unfused"
+        self.enable_allreduce_fusion = False
+        self.disable_tf32 = True
 
     def _resolve_rl_bitwise(self):
         """The rl-bitwise block: every envelope beyond auto runs it."""
@@ -2804,7 +2861,8 @@ class ServerArgs:
             "--moe-backend",
             type=str,
             default=ServerArgs.moe_backend,
-            help="MoE runner backend: auto, triton, gluon, flashinfer_trtllm, "
+            help="MoE runner backend: auto, triton, triton_staged (unquantized "
+            "BF16 stages, MoE TP 1), gluon, flashinfer_trtllm, "
             "flashinfer_cutlass, flashinfer_cutedsl, deep_gemm, mega_moe, "
             "gluon_petit, aok (the batch-invariant leaves; --numerics rl-bitwise "
             "folds auto to it)",
@@ -3519,6 +3577,18 @@ class ServerArgs:
             "group.",
         )
         parser.add_argument(
+            "--attn-token-parallel-size",
+            type=int,
+            default=ServerArgs.attn_token_parallel_size,
+            help="Split DSA sparse-attention query rows over consecutive groups of "
+            "this many attention TP ranks: each rank attends a slice of the rows "
+            "with the whole group's heads, which cuts the head padding of "
+            "kernels that pad few TP-local heads to a wide tile. Must divide "
+            "the attention TP size and --nprocs-per-node, so that every group "
+            "stays inside one node; does not combine with --kv-parallel-size or "
+            "--query-context-parallel-size.",
+        )
+        parser.add_argument(
             "--dense-tp-size",
             type=int,
             default=ServerArgs.dense_tp_size,
@@ -3592,6 +3662,17 @@ class ServerArgs:
             "alignment.trainer) so a teacher-forced pass reproduces the RL "
             "trainer's logprobs; a model serves it only once its profile "
             "declares it verified.",
+        )
+        parser.add_argument(
+            "--hyv4-numerics",
+            type=str,
+            choices=["auto", "staged-bf16"],
+            default=ServerArgs.hyv4_numerics,
+            help="HY V4 numerical implementation. staged-bf16 selects explicit "
+            "BF16 stages on NVIDIA for unquantized models, MoE TP 1, contiguous "
+            "EP and single-group routing. It pins the staged MoE backend, "
+            "unfused boundary norms and IEEE FP32 matmul. This is not a "
+            "bitwise invariance guarantee; validate the deployment separately.",
         )
         parser.add_argument(
             "--yarn-ramp-mask-device",

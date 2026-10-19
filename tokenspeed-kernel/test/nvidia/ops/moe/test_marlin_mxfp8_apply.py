@@ -78,7 +78,11 @@ def _dequant(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 
 
 def _reference(x, raw, topk_ids, topk_weights, limit):
-    """bf16 GEMMs over dequantized experts with the clamped SwiGLU epilogue."""
+    """Clamped SwiGLU with BF16 operand/product rounding in Marlin GEMM2.
+
+    The global diagnostic sum stays FP32; per-rank BF16 finalize and the
+    cross-rank reduction tree can still differ from this reference.
+    """
     out = torch.zeros_like(x, dtype=torch.float32)
     for expert in range(raw["w13_weight"].shape[0]):
         token_ids, slot_ids = (topk_ids == expert).nonzero(as_tuple=True)
@@ -93,9 +97,11 @@ def _reference(x, raw, topk_ids, topk_weights, limit):
             up = up.clamp(-limit, limit)
         hidden = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)
         down = (hidden.float() @ w2.float().T).to(torch.bfloat16)
-        out.index_add_(
-            0, token_ids, down.float() * topk_weights[token_ids, slot_ids][:, None]
-        )
+        # The native Marlin epilogue rounds both the GEMM2 fragment and the
+        # route weight to BF16 before its BF16 multiply/store.
+        route_weights = topk_weights[token_ids, slot_ids].to(torch.bfloat16)
+        weighted = (down.float() * route_weights.float()[:, None]).to(torch.bfloat16)
+        out.index_add_(0, token_ids, weighted.float())
     return out
 
 
@@ -468,7 +474,8 @@ def test_dense_prefill_validates_storage_at_weight_preparation(monkeypatch):
         actual = marlin_mxfp8_precomputed_moe_apply(
             plan, x, w, None, topk_weights=weights, topk_ids=ids
         )
-        _assert_close(actual, expected)
+        assert actual.dtype == x.dtype
+        _assert_close(actual.float(), expected)
 
 
 def test_dense_prefill_path_shares_the_bf16_cutlass_call(monkeypatch):
@@ -737,3 +744,51 @@ def test_dequant_rejects_invalid_storage_before_launch(
     monkeypatch.setattr(mxfp8, "_marlin_mxfp8_to_bf16_kernel", ForbiddenLaunch())
     with pytest.raises(exception, match=message):
         mxfp8.dequantize_marlin_mxfp8(qweight, scales, out, swap_halves=True)
+
+
+@pytest.mark.parametrize("splits", [1, 2, 4])
+def test_gemv_weighted_finalize_matches_native_bf16_epilogue(splits):
+    """Match the native operand casts, including masked/nonlocal NaN rows."""
+    _requires_sm90()
+    tokens, top_k, hidden = 2, 2, 128
+    values = torch.tensor(
+        [1.00390625, 0.7318954467773438, 3.1415927, -1.00390625],
+        dtype=torch.float32,
+        device="cuda",
+    ).repeat(hidden // 4)
+    partials = torch.full(
+        (splits, tokens * top_k, hidden),
+        float("nan"),
+        dtype=torch.float32,
+        device="cuda",
+    )
+    # Rank one owns experts 2 and 3. Other and masked assignments must not
+    # read their uninitialized partials or contaminate the output.
+    partials[:, 0] = values / splits
+    partials[:, 2] = -values / splits
+    ids = torch.tensor([[2, 0], [3, -1]], dtype=torch.int32, device="cuda")
+    weights = torch.tensor([[0.7, 0.1], [0.31, 0.9]], device="cuda")
+    out = torch.full(
+        (tokens, hidden), float("nan"), dtype=torch.bfloat16, device="cuda"
+    )
+    mxfp8._gemv_topk_sum_kernel[(tokens, 1)](
+        partials,
+        weights,
+        ids,
+        2,
+        2,
+        out,
+        tokens * top_k,
+        HIDDEN=hidden,
+        TOP_K=top_k,
+        SPLITS=splits,
+        BLOCK=256,
+        num_warps=4,
+    )
+    accumulated = torch.stack([values, -values])
+    expected = (
+        accumulated.bfloat16().float() * weights[:, :1].bfloat16().float()
+    ).bfloat16()
+    old_combined = (accumulated * weights[:, :1]).bfloat16()
+    assert torch.any(expected != old_combined)
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)

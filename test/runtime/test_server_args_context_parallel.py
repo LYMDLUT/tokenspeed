@@ -349,6 +349,7 @@ def _dsa_attn_config(**overrides):
         index_head_dim=128,
         index_n_heads=64,
         index_k_format="fp8_scaled",
+        core_kernel_solution=None,
     )
     kwargs = dict(
         device="cuda",

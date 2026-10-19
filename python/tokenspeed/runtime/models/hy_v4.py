@@ -37,13 +37,18 @@ that cannot apply it would change the model's output, so the DSA kernels declare
 from __future__ import annotations
 
 import inspect
+import os
 from collections.abc import Iterable
 from dataclasses import replace
+from functools import lru_cache
+from typing import Any, NamedTuple
 
 import torch
 from tokenspeed_kernel.ops import residual as residual_ops
-from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
 from tokenspeed_kernel.ops.attention import dsa as dsa_ops
+from tokenspeed_kernel.ops.moe import moe_topk
+from tokenspeed_kernel.platform import ArchVersion, current_platform
+from tokenspeed_kernel.selection import resolve_kernel_override
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -64,13 +69,22 @@ from tokenspeed.runtime.layers.moe import (
     MoELayer,
     build_moe_checkpoint_loader,
 )
-from tokenspeed.runtime.layers.moe.topk import TopK
-from tokenspeed.runtime.layers.moe.utils import RoutingMethodType
+from tokenspeed.runtime.layers.moe.topk import (
+    ExpertLocationDispatchInfo,
+    StandardTopKOutput,
+    TopK,
+    TopKOutputFormat,
+    _mask_topk_ids_padded_region,
+    record_expert_load,
+)
+from tokenspeed.runtime.layers.moe.utils import RoutingMethodType, get_moe_backend
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.modelopt_mxfp8 import (
     ModelOptMxfp8Config,
+    dequantize_mxfp8_weight,
     preprocess_modelopt_mxfp8_weights,
 )
+from tokenspeed.runtime.layers.rotary_embedding import RotaryEmbedding
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.deepseek_v3 import (
@@ -110,6 +124,161 @@ _STACKED_DENSE_PROJECTIONS = (
     (".gate_up_proj.", ".up_proj.", 1),
 )
 
+_HYV4_TOPK_KERNEL = "cuda_public_v029_sigmoid_bias_topk"
+
+
+def hyv4_staged_bf16() -> bool:
+    return global_server_args_dict["hyv4_numerics"] == "staged-bf16"
+
+
+def _require_hyv4_kernel(family: str, mode: str, expected: str) -> None:
+    selected = resolve_kernel_override(family, mode, expected)
+    if selected != expected:
+        raise ValueError(
+            f"HY V4 staged-bf16 requires {family}.{mode}={expected}, "
+            f"but the effective kernel override is {selected!r}"
+        )
+
+
+def configure_hyv4_numerics(
+    config: PretrainedConfig,
+    mapping: Mapping,
+    quant_config: QuantizationConfig | None,
+) -> None:
+    """Validate the opt-in implementation before allocating target/draft layers.
+
+    This checks the actual worker dtype and resolved MoE backend as well as
+    launch options. IEEE FP32 applies to the worker's FP32 router/iHC GEMMs;
+    configuring it here precedes every warmup and graph capture.
+    """
+    if not hyv4_staged_bf16():
+        return
+    platform = current_platform()
+    if (
+        not platform.is_nvidia
+        or platform.arch_version != ArchVersion(9, 0)
+        or torch.get_default_dtype() != torch.bfloat16
+    ):
+        raise ValueError("HY V4 staged-bf16 requires an SM90 NVIDIA BF16 model worker")
+    if quant_config is not None:
+        raise ValueError("HY V4 staged-bf16 does not support quantized checkpoints")
+    if mapping.moe.tp_size != 1 or config.n_routed_experts % mapping.moe.ep_size:
+        raise ValueError("HY V4 staged-bf16 requires MoE TP 1 and equal EP shards")
+    topk_limit = min(
+        config.n_routed_experts, 22 if config.n_routed_experts <= 512 else 16
+    )
+    if (
+        config.n_group != 1
+        or config.topk_group != 1
+        or not 0 < config.num_experts_per_tok <= topk_limit
+        or config.n_routed_experts > 1024
+    ):
+        raise ValueError(
+            "HY V4 staged-bf16 requires single-group routing with E <= 1024; "
+            "top_k must be <= min(E, 22) for E <= 512, otherwise <= 16"
+        )
+    if any(
+        width <= 0 or width % 8
+        for width in (config.hidden_size, config.q_lora_rank, config.kv_lora_rank)
+    ):
+        raise ValueError(
+            "HY V4 staged-bf16 norm widths must be positive multiples of 8"
+        )
+    for key, expected in (
+        ("all2all_backend", "none"),
+        ("moe_combine_order", "rank"),
+        ("init_expert_location", "trivial"),
+        ("ep_num_redundant_experts", 0),
+        ("enable_eplb", False),
+        ("ep_dispatch_algorithm", None),
+        ("layer_boundary_norm", "unfused"),
+        ("enable_allreduce_fusion", False),
+    ):
+        if global_server_args_dict[key] != expected:
+            raise ValueError(f"HY V4 staged-bf16 requires {key}={expected!r}")
+    if get_moe_backend().value != "triton_staged":
+        raise ValueError("HY V4 staged-bf16 requires the triton_staged MoE backend")
+    for key in ("NVIDIA_TF32_OVERRIDE", "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE"):
+        if os.environ.get(key) not in (None, "0"):
+            raise ValueError(
+                f"HY V4 staged-bf16 conflicts with {key}={os.environ[key]!r}"
+            )
+    for mode in ("ihc_pre", "ihc_post", "ihc_head", "ihc_fused_hc"):
+        _require_hyv4_kernel("residual", mode, f"torch_{mode}")
+    _require_hyv4_kernel("moe", "sigmoid_bias_topk", _HYV4_TOPK_KERNEL)
+    _require_hyv4_kernel("moe", "apply", "triton_bf16_staged_moe_apply")
+    torch.set_float32_matmul_precision("highest")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    if (
+        torch.get_float32_matmul_precision() != "highest"
+        or torch.backends.cuda.matmul.allow_tf32
+    ):
+        raise RuntimeError("HY V4 staged-bf16 could not configure IEEE FP32 matmul")
+
+
+class HYV4StagedRMSNorm(RMSNorm):
+    """Standalone BF16 norm, with a materialized residual sum when supplied."""
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        from tokenspeed_kernel.ops.layernorm.cuda_staged import rmsnorm
+
+        if residual is not None:
+            x = x + residual
+            residual = x
+        result = rmsnorm(x, self.weight, self.variance_epsilon, out=out)
+        return result if residual is None else (result, residual)
+
+    def forward_with_allreduce_fusion(self, *args, **kwargs):
+        raise ValueError("HY V4 staged-bf16 does not support fused all-reduce/norm")
+
+
+class HYV4StagedQKVNorm(FusedRMSNorm):
+    """Keep Q's explicit output and normalize only the latent's non-RoPE view."""
+
+    def forward(
+        self,
+        input_q_a: torch.Tensor,
+        input_kv_a: torch.Tensor,
+        output_q_a: torch.Tensor | None = None,
+        output_kv_a: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        q = self.q_a_norm(
+            input_q_a, out=input_q_a if output_q_a is None else output_q_a
+        )
+        kv = self.kv_a_norm(
+            input_kv_a, out=input_kv_a if output_kv_a is None else output_kv_a
+        )
+        return q, kv
+
+    def forward_with_allgather_fusion(self, *args, **kwargs):
+        raise ValueError("HY V4 staged-bf16 requires separate all-gather and QKV norms")
+
+
+class HYV4StagedSiluAndMul(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from tokenspeed_kernel.ops.activation.cuda_staged import silu_and_mul
+
+        return silu_and_mul(x)
+
+
+class HYV4MLP(DeepseekV3MLP):
+    """HY dense/shared projections, with the selected activation's BF16 stages."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        if hyv4_staged_bf16():
+            self.act_fn = HYV4StagedSiluAndMul()
+
+
+def hyv4_rmsnorm(hidden_size: int, *, eps: float) -> RMSNorm:
+    norm_type = HYV4StagedRMSNorm if hyv4_staged_bf16() else RMSNorm
+    return norm_type(hidden_size, eps=eps)
+
 
 def normalize_hyv4_checkpoint_name(name: str) -> str:
     """Map an HY V4 checkpoint tensor name onto this module tree."""
@@ -135,7 +304,7 @@ def check_hyv4_runtime(mapping: Mapping, *, enable_ihc: bool) -> None:
     if enable_ihc:
         missing.extend(
             name
-            for name in ("ihc_pre", "ihc_post", "ihc_head")
+            for name in ("ihc_pre", "ihc_post", "ihc_head", "ihc_fused_hc")
             if not callable(getattr(residual_ops, name, None))
         )
     for name in ("dsa_prefill", "dsa_decode"):
@@ -153,6 +322,55 @@ def check_hyv4_runtime(mapping: Mapping, *, enable_ihc: bool) -> None:
         )
 
 
+class HYV4RotaryEmbedding(RotaryEmbedding):
+    """Plain RoPE with coefficients rounded to the activation dtype."""
+
+    def _compute_cos_sin_cache(self) -> torch.Tensor:
+        # The prologue stores coefficients in FP32, but HY V4 rotates with
+        # coefficients rounded to the model dtype before FP32 arithmetic.
+        return super()._compute_cos_sin_cache().to(self.dtype).float()
+
+
+@lru_cache(maxsize=16)
+def _cached_hyv4_rope(
+    *,
+    head_size: int,
+    rotary_dim: int,
+    max_position: int,
+    base: float,
+    is_neox_style: bool,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> HYV4RotaryEmbedding:
+    # Keep this cache separate from GLM/DeepSeek, including across devices.
+    with torch.device(device):
+        return HYV4RotaryEmbedding(
+            head_size, rotary_dim, max_position, base, is_neox_style, dtype
+        )
+
+
+def _make_hyv4_rope(
+    *,
+    head_size: int,
+    rotary_dim: int,
+    max_position: int,
+    base: float,
+    rope_scaling: dict[str, Any] | None,
+    is_neox_style: bool,
+) -> HYV4RotaryEmbedding:
+    if rope_scaling is not None:
+        raise ValueError("HY V4 requires plain RoPE")
+    return _cached_hyv4_rope(
+        head_size=head_size,
+        rotary_dim=rotary_dim,
+        max_position=max_position,
+        base=base,
+        is_neox_style=is_neox_style,
+        dtype=torch.get_default_dtype(),
+        device=torch.empty(0).device,
+    )
+
+
 class HYV4DsaIndexer(GlmDsaIndexer):
     """DSA indexer using HY V4's checkpoint layout.
 
@@ -163,6 +381,25 @@ class HYV4DsaIndexer(GlmDsaIndexer):
     the sparse selection silently instead of failing loudly.
     """
 
+    def _make_rotary_embedding(
+        self,
+        *,
+        head_size: int,
+        rotary_dim: int,
+        max_position: int,
+        base: float,
+        rope_scaling: dict[str, Any] | None,
+        is_neox_style: bool,
+    ) -> RotaryEmbedding:
+        return _make_hyv4_rope(
+            head_size=head_size,
+            rotary_dim=rotary_dim,
+            max_position=max_position,
+            base=base,
+            rope_scaling=rope_scaling,
+            is_neox_style=is_neox_style,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -172,12 +409,17 @@ class HYV4DsaIndexer(GlmDsaIndexer):
         index_q = self.wq_b(q_lora)[0]
         index_q = index_q.view(-1, self.index_n_heads, self.index_head_dim)
         if self._wk_weights_proj_loaded:
+            assert self.wk_weights_proj is not None
             key_weights = self.wk_weights_proj(hidden_states)[0]
             index_k, weights = key_weights.split(
                 [self.index_head_dim, self.index_n_heads],
                 dim=-1,
             )
         else:
+            if self.wk is None or self.weights_proj is None:
+                raise RuntimeError(
+                    "Fused indexer weights must be loaded before forward"
+                )
             index_k = self.wk(hidden_states)[0]
             weights = self.weights_proj(hidden_states)[0]
         index_k = self.k_norm(index_k)
@@ -240,9 +482,10 @@ class HYV4Attention(GlmMoeDsaAttention):
             reduce_attn_results=False,
             alt_stream=alt_stream,
         )
-        self.q_a_layernorm = RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
-        self.kv_a_layernorm = RMSNorm(config.kv_lora_rank, eps=config.rms_norm_eps)
-        self.fused_qk_layernorm = FusedRMSNorm(
+        self.q_a_layernorm = hyv4_rmsnorm(config.q_lora_rank, eps=config.rms_norm_eps)
+        self.kv_a_layernorm = hyv4_rmsnorm(config.kv_lora_rank, eps=config.rms_norm_eps)
+        qkv_norm_type = HYV4StagedQKVNorm if hyv4_staged_bf16() else FusedRMSNorm
+        self.fused_qk_layernorm = qkv_norm_type(
             self.q_a_layernorm,
             self.kv_a_layernorm,
         )
@@ -266,6 +509,9 @@ class HYV4Attention(GlmMoeDsaAttention):
                 max_position_embeddings=config.max_position_embeddings,
                 quant_config=quant_config,
                 prefix=add_prefix("indexer", prefix),
+                # Match the reference: convert only indexer wk to BF16 at
+                # load time, then fuse it with the unquantized weights_proj.
+                fuse_wk_weights_proj=True,
             )
         )
         self._decode_topk_indices_buffer: torch.Tensor | None = None
@@ -289,22 +535,26 @@ class HYV4Attention(GlmMoeDsaAttention):
                 prefix=add_prefix("linear_gate", prefix),
             )
 
-        # This rank's slice of the per-head sink logits; the DSA backend reads
-        # it off ``attn_mqa`` once ``bind_learnable_sink`` publishes it.
+        # The sink logits of the heads this rank's sparse attention computes:
+        # its token-parallel group's heads, which are just the TP-local heads
+        # without token parallelism. The DSA backend reads them off
+        # ``attn_mqa`` once ``bind_learnable_sink`` publishes them.
         self.learnable_sink_param: nn.Parameter | None = None
         if config.learnable_sink:
+            num_sink_heads = self.num_local_heads * mapping.attn.token_parallel_size
             self.learnable_sink_param = nn.Parameter(
-                torch.empty(self.num_local_heads, dtype=torch.float32),
+                torch.empty(num_sink_heads, dtype=torch.float32),
                 requires_grad=False,
             )
-            head_start = mapping.attn.tp_rank * self.num_local_heads
-            num_local_heads = self.num_local_heads
+            head_start = (
+                mapping.attn.tp_rank // mapping.attn.token_parallel_size
+            ) * num_sink_heads
 
             def load_sink(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
-                local = loaded_weight.reshape(-1)[
-                    head_start : head_start + num_local_heads
+                heads = loaded_weight.reshape(-1)[
+                    head_start : head_start + num_sink_heads
                 ]
-                param.data.copy_(local.to(torch.float32))
+                param.data.copy_(heads.to(torch.float32))
 
             self.learnable_sink_param.weight_loader = load_sink
 
@@ -317,6 +567,25 @@ class HYV4Attention(GlmMoeDsaAttention):
         if self.learnable_sink_param is None:
             return
         self.attn_mqa.attn_sink = self.learnable_sink_param.detach()
+
+    def _make_rotary_embedding(
+        self,
+        *,
+        head_size: int,
+        rotary_dim: int,
+        max_position: int,
+        base: float,
+        rope_scaling: dict[str, Any] | None,
+        is_neox_style: bool,
+    ) -> RotaryEmbedding:
+        return _make_hyv4_rope(
+            head_size=head_size,
+            rotary_dim=rotary_dim,
+            max_position=max_position,
+            base=base,
+            rope_scaling=rope_scaling,
+            is_neox_style=is_neox_style,
+        )
 
     def _apply_output_gate(
         self,
@@ -333,11 +602,10 @@ class HYV4Attention(GlmMoeDsaAttention):
         gate = self.linear_gate(hidden_states)[0]
         if self.gate_size_per_head == 1:
             shaped = attn_output.view(attn_output.shape[0], -1, self.v_head_dim)
-            shaped = shaped * torch.sigmoid(gate.float()).to(shaped.dtype).unsqueeze(-1)
+            shaped = shaped * torch.sigmoid(gate).unsqueeze(-1)
             return shaped.reshape(attn_output.shape[0], -1)
-        # One fused pass instead of a sigmoid plus a multiply.
-        sigmoid_mul(attn_output, gate)
-        return attn_output
+        # Materialize the sigmoid in the gate dtype before the product.
+        return attn_output * torch.sigmoid(gate)
 
     def forward(
         self,
@@ -352,11 +620,32 @@ class HYV4Attention(GlmMoeDsaAttention):
         The token-shaped projections around the sparse core stay in the
         caller's graph segments; only :meth:`_sparse_attention` is an eager
         break. The hidden states are gathered once and shared by the indexer
-        and the gate, and the gate is applied before any draft narrowing so its
-        rows always match the attention output.
+        and the gate. Draft narrowing never reaches this forward: the MTP draft
+        narrows between :meth:`attend_token_shaped` and ``o_proj`` in its own
+        stages (``HYV4ModelNextN``).
         """
         if hidden_states.shape[0] == 0:
             return hidden_states
+        attn_output = self.attend_token_shaped(
+            positions, hidden_states, ctx, comm_manager, block_scale
+        )
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    def attend_token_shaped(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+        comm_manager: CommManager,
+        block_scale: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Projections, sparse attention and the output gate; no draft narrowing.
+
+        Token-shaped through the eager ``_sparse_attention`` break. The NextN
+        prefill-graph encoder captures this; :meth:`narrowing_forward` then
+        gathers the live rows before :meth:`o_proj`.
+        """
         qkv = self.fused_qkv_a_proj_with_mqa(
             hidden_states,
             block_scale,
@@ -387,11 +676,7 @@ class HYV4Attention(GlmMoeDsaAttention):
         attn_output = self._sparse_attention(
             positions, q, latent_cache, index_q, index_k, index_weights, ctx
         )
-        attn_output = self._apply_output_gate(attn_output, hidden_states)
-        if ctx.draft_narrowing is not None:
-            attn_output = attn_output.index_select(0, ctx.gather_ids)
-        output, _ = self.o_proj(attn_output)
-        return output
+        return self._apply_output_gate(attn_output, hidden_states)
 
     @break_point
     def _sparse_attention(
@@ -534,6 +819,70 @@ class HYV4Attention(GlmMoeDsaAttention):
         return attn_output
 
 
+class HYV4MoEGate(MoEGate):
+    """Project the router's FP32 operands without a BF16-input GEMM path."""
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.linear(hidden_states.float(), self.weight, None)
+
+
+class HYV4StagedTopK(TopK):
+    """One named single-group router for eager and padded graph forwards."""
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        *,
+        output_format: TopKOutputFormat | None = None,
+        num_token_non_padded: torch.Tensor | None = None,
+        expert_location_dispatch_info: ExpertLocationDispatchInfo | None = None,
+    ) -> StandardTopKOutput:
+        config = self.topk_config
+        selected_format = (
+            output_format or config.output_format or TopKOutputFormat.STANDARD
+        )
+        if selected_format != TopKOutputFormat.STANDARD:
+            raise ValueError("HY V4 staged-bf16 requires precomputed STANDARD routing")
+        if expert_location_dispatch_info is not None:
+            raise ValueError("HY V4 staged-bf16 does not support expert placement")
+        if self.simulate_routing:
+            raise ValueError("HY V4 staged-bf16 does not support simulated routing")
+        if (
+            not config.use_grouped_topk
+            or config.num_expert_group != 1
+            or config.topk_group != 1
+            or config.correction_bias is None
+            or config.num_fused_shared_experts != 0
+            or config.custom_routing_function is not None
+            or config.num_sink_experts != 0
+            or config.zero_expert_num != 0
+        ):
+            raise ValueError("HY V4 staged-bf16 requires single-group sigmoid routing")
+        if hidden_states.shape[0] != router_logits.shape[0]:
+            raise ValueError(
+                "HY V4 hidden states and router logits have different row counts"
+            )
+        _require_hyv4_kernel("moe", "sigmoid_bias_topk", _HYV4_TOPK_KERNEL)
+        weights, ids = moe_topk(
+            router_logits,
+            config.top_k,
+            score_function="sigmoid",
+            selection_method="topk",
+            renormalize=config.renormalize,
+            routed_scaling_factor=config.routed_scaling_factor,
+            correction_bias=config.correction_bias,
+            topk_indices_dtype=config.topk_indices_dtype,
+            topk_weights_dtype=config.topk_weights_dtype,
+            override=_HYV4_TOPK_KERNEL,
+        )
+        # Same padding and observer order as select_experts: invalid IDs do
+        # not compute experts or count as traffic, while weights stay intact.
+        _mask_topk_ids_padded_region(ids, num_token_non_padded)
+        record_expert_load(None, ids)
+        return StandardTopKOutput(weights, ids, router_logits)
+
+
 class HYV4MoE(DeepseekV3MoE):
     """DeepSeek routing with HY V4's clamped SwiGLU routed experts.
 
@@ -567,7 +916,12 @@ class HYV4MoE(DeepseekV3MoE):
                 f"Unsupported activation: {config.hidden_act}. Only silu is supported."
             )
 
-        self.gate = MoEGate(config=config, prefix=add_prefix("gate", prefix))
+        # Router parameters and logits stay in FP32 even for a BF16 model.
+        self.gate = HYV4MoEGate(
+            config=config,
+            prefix=add_prefix("gate", prefix),
+            params_dtype=torch.float32,
+        )
         self.experts = MoELayer(
             top_k=config.num_experts_per_tok,
             num_experts=config.n_routed_experts,
@@ -596,7 +950,8 @@ class HYV4MoE(DeepseekV3MoE):
             # the drift then spreads through attention.
             deterministic_finalize=True,
         )
-        self.topk = TopK(
+        topk_type = HYV4StagedTopK if hyv4_staged_bf16() else TopK
+        self.topk = topk_type(
             top_k=config.num_experts_per_tok,
             renormalize=config.norm_topk_prob,
             use_grouped_topk=True,
@@ -607,7 +962,7 @@ class HYV4MoE(DeepseekV3MoE):
             routed_scaling_factor=config.routed_scaling_factor,
             output_format=self.experts.topk_output_format,
         )
-        self.shared_experts = DeepseekV3MLP(
+        self.shared_experts = HYV4MLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
             hidden_act=config.hidden_act,
@@ -645,13 +1000,23 @@ class HYV4HCBoundary(nn.Module):
         )
 
 
+class IhcPost(NamedTuple):
+    """A sub-block output whose iHC post boundary is still to be applied."""
+
+    block_output: torch.Tensor
+    gates: torch.Tensor
+
+
 class HYV4DecoderLayer(nn.Module):
     """One HY V4 decoder layer: gated sparse MLA plus a dense or MoE MLP.
 
     With iHC enabled the residual lives on the channel axis of
-    ``hidden_states`` (``[num_tokens, hc_mult, hidden_size]``), so no separate
-    residual is threaded between layers and the returned residual is None. The
-    RMSNorm before each sub-block is fused into the iHC reduce pass.
+    ``hidden_states`` (``[num_tokens, hc_mult, hidden_size]``). Each post
+    boundary runs in the projection pass of the next pre boundary, so a layer
+    returns its channels before its MLP's post boundary and that post
+    (``IhcPost``) as the residual; the next layer, or the model's head, applies
+    it. Under staged-bf16 the channel reduction materializes before its
+    standalone RMSNorm; otherwise the norm is fused into the reduction.
 
     iHC requires the attention and MLP to see full token rows: the boundary
     reduces and re-scatters every channel of a token at once. Attention data
@@ -675,6 +1040,7 @@ class HYV4DecoderLayer(nn.Module):
         self.config = config
         self.mapping = mapping
         self.layer_id = layer_id
+        self.staged_bf16 = hyv4_staged_bf16()
         # The MTP block carries no iHC weights, so it runs single-stream.
         self.enable_ihc = config.enable_ihc and not is_nextn
         self.is_moe_layer = True if is_nextn else config.is_moe_layer(layer_id)
@@ -698,7 +1064,7 @@ class HYV4DecoderLayer(nn.Module):
                 alt_stream=alt_stream,
             )
         else:
-            self.mlp = DeepseekV3MLP(
+            self.mlp = HYV4MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
@@ -709,8 +1075,8 @@ class HYV4DecoderLayer(nn.Module):
                 batch_invariant=False,
             )
 
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
+        self.input_layernorm = hyv4_rmsnorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = hyv4_rmsnorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
         prev_is_moe = (
@@ -751,21 +1117,19 @@ class HYV4DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        residual: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        residual: torch.Tensor | IhcPost | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | IhcPost | None]:
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
             ctx
         )
         if self.enable_ihc:
-            return (
-                self._forward_ihc(
-                    positions,
-                    hidden_states,
-                    ctx,
-                    num_global_tokens,
-                    max_num_tokens_per_gpu,
-                ),
-                None,
+            return self._forward_ihc(
+                positions,
+                hidden_states,
+                ctx,
+                residual,
+                num_global_tokens,
+                max_num_tokens_per_gpu,
             )
 
         if not ctx.forward_mode.is_idle():
@@ -778,9 +1142,7 @@ class HYV4DecoderLayer(nn.Module):
                 ctx=ctx,
                 comm_manager=self.comm_manager,
             )
-            if ctx.draft_narrowing is not None:
-                residual = residual.index_select(0, ctx.gather_ids)
-            hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
+            hidden_states, residual = self.post_attention_norm(
                 hidden_states, residual, ctx
             )
         hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
@@ -791,6 +1153,19 @@ class HYV4DecoderLayer(nn.Module):
             hidden_states, residual, ctx
         )
         return hidden_states, residual
+
+    def post_attention_norm(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Materialize the attention residual before its separate RMSNorm."""
+        hidden_states, residual = self.comm_manager.post_attn_comm(
+            hidden_states, residual, ctx
+        )
+        residual = hidden_states + residual
+        return self.post_attention_layernorm(residual), residual
 
     def _run_mlp(
         self,
@@ -807,10 +1182,15 @@ class HYV4DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
+        pending: IhcPost | None,
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
-    ) -> torch.Tensor:
-        """iHC forward: each sub-block reduces the channels, then re-scatters."""
+    ) -> tuple[torch.Tensor, IhcPost | None]:
+        """iHC forward: each sub-block reduces the channels, then re-scatters.
+
+        ``pending`` is the previous layer's MLP post boundary, applied with the
+        attention pre boundary; this layer's own is returned the same way.
+        """
         if ctx.forward_mode.is_idle():
             # Idle ranks hold no tokens but must join the MoE collectives.
             # Mirror the active path's collectives exactly (pre gather, MoE,
@@ -824,19 +1204,10 @@ class HYV4DecoderLayer(nn.Module):
                 max_num_tokens_per_gpu,
             )
             self.comm_manager.post_mlp_comm(mlp_output, mlp_output, ctx)
-            return hidden_states
+            return hidden_states, None
 
-        attn = self.hc_attn_layer
-        attn_input, attn_post = residual_ops.ihc_pre(
-            hidden_states,
-            attn.hc_fn,
-            attn.hc_scale,
-            attn.hc_base,
-            self.config.hc_magnitude,
-            self.config.rms_norm_eps,
-            self.config.hc_eps,
-            norm_weight=self.input_layernorm.weight,
-            norm_eps=self.input_layernorm.variance_epsilon,
+        hidden_states, attn_input, attn_post = self._ihc_pre(
+            hidden_states, pending, self.hc_attn_layer, self.input_layernorm
         )
         attn_output = self.self_attn(
             positions=positions,
@@ -845,19 +1216,12 @@ class HYV4DecoderLayer(nn.Module):
             comm_manager=self.comm_manager,
         )
         attn_output, _ = self.comm_manager.post_attn_comm(attn_output, attn_output, ctx)
-        hidden_states = residual_ops.ihc_post(attn_output, hidden_states, attn_post)
 
-        mlp = self.hc_mlp_layer
-        mlp_input, mlp_post = residual_ops.ihc_pre(
+        hidden_states, mlp_input, mlp_post = self._ihc_pre(
             hidden_states,
-            mlp.hc_fn,
-            mlp.hc_scale,
-            mlp.hc_base,
-            self.config.hc_magnitude,
-            self.config.rms_norm_eps,
-            self.config.hc_eps,
-            norm_weight=self.post_attention_layernorm.weight,
-            norm_eps=self.post_attention_layernorm.variance_epsilon,
+            IhcPost(attn_output, attn_post),
+            self.hc_mlp_layer,
+            self.post_attention_layernorm,
         )
         mlp_output = self._run_mlp(
             self.comm_manager.pre_mlp_comm(mlp_input, ctx),
@@ -865,7 +1229,45 @@ class HYV4DecoderLayer(nn.Module):
             max_num_tokens_per_gpu,
         )
         mlp_output, _ = self.comm_manager.post_mlp_comm(mlp_output, mlp_output, ctx)
-        return residual_ops.ihc_post(mlp_output, hidden_states, mlp_post)
+        return hidden_states, IhcPost(mlp_output, mlp_post)
+
+    def _ihc_pre(
+        self,
+        hidden_states: torch.Tensor,
+        pending: IhcPost | None,
+        boundary: HYV4HCBoundary,
+        norm: RMSNorm,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Apply ``pending``, then reduce the channels for ``boundary``'s sub-block.
+
+        Returns the channels after ``pending``, the sub-block input and its post
+        gates.
+        """
+        args = (
+            boundary.hc_fn,
+            boundary.hc_scale,
+            boundary.hc_base,
+            self.config.hc_magnitude,
+            self.config.rms_norm_eps,
+            self.config.hc_eps,
+        )
+        if self.staged_bf16:
+            mode = "ihc_pre" if pending is None else "ihc_fused_hc"
+            _require_hyv4_kernel("residual", mode, f"torch_{mode}")
+        norm_args = (
+            dict(norm_weight=None, norm_eps=None, solution="torch")
+            if self.staged_bf16
+            else dict(norm_weight=norm.weight, norm_eps=norm.variance_epsilon)
+        )
+        if pending is None:
+            block_input, gates = residual_ops.ihc_pre(hidden_states, *args, **norm_args)
+        else:
+            hidden_states, block_input, gates = residual_ops.ihc_fused_hc(
+                pending.block_output, hidden_states, pending.gates, *args, **norm_args
+            )
+        if self.staged_bf16:
+            block_input = norm(block_input)
+        return hidden_states, block_input, gates
 
 
 class HYV4Model(nn.Module):
@@ -884,7 +1286,9 @@ class HYV4Model(nn.Module):
         check_hyv4_quant_config(quant_config)
         check_hyv4_speculative_algorithm()
         check_hyv4_runtime(mapping, enable_ihc=config.enable_ihc)
+        configure_hyv4_numerics(config, mapping, quant_config)
         self.config = config
+        self.staged_bf16 = hyv4_staged_bf16()
         self.mapping = mapping
         self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -912,7 +1316,7 @@ class HYV4Model(nn.Module):
                 for layer_id in range(config.num_hidden_layers)
             ]
         )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = hyv4_rmsnorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hc_head: HYV4HCBoundary | None = (
             HYV4HCBoundary(config, is_head=True) if config.enable_ihc else None
         )
@@ -932,13 +1336,9 @@ class HYV4Model(nn.Module):
         )
         residual = None
         if self.hc_head is not None:
-            # One embedding row seeds every channel, as in the reference. The
-            # channels stay FP32 across layers: rounding them to BF16 at every
-            # sub-block boundary compounds into a visible logit drift, while
-            # FP32 channels round only each sub-block's input.
-            hidden_states = (
-                hidden_states.float().unsqueeze(1).repeat(1, self.config.hc_mult, 1)
-            )
+            # Keep the embedding dtype across channels so every sub-block
+            # materializes its residual before the next pre boundary.
+            hidden_states = hidden_states.unsqueeze(1).repeat(1, self.config.hc_mult, 1)
 
         for layer in self.layers:
             hidden_states, residual = layer(positions, hidden_states, ctx, residual)
@@ -951,6 +1351,17 @@ class HYV4Model(nn.Module):
             return hidden_states, None
 
         if self.hc_head is not None:
+            if residual is not None:
+                if self.staged_bf16:
+                    _require_hyv4_kernel("residual", "ihc_post", "torch_ihc_post")
+                hidden_states = residual_ops.ihc_post(
+                    residual.block_output,
+                    hidden_states,
+                    residual.gates,
+                    solution="torch" if self.staged_bf16 else None,
+                )
+            if self.staged_bf16:
+                _require_hyv4_kernel("residual", "ihc_head", "torch_ihc_head")
             hidden_states = residual_ops.ihc_head(
                 hidden_states,
                 self.hc_head.hc_fn,
@@ -958,6 +1369,7 @@ class HYV4Model(nn.Module):
                 self.hc_head.hc_base,
                 self.config.rms_norm_eps,
                 self.config.hc_eps,
+                solution="torch" if self.staged_bf16 else None,
             )
             hidden_states = self.norm(hidden_states)
         else:
@@ -982,7 +1394,7 @@ class HYV4ForCausalLM(GlmMoeDsaForCausalLM):
     """
 
     model_cls = HYV4Model
-    # ``load_hyv4_weights`` dequantizes the dense ModelOpt MXFP8 weights.
+    # The loader retains dense ModelOpt MXFP8 weights for Marlin W8A16.
     supports_modelopt_mxfp8 = True
     # Loading derives tensors a live update would leave stale: the absorbed
     # MLA weights and the MoE kernels' weight layouts.
@@ -1073,7 +1485,15 @@ def check_hyv4_speculative_algorithm() -> None:
 
 def finalize_hyv4_attention(attn: HYV4Attention) -> None:
     """Derive the absorbed MLA weights and publish the sink after loading."""
-    attn.w_kc, attn.w_vc = _prepare_mla_kv_b_proj_weights(attn.kv_b_proj.weight, attn)
+    from tokenspeed.runtime.layers.dense.mxfp8 import ModelOptMxfp8LinearMethod
+
+    method = attn.kv_b_proj.quant_method
+    weight = (
+        method.weight_for_absorption(attn.kv_b_proj)
+        if isinstance(method, ModelOptMxfp8LinearMethod)
+        else attn.kv_b_proj.weight
+    )
+    attn.w_kc, attn.w_vc = _prepare_mla_kv_b_proj_weights(weight, attn)
     attn.bind_learnable_sink()
 
 
@@ -1113,6 +1533,7 @@ def load_hyv4_weights(
     # takes shards 0 and 1 and counts as loaded only once both have arrived.
     loaded_shards: dict[str, set[int]] = {}
     unmatched: list[str] = []
+    pending_indexer_wk: dict[str, dict[str, torch.Tensor]] = {}
 
     def record_fused_shard(param_name: str, shard_id: int) -> bool:
         """Record one shard of a fused parameter; True once both are loaded."""
@@ -1162,16 +1583,49 @@ def load_hyv4_weights(
                     direct, loaded_weight
                 )
                 loaded_params.add(name)
+            suffix = name.rsplit(".", 1)[-1]
             fused_name = f"{module_name}.wk_weights_proj.weight"
             fused = params_dict.get(fused_name)
-            if fused is not None:
+            # Reference ModelOpt MXFP8 indexer: wk is FP8, weights_proj BF16,
+            # but both are read by one BF16 GEMM. Keep the raw pair only until
+            # both tensors arrive, dequantize once and load fused shard zero.
+            is_wk = shard_id == 0
+            if (
+                fused is not None
+                and is_wk
+                and (
+                    suffix == "weight_scale"
+                    or (
+                        suffix == "weight"
+                        and loaded_weight.dtype == torch.float8_e4m3fn
+                    )
+                )
+            ):
+                pending = pending_indexer_wk.setdefault(module_name, {})
+                part = "scale" if suffix == "weight_scale" else "weight"
+                if part in pending:
+                    raise RuntimeError(f"Duplicate indexer wk {part}: {module_name}")
+                pending[part] = loaded_weight
+                if len(pending) == 2:
+                    weight = dequantize_mxfp8_weight(
+                        pending["weight"], pending["scale"]
+                    )
+                    fused.weight_loader(fused, weight, 0)
+                    del pending_indexer_wk[module_name]
+                    module = modules_dict.get(module_name)
+                    if record_fused_shard(fused_name, 0) and isinstance(
+                        module, GlmDsaIndexer
+                    ):
+                        module.set_wk_weights_proj_loaded(True)
+                continue
+            if fused is not None and suffix == "weight":
                 fused.weight_loader(fused, loaded_weight, shard_id)
                 module = modules_dict.get(module_name)
                 if record_fused_shard(fused_name, shard_id) and isinstance(
                     module, GlmDsaIndexer
                 ):
-                    module.set_wk_weights_proj_loaded()
-            if direct is None and fused is None:
+                    module.set_wk_weights_proj_loaded(True)
+            elif direct is None:
                 unmatched.append(name)
             continue
 
@@ -1224,6 +1678,11 @@ def load_hyv4_weights(
         getattr(param, "weight_loader", default_weight_loader)(param, loaded_weight)
         loaded_params.add(name)
 
+    if pending_indexer_wk:
+        raise RuntimeError(
+            f"HY V4 indexer FP8 wk weights/scales are incomplete: "
+            f"{sorted(pending_indexer_wk)}"
+        )
     if unmatched:
         logger.warning(
             f"HY V4 loader skipped {len(unmatched)} checkpoint tensors with no "

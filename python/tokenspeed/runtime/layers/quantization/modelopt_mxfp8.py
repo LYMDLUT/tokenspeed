@@ -20,13 +20,11 @@
 
 """ModelOpt single-algorithm MXFP8 checkpoints (``quant_algo: MXFP8``).
 
-Every quantized linear stores an E4M3 ``weight`` with one E8M0
-``weight_scale`` byte per 32 input channels. Routed experts stay MXFP8 and run
-on a weight-only MXFP8 MoE kernel (Marlin on Hopper, which has no MXFP8 tensor
-cores). Dense projections are dequantized to bf16 while loading: an E4M3 value
-times a power of two is exact in bf16, so a bf16 GEMM over the dequantized
-weight computes the same products as a weight-only MXFP8 GEMM and differs only
-in accumulation order.
+Every quantized linear keeps its E4M3 weight and E8M0 group-32 scales.
+Dense projections run the native Marlin W8A16 kernel. Modules excluded by the
+checkpoint stay unquantized; routed-expert dispatch is unchanged. Absorbed MLA
+may explicitly materialize K/V projection weights for its tensor contractions,
+which is not a fallback for an ordinary dense GEMM.
 """
 
 from __future__ import annotations
@@ -122,10 +120,23 @@ class ModelOptMxfp8Config(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> QuantizeMethodBase:
-        from tokenspeed.runtime.layers.dense import UnquantizedLinearMethod
+        from tokenspeed.runtime.layers.dense import (
+            ModelOptMxfp8LinearMethod,
+            UnquantizedLinearMethod,
+        )
+        from tokenspeed.runtime.layers.quantization.utils import (
+            should_exclude_quant_module,
+        )
 
-        # Dense weights arrive in bf16 from preprocess_modelopt_mxfp8_weights.
-        return UnquantizedLinearMethod()
+        if should_exclude_quant_module(prefix, self.exclude_modules):
+            return UnquantizedLinearMethod()
+        if layer is not None and layer.interleave_linear_and_gate:
+            raise ValueError("ModelOpt MXFP8 dense does not support fused interleaving")
+        return ModelOptMxfp8LinearMethod(
+            use_atomic_add=False,
+            use_fp32_reduce=True,
+            override=None if layer is None else layer.override_kernel_name,
+        )
 
     def get_moe_quant_config(self, prefix: str) -> QuantizationConfig:
         return self.moe_config
@@ -171,37 +182,43 @@ def preprocess_modelopt_mxfp8_weights(
     *,
     keeps_mxfp8: Callable[[str], bool],
 ) -> Iterator[tuple[str, torch.Tensor]]:
-    """Dequantize dense MXFP8 checkpoint tensors to bf16 while streaming.
+    """Forward dense E4M3/E8M0 tensors unchanged and require complete pairs.
 
-    Every FP8 ``<module>.weight`` is paired with its ``<module>.weight_scale``
-    and yielded once as a bf16 ``<module>.weight``. Tensors for which
-    ``keeps_mxfp8(name)`` is true (the routed experts) pass through untouched
-    for the MXFP8 MoE loader, as does every 16/32-bit tensor (unquantized
-    modules and bf16 refit streams). Only modules waiting for their partner
-    are buffered.
+    No weight values are expanded to BF16. The callback identifies packed
+    expert tensors, whose separate MoE loader validates their storage. Dense
+    pair bookkeeping retains only shape metadata, not extra weight tensors.
     """
     if not isinstance(quant_config, ModelOptMxfp8Config):
         yield from weights
         return
 
-    pending: dict[str, dict[str, torch.Tensor]] = {}
+    pairs: dict[str, dict[str, tuple[int, ...]]] = {}
     for name, tensor in weights:
-        is_scale = name.endswith(".weight_scale")
-        is_fp8_weight = name.endswith(".weight") and tensor.dtype == torch.float8_e4m3fn
-        if not (is_scale or is_fp8_weight) or keeps_mxfp8(name):
+        if keeps_mxfp8(name):
             yield name, tensor
             continue
-        module = name.rsplit(".", 1)[0]
-        entry = pending.setdefault(module, {})
-        entry["scale" if is_scale else "weight"] = tensor
-        if len(entry) == 2:
-            del pending[module]
-            yield (
-                module + ".weight",
-                dequantize_mxfp8_weight(entry["weight"], entry["scale"]),
-            )
-    if pending:
+        is_scale = name.endswith(".weight_scale")
+        is_fp8_weight = name.endswith(".weight") and tensor.dtype == torch.float8_e4m3fn
+        if is_scale or is_fp8_weight:
+            module = name.rsplit(".", 1)[0]
+            entry = pairs.setdefault(module, {})
+            kind = "scale" if is_scale else "weight"
+            if kind in entry:
+                raise RuntimeError(f"Duplicate MXFP8 {kind} for {module}")
+            if tensor.ndim != 2:
+                raise ValueError(f"MXFP8 {module}.{kind} must be two-dimensional")
+            if is_scale and tensor.dtype not in (torch.uint8, torch.float8_e8m0fnu):
+                raise TypeError(f"MXFP8 {module} scales must be raw E8M0 bytes")
+            entry[kind] = tuple(tensor.shape)
+            if len(entry) == 2:
+                n, k = entry["weight"]
+                if k % MXFP8_BLOCK_SIZE or entry["scale"] != (n, k // MXFP8_BLOCK_SIZE):
+                    raise ValueError(
+                        f"MXFP8 {module} weight/scale shapes disagree on 1x32 blocks"
+                    )
+        yield name, tensor
+    missing = sorted(module for module, pair in pairs.items() if len(pair) != 2)
+    if missing:
         raise RuntimeError(
-            "MXFP8 modules missing their weight/weight_scale pair at the end "
-            f"of the checkpoint stream: {sorted(pending)}"
+            f"MXFP8 modules missing weight/weight_scale pairs: {missing}"
         )
