@@ -1,3 +1,23 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
 """The in-engine RL control app as an external gateway sees it: where it
 listens, what it advertises, and how it authenticates.
 
@@ -239,8 +259,42 @@ class TestRouteSemantics(unittest.TestCase):
 
     def test_flush_cache_accepts_get_and_post(self):
         _llm, client = self._client()
-        self.assertEqual(client.get("/flush_cache").status_code, 200)
-        self.assertEqual(client.post("/flush_cache").status_code, 200)
+        for method in ("GET", "POST"):
+            with self.subTest(method=method):
+                response = client.request(method, "/flush_cache")
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(
+                    response.json(), {"success": True, "message": "Cache flushed."}
+                )
+
+    def test_flush_cache_propagates_scheduler_refusal(self):
+        llm, client = self._client()
+        llm.succeed = False
+        for method in ("GET", "POST"):
+            with self.subTest(method=method):
+                response = client.request(method, "/flush_cache")
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(
+                    response.json(),
+                    {"success": False, "message": "Cache flush failed."},
+                )
+
+    def test_flush_cache_surfaces_backend_errors(self):
+        llm, client = self._client()
+        for method in ("GET", "POST"):
+            for error in (
+                RuntimeError("scheduler unavailable"),
+                TimeoutError("flush timeout"),
+            ):
+                with self.subTest(method=method, error=type(error).__name__):
+                    with mock.patch.object(
+                        llm, "flush_cache", side_effect=error
+                    ) as flush:
+                        response = client.request(method, "/flush_cache")
+                    self.assertEqual(response.status_code, 500)
+                    self.assertFalse(response.json()["success"])
+                    self.assertIn(str(error), response.json()["message"])
+                    flush.assert_awaited_once_with()
 
 
 class TestUnsupportedWeightUpdateSources(unittest.TestCase):

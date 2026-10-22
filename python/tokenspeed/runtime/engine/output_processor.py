@@ -92,6 +92,9 @@ class ReqState:
     # See runtime/engine/detokenizer.py::IncrementalDetokenizer.
     inline_detokenizer: IncrementalDetokenizer | None = None
 
+    # The waiter owns cleanup after an explicit scheduler abort is enqueued.
+    abort_requested: bool = False
+
 
 class OutputProcessor:
     """Translate scheduler output frames into per-request collector payloads.
@@ -118,6 +121,9 @@ class OutputProcessor:
                     f"Received output for rid={rid!r} but the state was deleted in "
                     "AsyncLLM.",
                 )
+                continue
+            if state.abort_requested:
+                # A late frame must not overwrite the local abort outcome.
                 continue
 
             # Whether out_dict's output_ids hold every id so far instead of

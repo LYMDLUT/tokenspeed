@@ -1,3 +1,23 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
 """Regression guard for ``AsyncLLM._wait_one_response`` cancellation.
 
 Locks the contract Phase G.1 established: when the task driving a
@@ -24,11 +44,17 @@ register_cuda_ci(est_time=20, suite="runtime-1gpu")
 
 import asyncio  # noqa: E402
 import types  # noqa: E402
-from typing import Any, Dict  # noqa: E402
+from typing import Any  # noqa: E402
+from unittest import mock  # noqa: E402
 
 from tokenspeed.runtime.engine.async_llm import AsyncLLM  # noqa: E402
 from tokenspeed.runtime.engine.collector import RequestOutputCollector  # noqa: E402
-from tokenspeed.runtime.engine.output_processor import ReqState  # noqa: E402
+from tokenspeed.runtime.engine.exceptions import EngineGenerateError  # noqa: E402
+from tokenspeed.runtime.engine.io_struct import BatchEmbeddingOut  # noqa: E402
+from tokenspeed.runtime.engine.output_processor import (  # noqa: E402
+    OutputProcessor,
+    ReqState,
+)
 
 
 class _FakeScheduler:
@@ -52,10 +78,14 @@ class _StubAsyncLLM(AsyncLLM):
     """
 
     def __init__(self) -> None:
-        self.rid_to_state: Dict[str, ReqState] = {}
+        self.rid_to_state: dict[str, ReqState] = {}
         self.log_requests = False
         self.enable_metrics = False
         self.tokenizer = None
+        self.dump_requests_folder = None
+        self.server_args = types.SimpleNamespace(
+            weight_version="test", speculative_algorithm=None
+        )
         self.model_config = types.SimpleNamespace(is_multimodal_gen=False)
         self.engine_core_client = types.SimpleNamespace(
             send_to_scheduler=_FakeScheduler()
@@ -123,7 +153,31 @@ class TestWaitOneResponseCancellation(unittest.IsolatedAsyncioTestCase):
             f"expected exactly one AbortReq on cancel, got {len(aborts)}",
         )
         # The AbortReq should carry the right rid.
-        self.assertEqual(getattr(aborts[0], "rid", None), obj.rid)
+        self.assertEqual(aborts[0].rid, obj.rid)
+
+    async def test_cancelled_waiter_cleans_up_when_abort_ipc_fails(self) -> None:
+        mgr = _StubAsyncLLM()
+        obj = _StubReqObj(rid="cancel-ipc-failure", stream=True)
+        mgr.rid_to_state[obj.rid] = _fresh_state(obj)
+        gen = mgr._wait_one_response(obj)
+        self.addAsyncCleanup(gen.aclose)
+
+        async def drain() -> None:
+            async for _ in gen:
+                pass
+
+        task = asyncio.create_task(drain())
+        await asyncio.sleep(0)
+        sender = mgr.engine_core_client.send_to_scheduler
+        with mock.patch.object(
+            sender, "send_pyobj", side_effect=RuntimeError("IPC failed")
+        ) as abort:
+            task.cancel()
+            with self.assertRaisesRegex(RuntimeError, "IPC failed"):
+                await task
+
+        abort.assert_called_once()
+        self.assertNotIn(obj.rid, mgr.rid_to_state)
 
     async def test_normal_finish_does_not_fire_abort(self) -> None:
         """When the generator exits on ``state.finished`` (scheduler's
@@ -171,6 +225,183 @@ class TestWaitOneResponseCancellation(unittest.IsolatedAsyncioTestCase):
             0,
             "normal finish should not schedule an AbortReq",
         )
+
+
+class TestExplicitAbort(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.mgr = _StubAsyncLLM()
+
+    def _request(self, *, stream: bool):
+        obj = _StubReqObj(rid="explicit-abort", stream=stream)
+        state = _fresh_state(obj)
+        self.mgr.rid_to_state[obj.rid] = state
+        gen = self.mgr._wait_one_response(obj)
+        self.addAsyncCleanup(gen.aclose)
+        return obj, state, gen
+
+    @staticmethod
+    async def _drain(gen) -> list:
+        return [chunk async for chunk in gen]
+
+    async def _cancel_task(self, task) -> None:
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, EngineGenerateError):
+            pass
+
+    def _drive(self, gen):
+        task = asyncio.create_task(self._drain(gen))
+        self.addAsyncCleanup(self._cancel_task, task)
+        return task
+
+    async def _assert_aborted(self, task, rid: str) -> None:
+        # wait() does not cancel the producer on timeout: a broken implementation
+        # must fail for the hanging task, not pass through test-side cancellation.
+        done, _ = await asyncio.wait({task}, timeout=1.0)
+        self.assertIn(task, done, "explicit abort left the frontend waiter pending")
+        with self.assertRaisesRegex(EngineGenerateError, "aborted"):
+            task.result()
+        self.assertNotIn(rid, self.mgr.rid_to_state)
+        self.assertEqual(
+            [req.rid for req in self.mgr.engine_core_client.send_to_scheduler.aborts],
+            [rid],
+        )
+
+    async def test_abort_wakes_waiting_streaming_request(self) -> None:
+        obj, _state, gen = self._request(stream=True)
+        task = self._drive(gen)
+        await asyncio.sleep(0)
+        self.mgr.abort_request(obj.rid)
+        await self._assert_aborted(task, obj.rid)
+
+    async def test_abort_wakes_waiting_nonstreaming_request(self) -> None:
+        obj, _state, gen = self._request(stream=False)
+        task = self._drive(gen)
+        await asyncio.sleep(0)
+        self.mgr.abort_request(obj.rid)
+        await self._assert_aborted(task, obj.rid)
+
+    async def test_abort_before_first_iterator_resume(self) -> None:
+        obj, _state, gen = self._request(stream=False)
+        self.mgr.abort_request(obj.rid)
+        await self._assert_aborted(self._drive(gen), obj.rid)
+
+    async def test_repeated_abort_and_unknown_id_are_idempotent(self) -> None:
+        obj, _state, gen = self._request(stream=True)
+        task = self._drive(gen)
+        await asyncio.sleep(0)
+        self.mgr.abort_request("unknown")
+        self.mgr.abort_request(obj.rid)
+        self.mgr.abort_request(obj.rid)
+        await self._assert_aborted(task, obj.rid)
+        self.mgr.abort_request(obj.rid)
+        self.assertEqual(len(self.mgr.engine_core_client.send_to_scheduler.aborts), 1)
+
+    async def test_abort_supersedes_pending_nonterminal_output(self) -> None:
+        obj, state, gen = self._request(stream=False)
+        task = self._drive(gen)
+        await asyncio.sleep(0)
+        state.collector.put(
+            {"text": "partial", "output_ids": [1], "meta_info": {"id": obj.rid}},
+            stream=False,
+            cumulative=False,
+        )
+        state.event.set()
+        self.mgr.abort_request(obj.rid)
+        await self._assert_aborted(task, obj.rid)
+
+    async def test_abort_between_streamed_chunks(self) -> None:
+        obj, state, gen = self._request(stream=True)
+        state.collector.put(
+            {"text": "partial", "output_ids": [1], "meta_info": {"id": obj.rid}},
+            stream=True,
+            cumulative=False,
+        )
+        state.event.set()
+        chunk = await asyncio.wait_for(anext(gen), timeout=1.0)
+        self.assertEqual(chunk["output_ids"], [1])
+        task = self._drive(gen)
+        await asyncio.sleep(0)
+        self.mgr.abort_request(obj.rid)
+        await self._assert_aborted(task, obj.rid)
+
+    async def test_natural_finish_already_received_wins(self) -> None:
+        obj, state, gen = self._request(stream=True)
+        task = self._drive(gen)
+        await asyncio.sleep(0)
+        out = {
+            "text": "done",
+            "meta_info": {"id": obj.rid, "finish_reason": {"type": "length"}},
+        }
+        state.finished = True
+        state.collector.put(out, stream=True, cumulative=False)
+        state.event.set()
+        self.mgr.abort_request(obj.rid)
+        self.assertEqual(await asyncio.wait_for(task, timeout=1.0), [out])
+        self.assertNotIn(obj.rid, self.mgr.rid_to_state)
+        self.assertEqual(self.mgr.engine_core_client.send_to_scheduler.aborts, [])
+
+    async def test_old_generator_cleanup_preserves_new_same_id_state(self) -> None:
+        obj, state, gen = self._request(stream=True)
+        state.finished = True
+        state.collector.put(
+            {"text": "done", "meta_info": {"id": obj.rid}},
+            stream=True,
+            cumulative=False,
+        )
+        state.event.set()
+        await asyncio.wait_for(anext(gen), timeout=1.0)
+        replacement = _fresh_state(obj)
+        self.mgr.rid_to_state[obj.rid] = replacement
+        await gen.aclose()
+        self.assertIs(self.mgr.rid_to_state[obj.rid], replacement)
+        self.assertEqual(self.mgr.engine_core_client.send_to_scheduler.aborts, [])
+        self.mgr.rid_to_state.clear()
+
+    async def test_disconnect_after_explicit_abort_sends_no_second_abort(self) -> None:
+        obj, _state, gen = self._request(stream=True)
+        task = self._drive(gen)
+        await asyncio.sleep(0)
+        self.mgr.abort_request(obj.rid)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertNotIn(obj.rid, self.mgr.rid_to_state)
+        self.assertEqual(len(self.mgr.engine_core_client.send_to_scheduler.aborts), 1)
+
+    async def test_ipc_failure_does_not_claim_successful_abort(self) -> None:
+        obj, state, gen = self._request(stream=True)
+        task = self._drive(gen)
+        await asyncio.sleep(0)
+        sender = self.mgr.engine_core_client.send_to_scheduler
+        with mock.patch.object(
+            sender, "send_pyobj", side_effect=RuntimeError("IPC failed")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "IPC failed"):
+                self.mgr.abort_request(obj.rid)
+        self.assertIs(self.mgr.rid_to_state[obj.rid], state)
+        self.assertFalse(state.event.is_set())
+        self.mgr.abort_request(obj.rid)
+        await self._assert_aborted(task, obj.rid)
+
+    async def test_late_output_does_not_revive_aborted_request(self) -> None:
+        obj, state, gen = self._request(stream=False)
+        task = self._drive(gen)
+        await asyncio.sleep(0)
+        self.mgr.abort_request(obj.rid)
+        OutputProcessor(self.mgr).handle_batch_output(
+            BatchEmbeddingOut(
+                rids=[obj.rid],
+                finished_reasons=[{"type": "length"}],
+                embeddings=[[1.0]],
+                prompt_tokens=[1],
+            )
+        )
+        self.assertFalse(state.collector.has_pending())
+        self.assertFalse(state.finished)
+        await self._assert_aborted(task, obj.rid)
 
 
 if __name__ == "__main__":

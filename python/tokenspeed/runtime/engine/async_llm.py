@@ -349,15 +349,19 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         ``LLM`` bridge, RL-trainer drivers, etc.) signal client disconnect
         via ``asyncio.CancelledError`` — not via a polled
         ``request.is_disconnected()`` check. If the task driving this
-        generator is cancelled mid-wait, the ``finally`` below drops the
-        rid from ``rid_to_state`` and fires an ``AbortReq`` at the
-        scheduler so no per-request state leaks.
+        generator is cancelled mid-wait, the ``finally`` below sends an
+        ``AbortReq`` and removes its own request state. An explicit abort
+        wakes the waiter through ``state.abort_requested`` and raises
+        ``EngineGenerateError`` without consuming pending output. Sending
+        an abort is not proof that the scheduler has finished cleanup.
         """
         state = self.rid_to_state[obj.rid]
 
         try:
             while True:
                 await state.event.wait()
+                if state.abort_requested:
+                    raise EngineGenerateError(f"Request {obj.rid} aborted.")
 
                 out = state.collector.take()
                 if out is None:
@@ -389,7 +393,8 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
                                     obj.text = ""
                             msg = f"Finish: obj={dataclass_to_string_truncated(obj, max_length, skip_names=skip_names)}, out={dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
                         logger.info(msg)
-                    del self.rid_to_state[obj.rid]
+                    if self.rid_to_state.get(obj.rid) is state:
+                        del self.rid_to_state[obj.rid]
 
                     # Check if this was an abort/error created by scheduler
                     if isinstance(out["meta_info"].get("finish_reason"), dict):
@@ -414,24 +419,16 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
                 # final chunk; external cancellation wakes us via
                 # ``asyncio.CancelledError`` from ``state.event.wait()``.
         finally:
-            # Idempotent cleanup split on ``state.finished``:
-            #
-            # * Normal-finish path: the yield loop above already did
-            #   ``del self.rid_to_state[obj.rid]`` at ``state.finished``.
-            #   We defensively ``pop`` with a default so a second exit
-            #   through ``finally`` (e.g. when the yield itself raised
-            #   after the del) is a no-op.
-            #
-            # * Abandoned path (CancelledError / unexpected exception):
-            #   the rid is still in ``rid_to_state``. Call
-            #   ``abort_request`` which **both** removes it from the
-            #   state map **and** sends ``AbortReq`` to the scheduler.
-            #   Ordering matters: ``abort_request`` early-returns if
-            #   the rid is already gone, so we must not pop first.
-            if state.finished:
-                self.rid_to_state.pop(obj.rid, None)
-            else:
-                self.abort_request(obj.rid)
+            # A completed generator can be closed after its rid was reused.
+            # Only clean up the state this generator actually owns.
+            if self.rid_to_state.get(obj.rid) is state:
+                try:
+                    if not state.finished:
+                        self.abort_request(obj.rid)
+                finally:
+                    # The waiter is exiting even if the IPC send failed.
+                    if self.rid_to_state.get(obj.rid) is state:
+                        del self.rid_to_state[obj.rid]
 
     async def _handle_batch_request(
         self,
@@ -507,11 +504,18 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
                         pass
 
     def abort_request(self, rid: str):
-        if rid not in self.rid_to_state:
+        """Enqueue one scheduler abort and wake the frontend waiter.
+
+        Keep the state until the waiter exits, including when it has not
+        started iterating yet. An IPC failure leaves the state unchanged.
+        """
+        state = self.rid_to_state.get(rid)
+        if state is None or state.finished or state.abort_requested:
             return
-        del self.rid_to_state[rid]
         req = AbortReq(rid=rid)
         self.engine_core_client.send_to_scheduler.send_pyobj(req)
+        state.abort_requested = True
+        state.event.set()
 
     def block_generation_admission(self) -> None:
         """Stop requests before they acquire the model-update reader lock."""
