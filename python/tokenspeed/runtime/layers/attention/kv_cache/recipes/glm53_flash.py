@@ -236,7 +236,7 @@ def declare_glm53_flash_groups(
                     (
                         GLM53_FLASH_LOGICAL_BLOCK_TOKENS,
                         1,
-                        dsa.kv_lora_rank + dsa.qk_rope_head_dim,
+                        dsa.cache_storage_dim(config),
                     ),
                     scatter_stored_dtype_name(config.kv_cache_dtype),
                 ),
@@ -363,11 +363,20 @@ class Glm53FlashRecipe(CacheRecipe):
             for spec, _ in groups
             if spec.group_id.startswith(LINEAR_ATTENTION)
         ]
-        return glm53_flash_packing_counts(
+        packing = glm53_flash_packing_counts(
             tp_size=self._dsa_config.attn_tp_size,
             mla_element_size=self.attn_config.kv_cache_dtype.itemsize,
             state_group_ids=state_group_ids,
         )
+        if self.attn_config.kv_cache_quant_method == "flashmla":
+            # Preserve the latent plane's byte budget when its rows also
+            # carry group scales and an unquantized RoPE tail.
+            packing[FULL_ATTENTION] = (
+                packing[FULL_ATTENTION]
+                * self._dsa_config.kv_cache_dim
+                // self._dsa_config.cache_storage_dim(self.attn_config)
+            )
+        return packing
 
     @cached_property
     def replay_kda(self) -> bool:
