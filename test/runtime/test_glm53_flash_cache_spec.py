@@ -48,6 +48,7 @@ def _recipe(
     linear_tp_size: int | None = None,
     pd_disaggregation_enabled: bool = False,
     index_k_format: str = "fp8_scaled",
+    kv_cache_quant_method: str = "none",
 ) -> Glm53FlashRecipe:
     linear_tp_size = linear_tp_size or tp_size
     dsa = DSAConfig(
@@ -82,7 +83,7 @@ def _recipe(
         device="cpu",
         dtype=torch.bfloat16,
         kv_cache_dtype=mla_cache_dtype,
-        kv_cache_quant_method="none",
+        kv_cache_quant_method=kv_cache_quant_method,
         prefix_granularity=GLM53_FLASH_LOGICAL_BLOCK_TOKENS,
         context_len=4096,
         max_bs=16,
@@ -329,3 +330,23 @@ def test_lcm_parent_budget_preserves_heterogeneous_group_demand(
     recipe.token_limit = token_limit
 
     assert Glm53FlashRecipe.num_lcm_blocks(recipe, layout) == expected
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("draft_layers", [0, 1])
+def test_packed_fp8_rows_fit_the_hybrid_arena(tp_size, draft_layers):
+    recipe = _recipe(
+        tp_size=tp_size,
+        mla_cache_dtype=torch.float8_e4m3fn,
+        draft_layers=draft_layers,
+        kv_cache_quant_method="flashmla",
+    )
+    setup = recipe.setup()
+    plan = setup.spec.memory_plan
+    latent = [f for f in plan.fields if f.field_id.endswith(".latent_kv")]
+    assert len(latent) == len(_FULL_LAYER_IDS) + draft_layers
+    for field in latent:
+        assert field.shape == (64, 1, 656)
+        assert field.payload_bytes == 64 * 656
+        assert field.page_stride_bytes == field.payload_bytes
+    assert plan.arena_bytes + setup.fixed_workspace_bytes <= recipe.cache_budget_bytes
