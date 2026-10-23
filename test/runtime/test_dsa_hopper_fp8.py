@@ -43,12 +43,12 @@ def _generate(
     tmp_path,
     monkeypatch,
     *,
-    arch=9,
-    rope_dim=64,
-    rank=512,
-    dtype="bfloat16",
-    kv_dtype="fp8",
-    quant_method="none"
+    arch,
+    rope_dim,
+    rank,
+    dtype,
+    kv_dtype,
+    quant_method,
 ):
     # A local config exercises the real model parser without downloading weights.
     hf = GlmMoeDsaConfig(
@@ -119,7 +119,16 @@ def _pool(args, model, config, *, device):
 def test_hopper_fp8_arena_matches_row_size_and_returns_raw_bytes(
     tmp_path, monkeypatch, rope_dim
 ):
-    args, model, config = _generate(tmp_path, monkeypatch, rope_dim=rope_dim)
+    args, model, config = _generate(
+        tmp_path,
+        monkeypatch,
+        arch=9,
+        rope_dim=rope_dim,
+        rank=512,
+        dtype="bfloat16",
+        kv_dtype="fp8",
+        quant_method="none",
+    )
     assert config.kv_cache_quant_method == "flashmla"
     spec = config.component(dsa.DSAConfig)
     assert spec.cache_cell_size(config) == 656 + dsa.index_k_row_bytes(
@@ -142,30 +151,50 @@ def test_hopper_fp8_arena_matches_row_size_and_returns_raw_bytes(
 
 
 @pytest.mark.parametrize(
-    "override",
+    "rope_dim,rank,dtype,kv_dtype,quant_method",
     [
-        dict(rope_dim=128),
-        dict(rank=256),
-        dict(dtype="float16"),
-        dict(kv_dtype="fp8_e5m2"),
-        dict(quant_method="per_token_head"),
+        (128, 512, "bfloat16", "fp8", "none"),
+        (64, 256, "bfloat16", "fp8", "none"),
+        (64, 512, "float16", "fp8", "none"),
+        (64, 512, "bfloat16", "fp8_e5m2", "none"),
+        (64, 512, "bfloat16", "fp8", "per_token_head"),
     ],
 )
-def test_hopper_rejects_incompatible_formats(tmp_path, monkeypatch, override):
+def test_hopper_rejects_incompatible_formats(
+    tmp_path, monkeypatch, rope_dim, rank, dtype, kv_dtype, quant_method
+):
     message = (
         "Unsupported kv_cache_dtype"
-        if override.get("kv_dtype") == "fp8_e5m2"
+        if kv_dtype == "fp8_e5m2"
         else "Hopper DSA FP8 requires"
     )
     with pytest.raises(ValueError, match=message):
-        _generate(tmp_path, monkeypatch, **override)
+        _generate(
+            tmp_path,
+            monkeypatch,
+            arch=9,
+            rope_dim=rope_dim,
+            rank=rank,
+            dtype=dtype,
+            kv_dtype=kv_dtype,
+            quant_method=quant_method,
+        )
 
 
 @pytest.mark.parametrize("arch,kv_dtype", [(9, "bfloat16"), (10, "fp8")])
 def test_existing_cache_formats_keep_their_storage(
     tmp_path, monkeypatch, arch, kv_dtype
 ):
-    _, _, config = _generate(tmp_path, monkeypatch, arch=arch, kv_dtype=kv_dtype)
+    _, _, config = _generate(
+        tmp_path,
+        monkeypatch,
+        arch=arch,
+        rope_dim=64,
+        rank=512,
+        dtype="bfloat16",
+        kv_dtype=kv_dtype,
+        quant_method="none",
+    )
     spec = config.component(dsa.DSAConfig)
     assert config.kv_cache_quant_method == "none"
     assert spec.cache_storage_dim(config) == 576
@@ -182,7 +211,16 @@ def test_runtime_prefill_and_verify_read_the_prologue_packed_cache(
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
-    args, model, config = _generate(tmp_path, monkeypatch, rope_dim=rope_dim)
+    args, model, config = _generate(
+        tmp_path,
+        monkeypatch,
+        arch=9,
+        rope_dim=rope_dim,
+        rank=512,
+        dtype="bfloat16",
+        kv_dtype="fp8",
+        quant_method="none",
+    )
     config = replace(config, context_len=128, speculative_num_draft_tokens=2)
     spec = config.component(dsa.DSAConfig)
     monkeypatch.setitem(global_server_args_dict, "numerics", args.numerics)

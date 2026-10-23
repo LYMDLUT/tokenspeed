@@ -20,6 +20,7 @@
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.dsa import torch_dsa_sparse_attention
 from tokenspeed_kernel.ops.attention.dsa import dsa_decode, dsa_prefill
 from tokenspeed_kernel.ops.kvcache.flashmla import set_flashmla_kv_buffer
 from tokenspeed_kernel.platform import current_platform
@@ -51,14 +52,22 @@ def test_packed_attention_rejects_a_mismatched_page_size():
 
 
 @pytest.mark.parametrize("rope_dim", [0, 64])
-@pytest.mark.parametrize("topk", [512, 2051])
+@pytest.mark.parametrize("topk", [512, 2049, 2050, 2051])
 @pytest.mark.parametrize("phase,q_len", [("prefill", 1), ("decode", 1), ("decode", 3)])
 def test_packed_attention_matches_dequantized_reference(rope_dim, topk, phase, q_len):
     torch.manual_seed(123)
-    keys = torch.randn((128, 1, 512 + rope_dim), device="cuda", dtype=torch.bfloat16)
+    num_slots = max(128, (topk + 63) // 64 * 64)
+    keys = torch.randn(
+        (num_slots, 1, 512 + rope_dim), device="cuda", dtype=torch.bfloat16
+    )
     query = torch.randn((3, 8, 512 + rope_dim), device="cuda", dtype=torch.bfloat16)
-    cache = torch.zeros((128, 1, 656), device="cuda", dtype=torch.uint8)
-    locations = torch.arange(128, dtype=torch.int64, device="cuda")
+    if topk > 2048:
+        # Equal scores make each distinct tail value contribute to the output.
+        query[0].zero_()
+        for offset in range(topk - 2048):
+            keys[2048 + offset, :, :512] = 64 * 2**offset
+    cache = torch.zeros((num_slots, 1, 656), device="cuda", dtype=torch.uint8)
+    locations = torch.arange(num_slots, dtype=torch.int64, device="cuda")
     set_flashmla_kv_buffer(
         cache,
         locations,
@@ -68,14 +77,19 @@ def test_packed_attention_matches_dequantized_reference(rope_dim, topk, phase, q
         write_mask=None,
     )
     # Decode the public row format independently of the gather kernel.
-    values = cache[:, 0, :512].view(torch.float8_e4m3fn).float().reshape(128, 4, 128)
+    values = (
+        cache[:, 0, :512].view(torch.float8_e4m3fn).float().reshape(num_slots, 4, 128)
+    )
     scales = cache[:, 0, 512:528].view(torch.float32)
-    latent = (values * scales[..., None]).reshape(128, 512)
-    key = torch.cat((latent, keys[:, 0, 512:].float()), dim=-1)
+    # Hopper rounds scales to BF16, then dequantizes keys with BF16 multiplication.
+    latent = (values * scales.bfloat16()[..., None]).bfloat16().reshape(num_slots, 512)
     slots = torch.full((3, topk), -1, dtype=torch.int32, device="cuda")
     slots[0, :4] = torch.tensor([0, 63, 64, 127], device="cuda")
     slots[1, :2] = torch.tensor([15, 100], device="cuda")
     lengths = torch.tensor([4, 1, 0], dtype=torch.int32, device="cuda")
+    if topk > 2048:
+        slots[0] = torch.arange(topk, dtype=torch.int32, device="cuda")
+        lengths[0] = topk
     scale = (512 + rope_dim) ** -0.5
     args = dict(
         q=query,
@@ -83,7 +97,7 @@ def test_packed_attention_matches_dequantized_reference(rope_dim, topk, phase, q
         sparse_kv_cache=cache,
         topk_slots=slots,
         topk_lens=lengths,
-        max_seqlen_k=128,
+        max_seqlen_k=num_slots,
         qk_nope_head_dim=256 if rope_dim == 0 else 128,
         kv_lora_rank=512,
         qk_rope_head_dim=rope_dim,
@@ -97,15 +111,18 @@ def test_packed_attention_matches_dequantized_reference(rope_dim, topk, phase, q
     if phase == "decode":
         args["q_len_per_req"] = q_len
     actual, lse = attention(**args)
-    valid = (slots >= 0) & (torch.arange(topk, device="cuda") < lengths[:, None])
-    gathered = slots.clamp_min(0).long()
-    logits = torch.einsum("thd,tkd->thk", query.float(), key[gathered]) * scale
-    logits.masked_fill_(~valid[:, None], -float("inf"))
-    reference_lse = torch.logsumexp(logits, -1)
-    reference = torch.einsum(
-        "thk,tkd->thd", logits.softmax(-1).nan_to_num(), latent[gathered]
+    reference, reference_lse = torch_dsa_sparse_attention(
+        query,
+        latent,
+        keys[:, 0, 512:] if rope_dim else None,
+        slots,
+        lengths,
+        scale,
+        return_lse=True,
     )
-    torch.testing.assert_close(actual.float(), reference, atol=0.015, rtol=0.015)
+    torch.testing.assert_close(
+        actual.float(), reference.float(), atol=0.015, rtol=0.015
+    )
     torch.testing.assert_close(lse, reference_lse, atol=2e-3, rtol=2e-3)
     assert not actual[2].any() and torch.isneginf(lse[2]).all()
     graph = torch.cuda.CUDAGraph()
