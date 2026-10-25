@@ -44,6 +44,7 @@ pytestmark = pytest.mark.skipif(
 def _reference_rows(latent, rope):
     groups = latent.float().reshape(-1, 4, 128)
     scales = groups.abs().amax(dim=-1).clamp_min(1e-12) / 448.0
+    scales = torch.exp2(torch.ceil(torch.log2(scales)))
     values = (groups / scales[..., None]).clamp(-448, 448).to(torch.float8_e4m3fn)
     packed = torch.zeros(
         (latent.shape[0], 656), device=latent.device, dtype=torch.uint8
@@ -53,6 +54,35 @@ def _reference_rows(latent, rope):
     if rope.shape[-1]:
         packed[:, 528:] = rope.reshape(-1, 64).view(torch.uint8)
     return packed, (values.float() * scales[..., None]).reshape(-1, 1, 512)
+
+
+def test_packed_scales_round_up_to_powers_of_two_and_remain_fp32():
+    maxima = torch.tensor(
+        [[0, 1e-6, 224, 448], [450, 896, 900, 0.75]],
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    values = torch.zeros((2, 4, 128), dtype=torch.bfloat16, device="cuda")
+    values[:, :, 0] = maxima
+    values[:, :, 1] = -maxima
+    cache = torch.zeros((2, 1, 656), dtype=torch.uint8, device="cuda")
+    set_flashmla_kv_buffer(
+        cache,
+        torch.arange(2, dtype=torch.int64, device="cuda"),
+        values.reshape(2, 512),
+        values.new_empty((2, 0)),
+        sanitize=False,
+        write_mask=None,
+    )
+    scales = cache[:, 0, 512:528].view(torch.float32)
+    expected = torch.tensor(
+        [[2**-48, 2**-28, 0.5, 1], [2, 2, 4, 2**-9]],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    torch.testing.assert_close(scales, expected, atol=0, rtol=0)
+    torch.testing.assert_close(scales.bfloat16().float(), scales, atol=0, rtol=0)
+    assert not cache[:, 0, 528:].any()
 
 
 @pytest.mark.parametrize("rope_dim", [0, 64])

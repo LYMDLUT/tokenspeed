@@ -266,7 +266,10 @@ backend serves the layer. A per-token-head cache keeps the activation dtype.
 
 Hopper DSA uses the packed FlashMLA FP8 format: 512 E4M3 latent values,
 four FP32 scales (one per 128 values), and 64 BF16 RoPE values, totaling
-656 bytes per row. NoPE models write zero into the RoPE tail. Its query stays
+656 bytes per row. Each scale is the group's maximum absolute value, floored
+at `1e-12`, divided by 448 and rounded up to a power of two. The scale remains
+FP32 in the cache and is exactly representable when FlashMLA converts it to
+BF16. NoPE models write zero into the RoPE tail. Its query stays
 BF16. The composite MLA prologue rotates the inputs and stores these packed
 rows; the ordinary and GLM-5.3-Flash cache recipes account for the complete
 row. Sparse prefill reads the same packed cache through the FlashMLA sparse

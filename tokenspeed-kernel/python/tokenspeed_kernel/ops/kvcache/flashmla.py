@@ -89,6 +89,7 @@ def _set_flashmla_kv_buffer(
             values = tl.where(values == values, values, 0.0)
             values = tl.minimum(tl.maximum(values, -3.38953139e38), 3.38953139e38)
         scale = tl.maximum(tl.max(tl.abs(values), axis=1), 1e-12) / 448.0
+        scale = tl.exp2(tl.ceil(tl.log2(scale)))
         quantized = tl.minimum(tl.maximum(values / scale[:, None], -448.0), 448.0)
         base = (slot // PAGE_SIZE) * page_stride + (slot % PAGE_SIZE) * row_stride
         tl.store(cache + base + offsets, quantized.to(tl.float8e4nv))
