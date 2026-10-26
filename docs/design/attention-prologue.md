@@ -269,7 +269,10 @@ four FP32 scales (one per 128 values), and 64 BF16 RoPE values, totaling
 656 bytes per row. Each scale is the group's maximum absolute value, floored
 at `1e-12`, divided by 448 and rounded up to a power of two. The scale remains
 FP32 in the cache and is exactly representable when FlashMLA converts it to
-BF16. NoPE models write zero into the RoPE tail. Its query stays
+BF16. At the largest finite BF16 scale, `2**120`, the writer saturates the
+E4M3 values to ±240: the next value, ±256, would dequantize beyond BF16's
+finite range. Lower scales retain the full ±448 range and identical packed
+bytes. NoPE models write zero into the RoPE tail. Its query stays
 BF16. The composite MLA prologue rotates the inputs and stores these packed
 rows; the ordinary and GLM-5.3-Flash cache recipes account for the complete
 row. Sparse prefill reads the same packed cache through the FlashMLA sparse

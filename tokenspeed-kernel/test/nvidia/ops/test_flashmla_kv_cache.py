@@ -85,6 +85,44 @@ def test_packed_scales_round_up_to_powers_of_two_and_remain_fp32():
     assert not cache[:, 0, 528:].any()
 
 
+@pytest.mark.parametrize("sanitize", [False, True])
+def test_packed_extreme_bf16_values_dequantize_finitely(sanitize):
+    # Last full-range scale, just below overflow, the rounding tie, and BF16 max.
+    magnitudes = torch.tensor([224, 247, 248, 255], dtype=torch.float32, device="cuda")
+    groups = torch.stack((magnitudes, -magnitudes)) * 2.0**120
+    values = groups.bfloat16()[..., None].expand(2, 4, 128).reshape(2, 512)
+    cache = torch.zeros((2, 1, 656), dtype=torch.uint8, device="cuda")
+    slots = torch.arange(2, dtype=torch.int64, device="cuda")
+    set_flashmla_kv_buffer(
+        cache,
+        slots,
+        values,
+        values.new_empty((2, 0)),
+        sanitize=sanitize,
+        write_mask=None,
+    )
+    positive_codes = magnitudes.new_tensor([448, 240, 240, 240])
+    codes = torch.stack((positive_codes, -positive_codes))
+    scales = magnitudes.new_tensor(
+        [2.0**119, 2.0**120, 2.0**120, 2.0**120]
+    ).expand(2, 4)
+    torch.testing.assert_close(
+        cache[:, 0, :512].view(torch.float8_e4m3fn).float().reshape(2, 4, 128),
+        codes[..., None].expand(2, 4, 128),
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        cache[:, 0, 512:528].view(torch.float32), scales, atol=0, rtol=0
+    )
+    nope, _ = get_flashmla_kv_buffer(cache, slots, 0, torch.bfloat16)
+    expected = (
+        (codes * scales).bfloat16()[..., None].expand(2, 4, 128).reshape(2, 1, 512)
+    )
+    assert torch.isfinite(nope).all()
+    torch.testing.assert_close(nope, expected, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("rope_dim", [0, 64])
 @pytest.mark.parametrize("rows", [0, 1, 17, 129])
 @pytest.mark.parametrize("paged", [False, True])

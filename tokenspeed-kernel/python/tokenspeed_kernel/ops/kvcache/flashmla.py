@@ -90,7 +90,10 @@ def _set_flashmla_kv_buffer(
             values = tl.minimum(tl.maximum(values, -3.38953139e38), 3.38953139e38)
         scale = tl.maximum(tl.max(tl.abs(values), axis=1), 1e-12) / 448.0
         scale = tl.exp2(tl.ceil(tl.log2(scale)))
-        quantized = tl.minimum(tl.maximum(values / scale[:, None], -448.0), 448.0)
+        # At the largest BF16 scale, E4M3's 256 overflows on dequantization.
+        # Its preceding value, 240, is finite; all lower scales keep the full range.
+        limit = tl.where(scale < 2.0**120, 448.0, 240.0)[:, None]
+        quantized = tl.minimum(tl.maximum(values / scale[:, None], -limit), limit)
         base = (slot // PAGE_SIZE) * page_stride + (slot % PAGE_SIZE) * row_stride
         tl.store(cache + base + offsets, quantized.to(tl.float8e4nv))
         tl.store(scales + base // 4 + 128 + tl.arange(0, 4), scale)
