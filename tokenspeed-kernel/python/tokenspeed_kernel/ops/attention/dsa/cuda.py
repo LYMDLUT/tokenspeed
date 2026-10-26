@@ -65,8 +65,6 @@ if platform.is_hopper_plus:
         get_mla_metadata,
     )
 
-_query_workspace_cache: dict[tuple, torch.Tensor] = {}
-
 
 def _flashmla_sparse_prefill_head_multiple() -> int:
     return 128 if platform.is_nvidia and platform.is_blackwell_plus else 64
@@ -86,32 +84,15 @@ def _flashmla_sparse_decode_padded_heads(num_heads: int) -> int:
     return num_heads
 
 
-def _get_query_workspace(
-    *,
-    q: torch.Tensor,
-    shape: tuple[int, ...],
-    cache_prefix: str,
-) -> torch.Tensor:
-    key = (cache_prefix, q.device, q.dtype, shape)
-    workspace = _query_workspace_cache.get(key)
-    if workspace is None:
-        workspace = torch.empty(shape, dtype=q.dtype, device=q.device)
-        workspace.zero_()
-        _query_workspace_cache[key] = workspace
-    return workspace
-
-
 def _pad_prefill_query(q: torch.Tensor) -> tuple[torch.Tensor, int]:
     q = q.reshape(-1, q.shape[-2], q.shape[-1]).contiguous()
     actual_heads = q.shape[1]
     padded_heads = _flashmla_sparse_prefill_padded_heads(actual_heads)
     if padded_heads == actual_heads:
         return q, actual_heads
-    q_padded = _get_query_workspace(
-        q=q,
-        shape=(q.shape[0], padded_heads, q.shape[2]),
-        cache_prefix="prefill",
-    )
+    # Call-local storage lets the allocator track stream ordering and graph
+    # pool lifetime without retaining every prefill length in a global cache.
+    q_padded = q.new_empty((q.shape[0], padded_heads, q.shape[2]))
     q_padded[:, :actual_heads, :].copy_(q)
     q_padded[:, actual_heads:, :].zero_()
     return q_padded, actual_heads
@@ -130,10 +111,8 @@ def _pad_decode_query(q: torch.Tensor, q_len_per_req: int) -> tuple[torch.Tensor
     padded_heads = _flashmla_sparse_decode_padded_heads(actual_heads)
     if padded_heads == actual_heads:
         return q, actual_heads
-    shape = (q.shape[0], q.shape[1], padded_heads, q.shape[3])
-    # Fresh storage is owned by this call (and its graph capture), never
-    # retained for every prefill length or shared by independently replayed graphs.
-    q_padded = torch.empty(shape, dtype=q.dtype, device=q.device)
+    # Each capture owns its storage; eager calls cannot overwrite graph buffers.
+    q_padded = q.new_empty((q.shape[0], q.shape[1], padded_heads, q.shape[3]))
     q_padded[:, :, :actual_heads, :].copy_(q)
     q_padded[:, :, actual_heads:, :].zero_()
     return q_padded, actual_heads
