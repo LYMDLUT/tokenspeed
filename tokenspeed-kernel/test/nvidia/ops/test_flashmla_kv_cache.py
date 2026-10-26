@@ -43,7 +43,7 @@ pytestmark = pytest.mark.skipif(
 
 def _reference_rows(latent, rope):
     groups = latent.float().reshape(-1, 4, 128)
-    scales = groups.abs().amax(dim=-1).clamp_min(1e-12) / 448.0
+    scales = (groups.abs().amax(dim=-1) / 448.0).clamp_min(1e-4)
     scales = torch.exp2(torch.ceil(torch.log2(scales)))
     values = (groups / scales[..., None]).clamp(-448, 448).to(torch.float8_e4m3fn)
     packed = torch.zeros(
@@ -56,33 +56,50 @@ def _reference_rows(latent, rope):
     return packed, (values.float() * scales[..., None]).reshape(-1, 1, 512)
 
 
-def test_packed_scales_round_up_to_powers_of_two_and_remain_fp32():
+def test_packed_scales_apply_floor_and_round_up_to_powers_of_two():
     maxima = torch.tensor(
-        [[0, 1e-6, 224, 448], [450, 896, 900, 0.75]],
+        [
+            [0, 1e-6, 224, 448],
+            [450, 896, 900, 0.75],
+            [2**-24, 2**-23, 3 * 2**-24, 2**-22],
+            [0.02734375, 0.03125, 0.0546875, 0.054931640625],
+        ],
         dtype=torch.bfloat16,
         device="cuda",
     )
-    values = torch.zeros((2, 4, 128), dtype=torch.bfloat16, device="cuda")
+    values = torch.zeros((4, 4, 128), dtype=torch.bfloat16, device="cuda")
     values[:, :, 0] = maxima
     values[:, :, 1] = -maxima
-    cache = torch.zeros((2, 1, 656), dtype=torch.uint8, device="cuda")
+    cache = torch.zeros((4, 1, 656), dtype=torch.uint8, device="cuda")
+    slots = torch.arange(4, dtype=torch.int64, device="cuda")
     set_flashmla_kv_buffer(
         cache,
-        torch.arange(2, dtype=torch.int64, device="cuda"),
-        values.reshape(2, 512),
-        values.new_empty((2, 0)),
+        slots,
+        values.reshape(4, 512),
+        values.new_empty((4, 0)),
         sanitize=False,
         write_mask=None,
     )
     scales = cache[:, 0, 512:528].view(torch.float32)
     expected = torch.tensor(
-        [[2**-48, 2**-28, 0.5, 1], [2, 2, 4, 2**-9]],
+        [
+            [2**-13, 2**-13, 0.5, 1],
+            [2, 2, 4, 2**-9],
+            [2**-13] * 4,
+            [2**-13, 2**-13, 2**-13, 2**-12],
+        ],
         dtype=torch.float32,
         device="cuda",
     )
     torch.testing.assert_close(scales, expected, atol=0, rtol=0)
     torch.testing.assert_close(scales.bfloat16().float(), scales, atol=0, rtol=0)
     assert not cache[:, 0, 528:].any()
+    # The floor makes the smallest decoded value 2**-22; the half-way tie is zero.
+    decoded, _ = get_flashmla_kv_buffer(cache, slots, 0, torch.bfloat16)
+    decoded = decoded.reshape(4, 4, 128)
+    smallest = values.new_tensor([0, 0, 2**-22, 2**-22])
+    torch.testing.assert_close(decoded[2, :, 0], smallest, atol=0, rtol=0)
+    torch.testing.assert_close(decoded[2, :, 1], -smallest, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("sanitize", [False, True])

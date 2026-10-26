@@ -88,7 +88,7 @@ def _set_flashmla_kv_buffer(
         if SANITIZE:
             values = tl.where(values == values, values, 0.0)
             values = tl.minimum(tl.maximum(values, -3.38953139e38), 3.38953139e38)
-        scale = tl.maximum(tl.max(tl.abs(values), axis=1), 1e-12) / 448.0
+        scale = tl.maximum(tl.max(tl.abs(values), axis=1) / 448.0, 1e-4)
         scale = tl.exp2(tl.ceil(tl.log2(scale)))
         # At the largest BF16 scale, E4M3's 256 overflows on dequantization.
         # Its preceding value, 240, is finite; all lower scales keep the full range.
