@@ -21,6 +21,8 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
+from typing import Callable
 
 import torch
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
@@ -39,6 +41,23 @@ AttentionResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]
 
 # One UE8M0 scale per 32 consecutive head_dim elements (MXFP8).
 MXFP8_ATTENTION_BLOCK_SCALE = MXFP8_BLOCK_SCALE
+
+
+@dataclass(frozen=True)
+class DSAResources:
+    """Provider-owned communication window, buffer views and matching release."""
+
+    window: object
+    outputs: dict
+    tables: dict
+    release: Callable
+
+
+def prepare_dsa_resources(*, group, rank):
+    """Select and allocate DSA communication resources outside graph capture."""
+    return select_kernel("attention", "dsa_prepare_resources", format_signature())(
+        group=group, rank=rank
+    )
 
 
 def _attention_format_signature(**roles: torch.Tensor):
@@ -410,6 +429,21 @@ def _slot_order_kwargs(
 # ===-----------------------------------------------------------------------===#
 
 
+def _attention_sink_kwargs(
+    q: torch.Tensor, attn_sink: torch.Tensor | None, num_heads: int
+) -> dict:
+    """Validate the optional sink without changing legacy providers' keywords."""
+    if attn_sink is None:
+        return {}
+    if attn_sink.shape != (num_heads,):
+        raise ValueError(
+            f"DSA sink must have shape ({num_heads},), got {attn_sink.shape}"
+        )
+    if attn_sink.dtype != torch.float32 or attn_sink.device != q.device:
+        raise ValueError("DSA sink must be FP32 on the query device")
+    return {"attn_sink": attn_sink.contiguous()}
+
+
 def dsa_decode(
     q: torch.Tensor,
     kv_cache: torch.Tensor | None,
@@ -432,6 +466,7 @@ def dsa_decode(
     kv_seq_lens: torch.Tensor | None = None,
     *,
     slot_order: str,
+    attn_sink: torch.Tensor | None = None,
     kernel_plan: KernelPlan | None = None,
 ) -> AttentionResult:
     """Sparse DSA decode over selected global KV slots.
@@ -458,7 +493,11 @@ def dsa_decode(
             ``topk_lens``, which describes the selected sparse width.
         logit_cap: Optional logit cap.
         k_scale: KV scale multiplier for FP8 backends.
-        return_lse: Whether to return LSE in addition to output.
+        return_lse: Whether to return natural-log FP32 LSE, including the sink
+            when supplied, in addition to output.
+        attn_sink: Optional FP32 sink logits [heads] on the query device. The
+            sink adds probability mass with a zero value. Context partials must
+            omit it and apply it once when all context shards are combined.
         out: Optional output buffer.
         override: Optional exact kernel override name.
         solution: Optional kernel solution to force through normal selection.
@@ -484,6 +523,8 @@ def dsa_decode(
         q_len = int(q_len_per_req)
         batch_size = tokens // q_len
 
+    sink_kwargs = _attention_sink_kwargs(q, attn_sink, num_heads)
+    features = frozenset({"attention_sink"}) if sink_kwargs else None
     traits = {
         "q_len": int(q_len_per_req),
         "qk_nope_head_dim": int(qk_nope_head_dim),
@@ -492,6 +533,7 @@ def dsa_decode(
         "page_size": int(page_size),
         "topk": int(topk_slots.shape[-1]),
         "has_kv_cache": kv_cache is not None,
+        "has_attention_sink": attn_sink is not None,
         "has_sparse_kv_cache": sparse_kv_cache is not None,
         "logit_cap": logit_cap != 0.0,
         "return_lse": return_lse,
@@ -505,7 +547,7 @@ def dsa_decode(
             "dsa_decode",
             signature,
             traits=traits,
-            features=None,
+            features=features,
             solution=solution,
             override=override,
         )
@@ -516,6 +558,7 @@ def dsa_decode(
             "dsa_decode",
             signature,
             traits=traits,
+            features=features,
             solution=solution,
             override=override,
         )
@@ -558,6 +601,7 @@ def dsa_decode(
             out=out,
             enable_pdl=pdl_enabled(),
             **slot_order_kwargs,
+            **sink_kwargs,
         )
 
 
@@ -582,6 +626,7 @@ def dsa_prefill(
     kv_seq_lens: torch.Tensor | None = None,
     *,
     slot_order: str,
+    attn_sink: torch.Tensor | None = None,
     kernel_plan: KernelPlan | None = None,
 ) -> AttentionResult:
     """Sparse DSA prefill over selected global KV slots.
@@ -606,7 +651,11 @@ def dsa_prefill(
             ``topk_lens``, which describes the selected sparse width.
         logit_cap: Optional logit cap.
         k_scale: KV scale multiplier for FP8 backends.
-        return_lse: Whether to return LSE in addition to output.
+        return_lse: Whether to return natural-log FP32 LSE, including the sink
+            when supplied, in addition to output.
+        attn_sink: Optional FP32 sink logits [heads] on the query device. The
+            sink adds probability mass with a zero value. Context partials must
+            omit it and apply it once when all context shards are combined.
         out: Optional output buffer.
         override: Optional exact kernel override name.
         solution: Optional kernel solution to force through normal selection.
@@ -625,6 +674,8 @@ def dsa_prefill(
         q_len = 1
         batch_size = tokens
 
+    sink_kwargs = _attention_sink_kwargs(q, attn_sink, num_heads)
+    features = frozenset({"attention_sink"}) if sink_kwargs else None
     traits = {
         "q_len": 1,
         "qk_nope_head_dim": int(qk_nope_head_dim),
@@ -633,6 +684,7 @@ def dsa_prefill(
         "page_size": int(page_size),
         "topk": int(topk_slots.shape[-1]),
         "has_kv_cache": kv_cache is not None,
+        "has_attention_sink": attn_sink is not None,
         "has_sparse_kv_cache": sparse_kv_cache is not None,
         "logit_cap": logit_cap != 0.0,
         "return_lse": return_lse,
@@ -646,7 +698,7 @@ def dsa_prefill(
             "dsa_prefill",
             signature,
             traits=traits,
-            features=None,
+            features=features,
             solution=solution,
             override=override,
         )
@@ -657,6 +709,7 @@ def dsa_prefill(
             "dsa_prefill",
             signature,
             traits=traits,
+            features=features,
             solution=solution,
             override=override,
         )
@@ -699,6 +752,7 @@ def dsa_prefill(
             out=out,
             enable_pdl=pdl_enabled(),
             **slot_order_kwargs,
+            **sink_kwargs,
         )
 
 
@@ -1393,6 +1447,8 @@ __all__ = [
     "CANDIDATE_LENS_CPU_FEATURE",
     "INDEX_K_WORKSPACE_ROWS_FEATURE",
     "SLOT_ORDERS",
+    "DSAResources",
+    "prepare_dsa_resources",
     "dsa_decode",
     "dsa_interleave_rope",
     "dsa_prefill",

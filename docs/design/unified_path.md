@@ -78,6 +78,10 @@ FlashInfer receives host CSR metadata derived from those mirrors, with fresh
 pinned sources for asynchronous uploads. Planning does not download device
 lengths or indptrs; mixed batches apply the same rule to their extend rows.
 
+NPU graph task updates and replay run in inference mode because they write the
+output tensors allocated during capture. This applies to active and idle DP
+ranks; callers need not establish an inference context.
+
 ### Buffer sizing: the ladder is a performance subset, never a capacity limit
 
 `ForwardStepRunner` distinguishes `max_capture_bs` (top of the capture ladder,
@@ -118,7 +122,10 @@ fail before a context-parallel kernel is launched. The backend takes its CP
 degree and ranks from the host topology and passes that degree to every fused
 collective. The installed operators' Meta implementations validate topology
 and head layout before execution or graph capture; the framework carries no
-CP degree whitelist. The current native fusion remains specialized for DCP8.
+CP degree whitelist. DSA native fusion remains specialized for DCP8; prepared Ascend MLA also
+admits the H32 geometry on TP8/DCP8. Its head count, Q latent
+width and borrowed producer views follow the model, with the same projection,
+owner-store and FP32 LSE merge path.
 Bindings must supply Meta implementations for this startup check; a missing
 Meta kernel reports a binding upgrade, separately from unsupported topology.
 
@@ -821,6 +828,16 @@ rows and leaves the per-token rows as the round's refresh published them.
 Neither hook clears the layer-shared sparse selection: the depth loop is
 one forward's worth of top-k reuse.
 
+DSA mixed init and decode refresh publish those per-token rows and their plan
+through the same in-place helper, including the draft's first mixed step.
+The plan excludes leading extend requests, matching the decode indexer's
+query rows. Initial rows own their storage even at width one; they never
+alias caller-owned lengths. A mixed batch's sparse decode TopK workspace
+contains only its decode tokens, with an explicit batch-row offset used by
+attention slicing and MTP gathers. A long prefill therefore cannot grow the
+per-layer workspace retained by decode graphs. KPool keeps its existing
+whole-batch selection layout and records offset zero.
+
 Backends with sharded KV must refresh derived local visibility in the same
 draft length-update hook as the global lengths. While page allocation and
 request order stay unchanged, they reuse the compact tables and ownership
@@ -933,10 +950,6 @@ Pipeline parallelism is the one prefill configuration that forces eager:
 each stage threads its boundary state through an eager stage forward
 (`ModelExecutor._run_target_forward`), so `ServerArgs.resolve_disaggregation`
 sets `enforce_eager` for `--pipeline-parallel-size > 1`, not for the role.
-The DeepSeek-V4.1 Flash PD gate
-(`test/ci_system/serve_deepseek_v41_flash_pd_1p1d.sh`) runs the prefill
-role with its graphs and passes `--disable-prefill-graph` to the decode role
-only.
 
 ### Sampling has no greedy branch
 

@@ -294,6 +294,7 @@ def main() -> None:
         v_head_dim=128,
         scaling=0.1,
         logit_cap=0.0,
+        attn_sink=None,
     )
     pool = SimpleNamespace(quant_method=None, get_key_buffer=lambda _: local_latent)
     for end in (129, 132, 128):

@@ -36,7 +36,7 @@ import torch
 from tokenspeed_kernel.ops.attention import dsa as dsa_pkg
 from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, Priority
-from tokenspeed_kernel.selection import NoKernelFoundError
+from tokenspeed_kernel.selection import KernelPlan, NoKernelFoundError
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 HEAD_DIM = 128
@@ -638,7 +638,19 @@ def cores(fresh_registry, h100_platform):
     Platform.override(real_platform)
 
 
-def _run_core(mode: str, **extra):
+def _run_core(mode: str, *, planned: bool = False, **extra):
+    if planned:
+        extra["kernel_plan"] = KernelPlan.select(
+            "attention",
+            mode,
+            format_signature(q=dense_tensor_format(torch.bfloat16)),
+            features=frozenset(),
+            static_traits={},
+            variable_traits=frozenset(),
+            declared_traits=frozenset(),
+            solution=extra.get("solution"),
+            ignore_layout=False,
+        )
     facade = dsa_pkg.dsa_decode if mode == "dsa_decode" else dsa_pkg.dsa_prefill
     return facade(
         q=torch.zeros((2, 8, 576), dtype=torch.bfloat16),
@@ -656,29 +668,34 @@ def _run_core(mode: str, **extra):
     )
 
 
+@pytest.mark.parametrize("planned", [False, True])
 @pytest.mark.parametrize("mode", ["dsa_decode", "dsa_prefill"])
-def test_selection_order_is_served_by_a_silent_core_without_the_keyword(cores, mode):
+def test_selection_order_is_served_by_a_silent_core_without_the_keyword(
+    cores, mode, planned
+):
     silent, sorting = cores
-    _run_core(mode, slot_order="selection")
+    _run_core(mode, planned=planned, slot_order="selection")
     assert len(silent[mode]) == 1 and "slot_order" not in silent[mode][0]
     assert not sorting[mode]
 
 
+@pytest.mark.parametrize("planned", [False, True])
 @pytest.mark.parametrize("mode", ["dsa_decode", "dsa_prefill"])
-def test_sorted_order_reaches_a_declaring_core_as_the_keyword(cores, mode):
+def test_sorted_order_reaches_a_declaring_core_as_the_keyword(cores, mode, planned):
     silent, sorting = cores
-    _run_core(mode, slot_order="sorted", solution=f"sorting_{mode}")
+    _run_core(mode, planned=planned, slot_order="sorted", solution=f"sorting_{mode}")
     assert sorting[mode][0]["slot_order"] == "sorted"
-    _run_core(mode, slot_order="selection", solution=f"sorting_{mode}")
+    _run_core(mode, planned=planned, slot_order="selection", solution=f"sorting_{mode}")
     assert sorting[mode][1]["slot_order"] == "selection"
     assert not silent[mode]
 
 
+@pytest.mark.parametrize("planned", [False, True])
 @pytest.mark.parametrize("mode", ["dsa_decode", "dsa_prefill"])
-def test_sorted_order_refuses_a_silent_core(cores, mode):
+def test_sorted_order_refuses_a_silent_core(cores, mode, planned):
     silent, _ = cores
     with pytest.raises(ValueError, match="does not declare the slot_order"):
-        _run_core(mode, slot_order="sorted")
+        _run_core(mode, planned=planned, slot_order="sorted")
     assert not silent[mode]
 
 
@@ -705,3 +722,37 @@ def test_topk_passes_preallocated_buffers_and_forced_window_policy(topk_leaves, 
     call = bf16[mode][0]
     assert call["out"] is out and call["lens_out"] is lens
     assert call["initial_tokens"] == 1 and call["local_tokens"] == 2
+
+
+@pytest.mark.parametrize("mode", ["dsa_decode", "dsa_prefill"])
+@pytest.mark.parametrize("selection", ["normal", "override", "plan"])
+def test_sink_refuses_a_provider_without_the_feature(cores, mode, selection):
+    extra = {}
+    error = NoKernelFoundError
+    if selection == "override":
+        extra["override"] = f"silent_{mode}"
+    elif selection == "plan":
+        extra["planned"] = True
+        error = ValueError
+    with pytest.raises(error):
+        _run_core(
+            mode,
+            slot_order="selection",
+            attn_sink=torch.zeros(8, dtype=torch.float32),
+            **extra,
+        )
+
+
+@pytest.mark.parametrize("mode", ["dsa_decode", "dsa_prefill"])
+@pytest.mark.parametrize(
+    "sink,message",
+    [
+        (torch.zeros(7), "shape"),
+        (torch.zeros(1, 8), "shape"),
+        (torch.zeros(8, dtype=torch.bfloat16), "FP32"),
+        (torch.empty(8, device="meta"), "query device"),
+    ],
+)
+def test_sink_contract_is_checked_before_dispatch(mode, sink, message):
+    with pytest.raises(ValueError, match=message):
+        _run_core(mode, slot_order="selection", attn_sink=sink)

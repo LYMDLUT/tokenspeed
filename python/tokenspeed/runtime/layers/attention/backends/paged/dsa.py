@@ -89,8 +89,8 @@ def _k_row_context_lengths(seq_lens: torch.Tensor, k: int) -> torch.Tensor:
     see ``dsa_decode_topk``). Not a view for ``k > 1``: reshaping the
     expanded (stride-0) rows materializes a contiguous copy, so later edits
     of ``seq_lens`` do not reach it and keepers rewrite it in place
-    (``_publish_k_row_indexer_rows``). Only ``k == 1`` aliases ``seq_lens``;
-    callers that keep the rows call ``.contiguous()`` to cover that case."""
+    (``_publish_k_row_indexer_rows``). Only ``k == 1`` aliases ``seq_lens``,
+    and ``.contiguous()`` preserves that alias, so keepers clone the rows."""
     return seq_lens.unsqueeze(1).expand(-1, k).reshape(-1, 1)
 
 
@@ -552,37 +552,46 @@ class DSABackend(PagedAttentionBackend):
             num_extends=num_extends,
             for_graph_replay=for_graph_replay,
         )
-        metadata = self.forward_decode_metadata
-        if metadata._dsa_seq_lens_2d is None:
-            # First refresh at a lazily-built bs (no capture ran): allocate the
-            # per-token rows once on the dense leaf's per-bs view; later
-            # refreshes (and the drafter's re-anchor) rewrite them in place.
-            metadata._dsa_seq_lens_2d = _k_row_context_lengths(
-                seq_lens[:bs], self.spec_num_tokens
-            ).contiguous()
+        self._publish_k_row_indexer_rows(
+            self.forward_decode_metadata, seq_lens, bs, num_extends=num_extends
+        )
+
+    def _publish_k_row_indexer_rows(
+        self, metadata, seq_lens: torch.Tensor, bs: int, *, num_extends: int
+    ) -> None:
+        """Publish per-token lengths and their decode plan at stable addresses.
+
+        A mixed round reuses the dense leaf's per-bs metadata view, also held
+        by that bs's decode graph. Allocate once, then rewrite both the rows
+        and plan in place so graph replay cannot read a stale plan against
+        live lengths. Clone even for k=1 to avoid aliasing caller lengths.
+
+        Both target mixed init and the draft's first refresh plan only the
+        decode requests past the leading extends. With no decode requests,
+        the plan is unused and covers all rows.
+        """
+        k = self.spec_num_tokens
+        plan_from_row = num_extends * k if num_extends < bs else 0
+        rows = metadata._dsa_seq_lens_2d
+        if rows is None:
+            with torch.inference_mode(False):
+                rows = _k_row_context_lengths(seq_lens[:bs], k).clone(
+                    memory_format=torch.contiguous_format
+                )
+            metadata._dsa_seq_lens_2d = rows
             metadata._dsa_plan = dsa_plan(
-                seq_lens_2d=metadata._dsa_seq_lens_2d,
+                seq_lens_2d=rows[plan_from_row:],
                 page_size=self.kernel_page_size,
             )
             return
-        self._publish_k_row_indexer_rows(metadata, seq_lens, bs)
-
-    def _publish_k_row_indexer_rows(
-        self, metadata, seq_lens: torch.Tensor, bs: int
-    ) -> None:
-        """Rewrite the per-token indexer rows to ``seq_lens[:bs]`` (``k`` rows
-        per request) and refresh their plan, both in place: fixed shapes and
-        storage, so a captured graph replays the edit."""
-        k = self.spec_num_tokens
-        rows = metadata._dsa_seq_lens_2d
         if rows.shape[0] != bs * k:
             raise RuntimeError(
-                "DSA draft per-token rows do not match the decode batch: "
+                "DSA per-token rows do not match the batch: "
                 f"rows={rows.shape[0]}, requests={bs}, width={k}"
             )
         rows.copy_(_k_row_context_lengths(seq_lens[:bs], k))
         dsa_plan(
-            seq_lens_2d=rows,
+            seq_lens_2d=rows[plan_from_row:],
             page_size=self.kernel_page_size,
             out=metadata._dsa_plan,
         )
@@ -620,7 +629,7 @@ class DSABackend(PagedAttentionBackend):
             )
         bs = metadata.seq_lens_k.numel()
         metadata.seq_lens_k.copy_(frontier[:bs])
-        self._publish_k_row_indexer_rows(metadata, frontier, bs)
+        self._publish_k_row_indexer_rows(metadata, frontier, bs, num_extends=0)
 
     def init_forward_metadata(
         self,
@@ -687,24 +696,8 @@ class DSABackend(PagedAttentionBackend):
         # A draft's plan is rebuilt by the wrapper's refresh_decode_metadata
         # after this init (the unified draft contract).
         if forward_mode.is_mixed() and not self.is_draft:
-            metadata = self.forward_decode_metadata
-            # Per-token context lengths: the paged-MQA-logits kernel only supports
-            # next_n == 1, so each verify token is its own row (bs * spec_num_tokens
-            # rows).
-            metadata._dsa_seq_lens_2d = _k_row_context_lengths(
-                seq_lens, self.spec_num_tokens
-            ).contiguous()
-            if num_extends < bs:
-                # Decode rows only: skip the extend requests' per-token block.
-                seq_lens_2d = metadata._dsa_seq_lens_2d[
-                    num_extends * self.spec_num_tokens :
-                ]
-            else:
-                # The dsa_plan is unused, alias to full-batch seq_lens_2d to
-                # generate dsa_plan as a placeholder
-                seq_lens_2d = metadata._dsa_seq_lens_2d
-            metadata._dsa_plan = dsa_plan(
-                seq_lens_2d=seq_lens_2d, page_size=self.kernel_page_size
+            self._publish_k_row_indexer_rows(
+                self.forward_decode_metadata, seq_lens, bs, num_extends=num_extends
             )
 
         self._prefill_page_table = None
@@ -1158,6 +1151,7 @@ class DSABackend(PagedAttentionBackend):
             logit_cap=layer.logit_cap,
             k_scale=1.0,
             return_lse=use_dcp,
+            attn_sink=None if use_dcp else layer.attn_sink,
             solution=self.kernel_solution,
             kernel_plan=self.prefill_kernel_plan,
             slot_order=self.slot_order,
@@ -1169,7 +1163,7 @@ class DSABackend(PagedAttentionBackend):
                 local_lse,
                 group=self.kvp_group,
                 rank=self.kvp_rank,
-                sink=None,
+                sink=layer.attn_sink,
                 keep_all_heads=keep_all_heads,
             )
         # GLM's sparse-prefill path writes both the latent KV and index_k before
@@ -1239,6 +1233,7 @@ class DSABackend(PagedAttentionBackend):
                 logit_cap=layer.logit_cap,
                 k_scale=1.0,
                 return_lse=False,
+                attn_sink=layer.attn_sink,
                 solution=self.kernel_solution,
                 kernel_plan=self.prefill_kernel_plan,
                 slot_order=self.slot_order,
@@ -1383,6 +1378,7 @@ class DSABackend(PagedAttentionBackend):
             logit_cap=layer.logit_cap,
             k_scale=1.0,
             return_lse=use_dcp,
+            attn_sink=None if use_dcp else layer.attn_sink,
             solution=self.kernel_solution,
             kernel_plan=self.decode_kernel_plan,
             slot_order=self.slot_order,
@@ -1394,7 +1390,7 @@ class DSABackend(PagedAttentionBackend):
                 local_lse,
                 group=self.kvp_group,
                 rank=self.kvp_rank,
-                sink=None,
+                sink=layer.attn_sink,
                 keep_all_heads=keep_all_heads,
             ).to(
                 torch.bfloat16 if q_view.dtype == torch.float8_e4m3fn else q_view.dtype

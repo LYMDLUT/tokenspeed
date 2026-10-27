@@ -223,13 +223,23 @@ DeepGEMM index scoring registers for 16, 32, or 64 index heads. The
 caller-provided scoring scales and forced initial/local candidate policies
 remain unchanged. Kernel traits exclude other head counts.
 
-FlashMLA sparse prefill (regular BF16 KV) and sparse decode (packed FP8 KV)
-also support `return_lse=True`. Both return natural-log LSE `[tokens, heads]`
-and normalize empty rows to zero output / negative-infinite LSE for the shared
-DCP reduction. `topk_lens` masks excluded columns before dispatch, and supplied
-output buffers retain their identity. Decode transposes the vendor's
-`[batch, heads, query]` LSE to token-major order. This does not reinterpret
-regular BF16 KV as packed FP8 or change its Triton decode selection.
+FlashMLA sparse prefill and decode support regular BF16 KV and packed FP8 KV.
+Regular BF16 decode with a sink reuses the sparse prefill kernel with one
+selected slot row per query, including multi-token verify rows. Its registration
+requires `has_attention_sink=True`, preserving the existing provider selection
+for no-sink BF16 decode and context-sharded partials. Packed FP8 prefill retains the
+sparse decode route. Both return natural-log FP32 LSE `[tokens, heads]` and
+normalize empty rows to zero output / negative-infinite LSE for the shared
+DCP merge. Packed decode converts the native `[batch, heads, query]` LSE to
+token-major order.
+
+The optional `attn_sink` is an FP32 vector `[heads]` on the query device and
+requires the provider's `attention_sink` feature, also under a kernel override.
+FlashMLA applies this zero-value term before the output's final BF16 cast;
+the wrapper adds it to native KV-only LSE with `logaddexp` when LSE is requested.
+Empty rows then return zero output and LSE equal to the sink. Head padding uses
+negative-infinity sinks. Context partials must omit the sink; the runtime
+combiner adds it exactly once after gathering every context shard.
 
 ## Runtime backend selection
 
