@@ -56,6 +56,7 @@ from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfi
 from tokenspeed.runtime.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsConfig,
 )
+from tokenspeed.runtime.layers.quantization.modelopt_mxfp8 import ModelOptMxfp8Config
 from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
 from tokenspeed.runtime.layers.quantization.utils import (
     should_exclude_quant_module,
@@ -230,6 +231,18 @@ class MoELayer(torch.nn.Module):
         internal_activation_dtype = "input"
         if self._quant_kind == "fp8":
             fp8_scale_block_shape = tuple(self.quant_config.weight_block_size)
+            if isinstance(quant_config, ModelOptMxfp8Config):
+                internal_activation_dtype = (
+                    "fp8" if quant_config.activation_dtype == "fp8" else "input"
+                )
+                if self._internal_activation_dtype_override not in (
+                    None,
+                    internal_activation_dtype,
+                ):
+                    raise ValueError(
+                        "The ModelOpt MXFP8 activation selection conflicts with "
+                        f"{self.prefix!s}'s explicit activation dtype override"
+                    )
             # The loader slices each rank's block scales at ceil(ispp / block)
             # rows, which follow its weight rows only for a block-aligned
             # ispp, whatever kernel then runs the layer: pad for every backend.

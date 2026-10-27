@@ -93,6 +93,56 @@ the first generated token.
 
 ## Validation scope
 
+### Optional group32 W8A8 comparison
+
+Install the optional Humming dependency into the same environment as
+TokenSpeed:
+
+```bash
+python -m pip install -r tokenspeed-kernel/python/requirements/cuda-humming.txt
+```
+
+The dependency is pinned to an upstream source revision; it requires a CUDA
+compiler and is not installed by the default runtime requirements. For the
+W8A8 arm, replace the launch template's MoE backend and add:
+
+```bash
+--moe-backend humming --modelopt-mxfp8-activation-dtype fp8 --disable-pdl
+```
+
+Use `--modelopt-mxfp8-activation-dtype bf16 --moe-backend marlin --disable-pdl`
+for the matching baseline. Both arms disable PDL because the current Humming
+adapter does not support it. The ordinary `--dense-gemm-backend` setting
+controls 128x128 quantization and remains `auto`; this MXFP8 selection pins
+Marlin for W8A16 and the existing Triton group32 GEMM for W8A8.
+
+The optional path keeps the checkpoint's E4M3 weights and E8M0 scale bytes.
+Each activation group uses `ceil_pow2(max(amax, 1e-4) / 448)` and E4M3 codes.
+Dense GEMMs consume exponent bytes; Hopper Humming consumes the same scale
+values stored in FP32. Humming's implicit quantizer is bypassed. Both expert
+GEMMs accumulate in FP32, with Stream-K disabled, and retain the baseline's
+BF16 gate/up, activated-output and weighted-route boundaries. The shared
+expert remains unclamped; the routed experts clamp at 10.
+
+This path currently requires SM90, local MoE N/K dimensions divisible by 64,
+scale codes 1 through 254, fixed contiguous expert placement, rank-order
+communication and the existing gather/reduce EP path. DeepEP/all-to-all,
+EPLB, slot-order combine and batch-invariant numerics are rejected. No A16
+or weight requantization fallback is selected when these requirements fail.
+
+The [layer replay tool](../../tokenspeed-kernel/benchmarks/mxfp8-replay.md)
+compares the complete local chain, including routing and activation
+quantization, from captured checkpoint weights and activations. It records
+the selected kernels, scheduling policy, numerical references and memory.
+Hardware acceptance must also record profiler traces and inspect the
+generated Humming binary's FP8 WGMMA instructions; a backend name alone does
+not prove the arithmetic that executed. Report the earlier composite
+Marlin/GEMV/BF16 implementation separately if it is included as a comparator.
+W8A8 does not reduce the 8-bit weight payload relative to pure Marlin;
+activation buffers and scratch space determine the measured memory change.
+
+### Baseline and full-model checks
+
 `test/runtime/test_hy_v4.py` exercises configuration, real parameter loading,
 RoPE, sink binding and attention gating.
 `test/runtime/test_modelopt_mxfp8.py` covers the quantized loader.

@@ -1,0 +1,2 @@
+# Optional HY4 group32 W8A8 kernels; install explicitly when selecting Humming.
+humming-kernels @ git+https://github.com/vllm-project/humming.git@64ab616cc26e6d5e4000a8fc3022814d2abd90bb

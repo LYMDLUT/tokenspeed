@@ -479,6 +479,8 @@ class ServerArgs:
     # Opt-in: run MXFP4 routed experts with FP8 activations (FlashInfer cutlass
     # W4A8 on Hopper). Off keeps the checkpoint's BF16 activation contract.
     moe_mxfp4_fp8_activation: bool = False
+    # Explicit activation arithmetic for single-algorithm ModelOpt MXFP8.
+    modelopt_mxfp8_activation_dtype: Literal["bf16", "fp8"] = "bf16"
     all2all_backend: str = "none"
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     disable_flashinfer_cutlass_moe_fp4_allgather: bool = False
@@ -964,6 +966,35 @@ class ServerArgs:
             self.dense_gemm_backend,
             ("auto", "trtllm_cutedsl", "deepgemm"),
         )
+        _require_choice(
+            "--modelopt-mxfp8-activation-dtype",
+            self.modelopt_mxfp8_activation_dtype,
+            ("bf16", "fp8"),
+        )
+        if self.modelopt_mxfp8_activation_dtype == "fp8":
+            if self.moe_backend != "humming":
+                raise ValueError(
+                    "ModelOpt MXFP8 FP8 activations require --moe-backend humming"
+                )
+            if self.draft_moe_backend not in (None, "humming"):
+                raise ValueError(
+                    "ModelOpt MXFP8 FP8 activations require the same Humming "
+                    "backend for the draft model"
+                )
+            if not self.disable_pdl:
+                raise ValueError("Humming MXFP8 requires --disable-pdl")
+            if self.all2all_backend != "none":
+                raise ValueError("Humming MXFP8 does not support all-to-all dispatch")
+            if self.moe_combine_order != "rank":
+                raise ValueError("Humming MXFP8 requires --moe-combine-order rank")
+            if (
+                self.enable_eplb
+                or self.ep_num_redundant_experts
+                or self.init_expert_location not in (None, "trivial")
+            ):
+                raise ValueError(
+                    "Humming MXFP8 requires fixed contiguous expert placement"
+                )
         # The numerics switches (docs/design/numerics.md) are closed sets.
         for flag, value, choices in (
             ("--sampling-stream", self.sampling_stream, SAMPLING_STREAMS),
@@ -2950,6 +2981,16 @@ class ServerArgs:
             "every MXFP4 expert layer, target and draft; the MoE plan fails at "
             "startup where the selected backend has no FP8-activation kernel for "
             "the layer.",
+        )
+        parser.add_argument(
+            "--modelopt-mxfp8-activation-dtype",
+            choices=["bf16", "fp8"],
+            default=ServerArgs.modelopt_mxfp8_activation_dtype,
+            help="Activation arithmetic for single-algorithm ModelOpt MXFP8 "
+            "checkpoints. bf16 keeps Marlin W8A16. fp8 explicitly uses group32 "
+            "W8A8 dense GEMMs and Humming routed experts, preserving E4M3/E8M0 "
+            "weights. Requires --moe-backend humming --disable-pdl and fixed "
+            "contiguous experts; validate model accuracy and speed before use.",
         )
         parser.add_argument(
             "--draft-moe-backend",

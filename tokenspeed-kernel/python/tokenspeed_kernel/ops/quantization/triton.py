@@ -1416,7 +1416,10 @@ def _fp8_group32_ue8m0_quantize(X, Q, S, K: tl.constexpr, X0: tl.constexpr):
     inverse_scale = 1.0 / scale
     quantized = (values * inverse_scale).to(tl.float8e4nv)
     tl.store(Q + row * K + column, quantized)
-    tl.store(S + group, exponent.to(tl.uint8))
+    if S.dtype.element_ty == tl.float32:
+        tl.store(S + group, scale)
+    else:
+        tl.store(S + group, exponent.to(tl.uint8))
 
 
 @register_kernel(
@@ -1465,6 +1468,67 @@ def triton_quantize_fp8_group32_ue8m0(
     quantized = torch.empty(x.shape, dtype=torch.float8_e4m3fn, device=x.device)
     scales = torch.empty(
         (x.shape[0], x.shape[1] // 32), dtype=torch.uint8, device=x.device
+    )
+    if x.numel():
+        _fp8_group32_ue8m0_quantize[(x.numel() // 32,)](
+            x,
+            quantized,
+            scales,
+            K=x.shape[1],
+            X0=x.stride(0),
+            num_warps=1,
+            num_stages=1,
+        )
+    return quantized, scales
+
+
+@register_kernel(
+    "quantization",
+    "fp8_with_scale",
+    name="triton_quantize_fp8_group32_pow2_float32",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
+    signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
+    traits={
+        "granularity": frozenset({"token_group_32"}),
+        "scale_encoding": frozenset({"float32"}),
+    },
+    features={"power_of_two_scales"},
+    priority=Priority.PORTABLE - 1,
+)
+def triton_quantize_fp8_group32_pow2_float32(
+    x: torch.Tensor,
+    granularity: str,
+    group_size: int,
+    scale_encoding: str,
+    enable_pdl: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize to E4M3 with the group-32 UE8M0 rule and FP32 scale storage.
+
+    The codes and scale values match ``triton_quantize_fp8_group32_ue8m0``:
+    ``scale = ceil_pow2(max(amax, 1e-4) / 448)``. Only scale storage changes,
+    for kernels such as Hopper WGMMA that cannot consume exponent bytes.
+    Request the ``power_of_two_scales`` feature to distinguish this contract
+    from ordinary FP32 group scales. Returns E4M3 ``[M,K]`` and FP32
+    ``[M,K/32]``; K must be contiguous and divisible by 32.
+    """
+    if (
+        x.ndim != 2
+        or x.shape[1] % 32
+        or x.stride(1) != 1
+        or granularity != "token_group"
+        or group_size != 32
+        or scale_encoding != "float32"
+    ):
+        raise ValueError(
+            "FP8 power-of-two quantization requires [M,K] with contiguous K "
+            "divisible by 32 and FP32 scale storage"
+        )
+    if enable_pdl:
+        raise ValueError("The group-32 power-of-two quantizer does not support PDL")
+    quantized = torch.empty(x.shape, dtype=torch.float8_e4m3fn, device=x.device)
+    scales = torch.empty(
+        (x.shape[0], x.shape[1] // 32), dtype=torch.float32, device=x.device
     )
     if x.numel():
         _fp8_group32_ue8m0_quantize[(x.numel() // 32,)](

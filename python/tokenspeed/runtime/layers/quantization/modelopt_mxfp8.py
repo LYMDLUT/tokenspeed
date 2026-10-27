@@ -21,8 +21,9 @@
 """ModelOpt single-algorithm MXFP8 checkpoints (``quant_algo: MXFP8``).
 
 Every quantized linear keeps its E4M3 weight and E8M0 group-32 scales.
-Dense projections run the native Marlin W8A16 kernel. Modules excluded by the
-checkpoint stay unquantized; routed-expert dispatch is unchanged. Absorbed MLA
+Dense projections default to native Marlin W8A16. An explicit FP8 activation
+request reuses group32 W8A8 GEMMs. Modules excluded by the checkpoint stay
+unquantized. Absorbed MLA
 may explicitly materialize K/V projection weights for its tensor contractions,
 which is not a fallback for an ordinary dense GEMM.
 """
@@ -58,12 +59,20 @@ class ModelOptMxfp8Config(QuantizationConfig):
         exclude_modules: Checkpoint module globs left unquantized.
         kv_cache_quant_algo: Must be None; the format carries no KV-cache
             scales.
+        activation_dtype: Explicit ``bf16`` baseline or ``fp8`` W8A8 arithmetic.
     """
 
     def __init__(
-        self, exclude_modules: list[str], kv_cache_quant_algo: str | None
+        self,
+        exclude_modules: list[str],
+        kv_cache_quant_algo: str | None,
+        *,
+        activation_dtype: str,
     ) -> None:
         super().__init__(exclude_modules=exclude_modules)
+        if activation_dtype not in {"bf16", "fp8"}:
+            raise ValueError("ModelOpt MXFP8 activations must be bf16 or fp8")
+        self.activation_dtype = activation_dtype
         if kv_cache_quant_algo is not None:
             raise ValueError(
                 "ModelOpt MXFP8 checkpoints with KV-cache quantization "
@@ -94,6 +103,8 @@ class ModelOptMxfp8Config(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "ModelOptMxfp8Config":
+        from tokenspeed.runtime.utils.env import global_server_args_dict
+
         section = _quantization_section(config)
         quant_algo = section.get("quant_algo")
         if quant_algo != "MXFP8":
@@ -105,6 +116,7 @@ class ModelOptMxfp8Config(QuantizationConfig):
                 section.get("exclude_modules") or section.get("ignore") or []
             ),
             kv_cache_quant_algo=section.get("kv_cache_quant_algo"),
+            activation_dtype=global_server_args_dict["modelopt_mxfp8_activation_dtype"],
         )
 
     @classmethod
@@ -133,6 +145,7 @@ class ModelOptMxfp8Config(QuantizationConfig):
         if layer is not None and layer.interleave_linear_and_gate:
             raise ValueError("ModelOpt MXFP8 dense does not support fused interleaving")
         return ModelOptMxfp8LinearMethod(
+            activation_dtype=self.activation_dtype,
             use_atomic_add=False,
             use_fp32_reduce=True,
             override=None if layer is None else layer.override_kernel_name,
