@@ -26,8 +26,14 @@
 
 from __future__ import annotations
 
+import math
+from typing import TYPE_CHECKING
+
 import torch
 from tokenspeed_kernel._triton import tl, triton
+
+if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.attention.prologue.types import LatentNorm
 
 
 def _cache_layout(cache: torch.Tensor, loc: torch.Tensor) -> tuple[int, int, int]:
@@ -67,6 +73,8 @@ def _set_flashmla_kv_buffer(
     nope,
     rope,
     write_mask,
+    norm_weight,
+    norm_eps,
     nope_stride,
     rope_stride,
     row_stride,
@@ -76,6 +84,7 @@ def _set_flashmla_kv_buffer(
     ROPE_DIM: tl.constexpr,
     SANITIZE: tl.constexpr,
     MASKED: tl.constexpr,
+    HAS_NORM: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     slot = tl.load(loc + row).to(tl.int64)
@@ -83,8 +92,15 @@ def _set_flashmla_kv_buffer(
     if MASKED:
         valid = valid & tl.load(write_mask + row)
     if valid:
-        offsets = tl.arange(0, 512).reshape(4, 128)
-        values = tl.load(nope + row * nope_stride + offsets).to(tl.float32)
+        channels = tl.arange(0, 512)
+        values = tl.load(nope + row * nope_stride + channels).to(tl.float32)
+        if HAS_NORM:
+            # Keep the normalized latent in fp32 until the FP8 cache store.
+            variance = tl.sum(values * values, axis=0) / 512.0
+            weight = tl.load(norm_weight + channels).to(tl.float32)
+            values = (values * tl.rsqrt(variance + norm_eps)) * weight
+        offsets = channels.reshape(4, 128)
+        values = values.reshape(4, 128)
         if SANITIZE:
             values = tl.where(values == values, values, 0.0)
             values = tl.minimum(tl.maximum(values, -3.38953139e38), 3.38953139e38)
@@ -118,6 +134,7 @@ def set_flashmla_kv_buffer(
     *,
     sanitize: bool,
     write_mask: torch.Tensor | None,
+    norm: LatentNorm | None = None,
 ) -> None:
     """Scatter BF16 keys into packed FlashMLA rows.
 
@@ -129,6 +146,9 @@ def set_flashmla_kv_buffer(
         rope: BF16 RoPE rows of width 0 or 64, otherwise shaped like nope.
         sanitize: Replace NaN/Inf with finite values before quantizing.
         write_mask: Dense bool [rows] mask, or None to write all valid slots.
+        norm: Optional RMSNorm of the unnormalized latent, computed in fp32
+            in the same kernel as quantization and scatter. None means nope
+            is already normalized.
     """
     page_size, row_stride, page_stride = _cache_layout(cache, loc)
     if nope.shape[-1] != 512 or rope.shape[-1] not in (0, 64):
@@ -150,6 +170,17 @@ def set_flashmla_kv_buffer(
         or not write_mask.is_contiguous()
     ):
         raise ValueError("FlashMLA KV write mask must be dense bool [rows]")
+    if norm is not None and (
+        norm.weight.shape != (512,)
+        or not norm.weight.is_contiguous()
+        or norm.weight.dtype not in (torch.bfloat16, torch.float32)
+        or norm.weight.device != cache.device
+        or not math.isfinite(norm.eps)
+        or norm.eps < 0
+    ):
+        raise ValueError(
+            "FlashMLA RMSNorm requires 512 dense weights and finite nonnegative eps"
+        )
     if loc.numel() == 0:
         return
     nope = nope.reshape(loc.numel(), 512)
@@ -162,6 +193,8 @@ def set_flashmla_kv_buffer(
         nope,
         rope,
         write_mask,
+        None if norm is None else norm.weight,
+        0.0 if norm is None else norm.eps,
         nope.stride(0),
         rope.stride(0),
         row_stride,
@@ -171,6 +204,7 @@ def set_flashmla_kv_buffer(
         ROPE_DIM=rope.shape[-1],
         SANITIZE=sanitize,
         MASKED=write_mask is not None,
+        HAS_NORM=norm is not None,
         num_warps=4,
     )
 

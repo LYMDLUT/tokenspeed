@@ -35,6 +35,7 @@ from tokenspeed_kernel.ops.attention.dsa.triton import (
     local_topk_to_global_slots,
     workspace_topk_to_global_slots,
 )
+from tokenspeed_kernel.ops.attention.prologue import LatentNorm
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -54,6 +55,7 @@ from tokenspeed.runtime.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
 )
+from tokenspeed.runtime.layers.paged_attention import QueryShardGather
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.utils import block_dequant
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
@@ -339,6 +341,58 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
         self._decode_topk_indices_buffer: torch.Tensor | None = None
         self._decode_topk_lens_buffer: torch.Tensor | None = None
         self._retired_decode_workspaces: list[torch.Tensor] = []
+
+    def _fuses_latent_norm(self, ctx: ForwardContext) -> bool:
+        cache = ctx.token_to_kv_pool.get_key_buffer(self.attn_mqa.layer_id)
+        return (
+            isinstance(cache, torch.Tensor)
+            and cache.dtype == torch.uint8
+            and cache.shape[-1] == 656
+        )
+
+    def _norm_qkv(
+        self, q_a: torch.Tensor, latent_cache: torch.Tensor, ctx: ForwardContext
+    ) -> torch.Tensor:
+        q_norm = torch.empty_like(q_a)
+        if q_a.size(0) > 0:
+            if self._fuses_latent_norm(ctx):
+                # Leave KV raw for the prologue's fp32 norm + FP8 cache write.
+                self.q_a_layernorm(q_a, out=q_norm)
+            else:
+                self.fused_qk_layernorm(
+                    input_q_a=q_a,
+                    input_kv_a=latent_cache[..., : self.kv_lora_rank],
+                    output_q_a=q_norm,
+                )
+        return q_norm
+
+    def latent_prologue(
+        self,
+        Q: torch.Tensor,
+        q_pe: torch.Tensor,
+        latent_cache: torch.Tensor,
+        positions: torch.Tensor,
+        ctx: ForwardContext,
+        slots: torch.Tensor,
+        *,
+        key_rows: QueryShardGather | None,
+    ) -> torch.Tensor:
+        norm = (
+            LatentNorm(self.kv_a_layernorm.weight, self.kv_a_layernorm.variance_epsilon)
+            if self._fuses_latent_norm(ctx)
+            else None
+        )
+        return self.attn_mqa.latent_prologue(
+            Q,
+            q_pe,
+            latent_cache,
+            positions,
+            ctx,
+            slots=slots,
+            expanded=None,
+            key_rows=key_rows,
+            norm=norm,
+        ).query
 
     def _get_decode_topk_workspace(
         self,
@@ -874,10 +928,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
             dim=-1,
         )
-        kv_a = latent_cache[..., : self.kv_lora_rank]
-        q_norm = torch.empty_like(q_a)
-        if q_a.size(0) > 0:
-            self.fused_qk_layernorm(input_q_a=q_a, input_kv_a=kv_a, output_q_a=q_norm)
+        q_norm = self._norm_qkv(q_a, latent_cache, ctx)
 
         decode_metadata = getattr(ctx.attn_backend, "forward_decode_metadata", None)
         num_attn_tokens = int(q_norm.shape[0])

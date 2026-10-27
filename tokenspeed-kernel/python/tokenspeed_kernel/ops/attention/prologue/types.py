@@ -72,6 +72,19 @@ class HeadNorm:
 
 
 @dataclass(frozen=True)
+class LatentNorm:
+    """RMSNorm fused into a packed MLA cache write, before FP8 rounding.
+
+    Attributes:
+        weight: Dense latent-channel weights, applied in fp32.
+        eps: Epsilon added to the fp32 mean square.
+    """
+
+    weight: torch.Tensor
+    eps: float
+
+
+@dataclass(frozen=True)
 class MRope:
     """Multimodal RoPE: which position row drives each rotary pair.
 

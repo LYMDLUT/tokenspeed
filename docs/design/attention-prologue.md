@@ -4,8 +4,10 @@ Everything between a layer's projections and its core attention is one
 operation: optional per-head QK RMSNorm, RoPE (full, partial, or multimodal),
 quantization, and the KV cache write. Models describe which steps apply to a
 `PagedAttention` layer. They never apply its per-head norm, rotate, quantize, or
-write its new K/V rows themselves. An MLA model still normalizes its latent
-and projects its absorbed query before the prologue. DeepSeek-V4 and V4.1
+write its new K/V rows themselves. An MLA model normally normalizes its latent
+and projects its absorbed query before the prologue. GLM's packed FlashMLA
+path passes raw latent rows and `LatentNorm` instead: the cache writer fuses
+RMSNorm with quantization, keeping the norm result in fp32. DeepSeek-V4 and V4.1
 attention is not a `PagedAttention` layer and keeps its own fused steps over
 its own cache groups.
 
@@ -18,7 +20,7 @@ first:
 * `gqa_prologue(q, k, v, *, norm, rotary, cache, return_kv,
   solution, override)` for multi-head and grouped-query attention;
 * `mla_prologue(query, q_pe, latent_cache, *, expanded, rotary,
-  cache, solution, override)` for multi-head latent attention; `cache=None`
+  cache, solution, override, norm=None)` for multi-head latent attention; `cache=None`
   rotates without storing and returns the latent for `latent_store(latent,
   *, kv_lora_rank, cache)`, so a caller can gather rows between the two
   (query context parallelism);
@@ -280,6 +282,16 @@ row. Sparse prefill reads the same packed cache through the FlashMLA sparse
 decode kernel with one query per row. Decode and speculative verification
 use that kernel with their actual query count. Query context parallelism
 continues to require the BF16 cache.
+
+GLM supplies unnormalized BF16 latent projection rows and the existing
+latent RMSNorm weight and epsilon to this packed writer. It computes the
+512-channel RMSNorm in fp32 and quantizes that result directly, as vLLM's
+fused writer does, without an intermediate BF16 rounding. Sanitization, when
+requested, applies after the norm and before quantization. Query normalization
+still outputs BF16 with its existing weight and epsilon; other cache formats
+keep the previous dual Q/KV normalization. RoPE and sparse prefill/decode
+selection are unchanged. The optional `LatentNorm` is supported only for
+absorbed packed FlashMLA writes, not expanded attention or gathered latent rows.
 
 MXFP8 is a GQA format for 128-wide key and value heads. FP8 per-token-head is
 an MLA format.

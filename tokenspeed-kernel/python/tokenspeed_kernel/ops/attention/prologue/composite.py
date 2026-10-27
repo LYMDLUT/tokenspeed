@@ -33,6 +33,7 @@ from tokenspeed_kernel.ops.attention.prologue.types import (
     HeadNorm,
     KVCacheFormat,
     LatentKVCache,
+    LatentNorm,
     MLAExpandedKV,
     MLAPrologueOutput,
     MRope,
@@ -243,7 +244,11 @@ def _rotate_absorbed(
 
 
 def _write_latent(
-    cache: LatentKVCache, k_nope: torch.Tensor, k_rope: torch.Tensor, enable_pdl: bool
+    cache: LatentKVCache,
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    enable_pdl: bool,
+    norm: LatentNorm | None = None,
 ) -> None:
     if cache.slots.numel() == 0:
         return
@@ -255,6 +260,7 @@ def _write_latent(
             k_rope,
             sanitize=cache.sanitize,
             write_mask=cache.write_mask,
+            norm=norm,
         )
         return
     if cache.format is KVCacheFormat.FP8_PER_TOKEN_HEAD:
@@ -325,6 +331,7 @@ def composite_mla_prologue(
     rotary: Rotary | None,
     cache: LatentKVCache | None,
     enable_pdl: bool,
+    norm: LatentNorm | None = None,
 ) -> MLAPrologueOutput:
     num_heads, rope_dim = q_pe.shape[1:]
     q_nope_dim = query.shape[-1] - rope_dim
@@ -364,5 +371,5 @@ def composite_mla_prologue(
         if expanded is not None:
             key = torch.cat((expanded.k_nope, k_pe.expand(-1, num_heads, -1)), dim=-1)
             value = expanded.value
-    _write_latent(cache, k_nope[:rows], k_pe[:rows], enable_pdl)
+    _write_latent(cache, k_nope[:rows], k_pe[:rows], enable_pdl, norm)
     return MLAPrologueOutput(query=query, key=key, value=value)

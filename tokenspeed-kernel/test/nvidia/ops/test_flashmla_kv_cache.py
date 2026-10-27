@@ -22,11 +22,13 @@ import pytest
 import torch
 from tokenspeed_kernel.ops.attention.prologue import (
     LatentKVCache,
+    LatentNorm,
     MLAExpandedKV,
     RopeStyle,
     Rotary,
     mla_prologue,
 )
+from tokenspeed_kernel.ops.attention.prologue.checks import check_mla_request
 from tokenspeed_kernel.ops.kvcache.flashmla import (
     _get_flashmla_kv_buffer,
     _set_flashmla_kv_buffer,
@@ -45,7 +47,8 @@ def _reference_rows(latent, rope):
     groups = latent.float().reshape(-1, 4, 128)
     scales = (groups.abs().amax(dim=-1) / 448.0).clamp_min(1e-4)
     scales = torch.exp2(torch.ceil(torch.log2(scales)))
-    values = (groups / scales[..., None]).clamp(-448, 448).to(torch.float8_e4m3fn)
+    limit = torch.where(scales < 2.0**120, 448.0, 240.0)[..., None]
+    values = (groups / scales[..., None]).clamp(-limit, limit).to(torch.float8_e4m3fn)
     packed = torch.zeros(
         (latent.shape[0], 656), device=latent.device, dtype=torch.uint8
     )
@@ -54,6 +57,115 @@ def _reference_rows(latent, rope):
     if rope.shape[-1]:
         packed[:, 528:] = rope.reshape(-1, 64).view(torch.uint8)
     return packed, (values.float() * scales[..., None]).reshape(-1, 1, 512)
+
+
+def _normalized_latent(latent, norm):
+    values = latent.float()
+    return (
+        values
+        * torch.rsqrt(values.square().mean(-1, keepdim=True) + norm.eps)
+        * norm.weight.float()
+    )
+
+
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_latent_norm_rejects_other_formats_after_a_cached_layout_check(cache_dtype):
+    query = torch.zeros((1, 8, 512), dtype=torch.bfloat16, device="cuda")
+    latent = torch.zeros((1, 512), dtype=query.dtype, device="cuda")
+    target = LatentKVCache(
+        torch.zeros((8, 1, 512), dtype=cache_dtype, device="cuda"),
+        False,
+        torch.tensor([1], dtype=torch.int64, device="cuda"),
+        None,
+    )
+    check_mla_request(query, query[..., 512:], latent, None, None, target)
+    norm = LatentNorm(torch.ones(512, dtype=query.dtype, device="cuda"), 1e-6)
+    with pytest.raises(ValueError, match="absorbed FlashMLA"):
+        check_mla_request(query, query[..., 512:], latent, None, None, target, norm)
+
+
+@pytest.mark.parametrize("written_rows", [0, 2])
+def test_fused_norm_preserves_raw_latent_and_only_writes_selected_leading_rows(
+    written_rows,
+):
+    latent = torch.randn((5, 512), dtype=torch.bfloat16, device="cuda")
+    original = latent.clone()
+    query = torch.randn((5, 8, 512), dtype=torch.bfloat16, device="cuda")
+    cache = torch.full((8, 1, 656), 37, dtype=torch.uint8, device="cuda")
+    slots = torch.tensor([7, 1], dtype=torch.int64, device="cuda")[:written_rows]
+    mask = torch.tensor([True, False], device="cuda")[:written_rows]
+    norm = LatentNorm(torch.ones(512, dtype=query.dtype, device="cuda"), 1e-6)
+    expected = cache.clone()
+    encoded, _ = _reference_rows(_normalized_latent(latent, norm), latent[:, 512:])
+    expected[slots[mask], 0] = encoded[:written_rows][mask]
+    out = mla_prologue(
+        query,
+        query[..., 512:],
+        latent,
+        expanded=None,
+        rotary=None,
+        cache=LatentKVCache(cache, False, slots, mask),
+        solution=None,
+        override=None,
+        norm=norm,
+    )
+    torch.testing.assert_close(cache, expected, atol=0, rtol=0)
+    torch.testing.assert_close(latent, original, atol=0, rtol=0)
+    torch.testing.assert_close(out.query, query, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("boundary", ["fp8_rounding", "scale_rounding"])
+def test_fused_norm_quantizes_fp32_without_a_bf16_intermediate(boundary):
+    values = torch.ones((1, 512), dtype=torch.bfloat16, device="cuda")
+    weight = torch.full((512,), 1.1875, dtype=torch.bfloat16, device="cuda")
+    if boundary == "scale_rounding":
+        values[0, -1] = 0.99609375
+        weight.fill_(1)
+        weight[0] = 448
+    norm = LatentNorm(weight, 1e-6)
+    normalized = _normalized_latent(values, norm)
+    rope = values.new_empty((1, 0))
+    expected, _ = _reference_rows(normalized, rope)
+    rounded, _ = _reference_rows(normalized.bfloat16(), rope)
+    # These inputs distinguish direct FP32 quantization from the old two-step path.
+    assert not torch.equal(expected, rounded)
+    if boundary == "scale_rounding":
+        assert expected[:, 512:528].view(torch.float32)[0, 0] == 2
+        assert rounded[:, 512:528].view(torch.float32)[0, 0] == 1
+    cache = torch.zeros((1, 1, 656), dtype=torch.uint8, device="cuda")
+    before = values.clone()
+    set_flashmla_kv_buffer(
+        cache,
+        torch.zeros(1, dtype=torch.int64, device="cuda"),
+        values,
+        rope,
+        sanitize=False,
+        write_mask=None,
+        norm=norm,
+    )
+    torch.testing.assert_close(cache[:, 0], expected, atol=0, rtol=0)
+    torch.testing.assert_close(values, before, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("sanitize", [False, True])
+def test_fused_norm_preserves_scale_floor_and_finite_extreme_dequantization(sanitize):
+    values = torch.ones((3, 512), dtype=torch.bfloat16, device="cuda")
+    values[0].zero_()
+    values[1].fill_(1e-8)
+    weights = (torch.tensor([224, 247, 248, 255], device="cuda") * 2.0**120).bfloat16()
+    norm = LatentNorm(weights.repeat_interleave(128), 1e-6)
+    rope = values.new_empty((3, 0))
+    cache = torch.zeros((3, 1, 656), dtype=torch.uint8, device="cuda")
+    slots = torch.arange(3, dtype=torch.int64, device="cuda")
+    set_flashmla_kv_buffer(
+        cache, slots, values, rope, sanitize=sanitize, write_mask=None, norm=norm
+    )
+    expected, _ = _reference_rows(_normalized_latent(values, norm), rope)
+    torch.testing.assert_close(cache[:, 0], expected, atol=0, rtol=0)
+    assert (cache[0, 0, 512:528].view(torch.float32) == 2**-13).all()
+    decoded, _ = get_flashmla_kv_buffer(cache, slots, 0, torch.bfloat16)
+    assert torch.isfinite(decoded).all()
+    assert (cache[2, 0, 128:512].view(torch.float8_e4m3fn).float() == 240).all()
 
 
 def test_packed_scales_apply_floor_and_round_up_to_powers_of_two():
@@ -203,13 +315,19 @@ def test_invalid_slots_and_nonfinite_masked_rows_do_not_write(rope_dim):
 
 
 @pytest.mark.parametrize("rope_dim", [0, 64])
-def test_prologue_keeps_bf16_queries_and_replays_updated_rows(rope_dim):
+@pytest.mark.parametrize("fused_norm", [False, True])
+def test_prologue_keeps_bf16_queries_and_replays_updated_rows(rope_dim, fused_norm):
     cache = torch.zeros((128, 1, 656), dtype=torch.uint8, device="cuda")
     latent = torch.randn((3, 512 + rope_dim), dtype=torch.bfloat16, device="cuda")
     query = torch.randn((3, 8, 512 + rope_dim), dtype=torch.bfloat16, device="cuda")
     slots = torch.tensor([1, 4, 9], dtype=torch.int32, device="cuda")
     mask = torch.tensor([True, False, True], device="cuda")
     target = LatentKVCache(kv_cache=cache, slots=slots, write_mask=mask, sanitize=False)
+    norm = (
+        LatentNorm(torch.ones(512, dtype=torch.bfloat16, device="cuda"), 1e-6)
+        if fused_norm
+        else None
+    )
 
     def run():
         return mla_prologue(
@@ -221,6 +339,7 @@ def test_prologue_keeps_bf16_queries_and_replays_updated_rows(rope_dim):
             cache=target,
             solution=None,
             override=None,
+            norm=norm,
         )
 
     result = run()
@@ -230,24 +349,35 @@ def test_prologue_keeps_bf16_queries_and_replays_updated_rows(rope_dim):
     with torch.cuda.graph(graph):
         result = run()
     latent.mul_(2)
+    if norm is not None:
+        norm.weight.mul_(1.25)
     slots.copy_(torch.tensor([11, 8, 2], dtype=torch.int32, device="cuda"))
     mask.logical_not_()
     cache.zero_()
     graph.replay()
-    packed, _ = _reference_rows(latent[:, :512], latent[:, 512:])
+    normalized = (
+        latent[:, :512] if norm is None else _normalized_latent(latent[:, :512], norm)
+    )
+    packed, _ = _reference_rows(normalized, latent[:, 512:])
     expected = torch.zeros_like(cache)
     expected[slots[mask].long(), 0] = packed[mask]
     torch.testing.assert_close(cache, expected, rtol=0, atol=0)
     torch.testing.assert_close(result.query, query, rtol=0, atol=0)
 
 
-def test_packed_writer_sanitizes_and_does_not_specialize_on_batch_size():
+@pytest.mark.parametrize("fused_norm", [False, True])
+def test_packed_writer_sanitizes_and_does_not_specialize_on_batch_size(fused_norm):
     cache = torch.zeros((128, 1, 656), dtype=torch.uint8, device="cuda")
     values = torch.randn((32, 1, 576), dtype=torch.bfloat16, device="cuda")
     values[:, :, 0] = float("nan")
     values[:, :, 1] = float("inf")
     values[:, :, 512] = -float("inf")
     slots = torch.arange(1, 33, dtype=torch.int64, device="cuda")
+    norm = (
+        LatentNorm(torch.ones(512, dtype=torch.bfloat16, device="cuda"), 1e-6)
+        if fused_norm
+        else None
+    )
 
     def run(n):
         set_flashmla_kv_buffer(
@@ -257,6 +387,7 @@ def test_packed_writer_sanitizes_and_does_not_specialize_on_batch_size():
             values[:n, :, 512:],
             sanitize=True,
             write_mask=None,
+            norm=norm,
         )
         return get_flashmla_kv_buffer(cache, slots[:n], 64, torch.bfloat16)
 
@@ -270,8 +401,10 @@ def test_packed_writer_sanitizes_and_does_not_specialize_on_batch_size():
 
 
 @pytest.mark.parametrize("style", [RopeStyle.NEOX, RopeStyle.GPTJ])
-@pytest.mark.parametrize("expanded", [False, True])
-def test_packed_prologue_quantizes_the_rotated_native_rows(style, expanded):
+@pytest.mark.parametrize(
+    "expanded,fused_norm", [(False, False), (True, False), (False, True)]
+)
+def test_packed_prologue_quantizes_the_rotated_native_rows(style, expanded, fused_norm):
     torch.manual_seed(91)
     rows, heads, rope = 3, 8, 64
     q_nope = 128 if expanded else 512
@@ -297,6 +430,11 @@ def test_packed_prologue_quantizes_the_rotated_native_rows(style, expanded):
     )
     native = torch.zeros((64, 1, 576), dtype=torch.bfloat16, device="cuda")
     packed = torch.zeros((64, 1, 656), dtype=torch.uint8, device="cuda")
+    norm = (
+        LatentNorm(torch.ones(512, dtype=torch.bfloat16, device="cuda"), 1e-6)
+        if fused_norm
+        else None
+    )
 
     def run(cache):
         q = query.clone()
@@ -309,6 +447,7 @@ def test_packed_prologue_quantizes_the_rotated_native_rows(style, expanded):
             cache=LatentKVCache(cache, False, slots, None),
             solution="composite",
             override=None,
+            norm=norm if cache.dtype == torch.uint8 else None,
         )
 
     reference = run(native)
@@ -317,5 +456,10 @@ def test_packed_prologue_quantizes_the_rotated_native_rows(style, expanded):
     if expanded:
         torch.testing.assert_close(result.key, reference.key, rtol=0, atol=0)
         torch.testing.assert_close(result.value, reference.value, rtol=0, atol=0)
-    encoded, _ = _reference_rows(native[slots, :, :512], native[slots, :, 512:])
+    normalized = (
+        native[slots, :, :512]
+        if norm is None
+        else _normalized_latent(latent[:, :512], norm)
+    )
+    encoded, _ = _reference_rows(normalized, native[slots, :, 512:])
     torch.testing.assert_close(packed[slots, 0], encoded, rtol=0, atol=0)

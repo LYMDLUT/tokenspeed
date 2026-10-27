@@ -30,10 +30,15 @@ from transformers import GlmMoeDsaConfig
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.attention.configs import dsa
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import OrdinaryRecipe
+from tokenspeed.runtime.models.glm5 import GlmMoeDsaAttention
+from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
@@ -105,7 +110,7 @@ def _pool(args, model, config, *, device):
     pool = MLATokenToKVPool(
         arena,
         torch.bfloat16,
-        torch.float8_e4m3fn,
+        config.kv_cache_dtype,
         config.kv_cache_quant_method,
         512,
         spec.qk_rope_head_dim,
@@ -113,6 +118,69 @@ def _pool(args, model, config, *, device):
         0,
     )
     return setup, pool
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA RMSNorm required")
+@pytest.mark.parametrize("kv_dtype", ["bfloat16", "fp8"])
+@torch.inference_mode()
+def test_glm_only_defers_latent_norm_for_the_packed_cache(
+    tmp_path, monkeypatch, kv_dtype
+):
+    args, model, config = _generate(
+        tmp_path,
+        monkeypatch,
+        arch=9,
+        rope_dim=64,
+        rank=512,
+        dtype="bfloat16",
+        kv_dtype=kv_dtype,
+        quant_method="none",
+    )
+    _, pool = _pool(args, model, config, device="cuda")
+    monkeypatch.setitem(global_server_args_dict, "mapping", args.mapping)
+    monkeypatch.setitem(global_server_args_dict, "attention_backend", "dsa")
+    attention = GlmMoeDsaAttention(
+        config=model.hf_text_config,
+        mapping=args.mapping,
+        hidden_size=16,
+        num_heads=8,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        q_lora_rank=64,
+        kv_lora_rank=512,
+        layer_id=0,
+    ).to(device="cuda", dtype=torch.bfloat16)
+    attention.kv_a_layernorm.weight.fill_(1.1875)
+    q = torch.randn((3, 64), device="cuda", dtype=torch.bfloat16)
+    latent = torch.randn((3, 576), device="cuda", dtype=torch.bfloat16)
+    before = latent.clone()
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=pool,
+        bs=3,
+        num_extends=0,
+        input_num_tokens=3,
+        forward_mode=ForwardMode.DECODE,
+        output_layout=ForwardOutputLayout(0, 0, 3, 1),
+    )
+    normalized_q = attention._norm_qkv(q, latent, ctx)
+    q_float = q.float()
+    expected_q = q_float * torch.rsqrt(q_float.square().mean(-1, keepdim=True) + 1e-6)
+    torch.testing.assert_close(
+        normalized_q, expected_q.bfloat16(), atol=1e-2, rtol=1e-2
+    )
+    if kv_dtype == "fp8":
+        torch.testing.assert_close(latent, before, atol=0, rtol=0)
+    else:
+        kv = before[:, :512].float()
+        expected_kv = (
+            kv * torch.rsqrt(kv.square().mean(-1, keepdim=True) + 1e-6) * 1.1875
+        )
+        torch.testing.assert_close(
+            latent[:, :512], expected_kv.bfloat16(), atol=1e-2, rtol=1e-2
+        )
+        torch.testing.assert_close(latent[:, 512:], before[:, 512:], atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("rope_dim", [0, 64])
