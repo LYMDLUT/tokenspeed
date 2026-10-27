@@ -1101,6 +1101,13 @@ setup(
             "objs/**/*.so",
             # Vendored Lamport protocol and FFI headers for the optional JIT extension.
             "csrc/tvm_ffi_utils.h",
+            # Pinned dense Marlin MXFP8 optional-JIT source closure.
+            "csrc/marlin_mxfp8_dense/*.cu",
+            "csrc/marlin_mxfp8_dense/*.h",
+            "csrc/marlin_mxfp8_dense/*.cuh",
+            "csrc/marlin_mxfp8_dense/core/*.hpp",
+            "csrc/marlin_mxfp8_dense/LICENSE",
+            "csrc/marlin_mxfp8_dense/SOURCE.json",
             "csrc/include/**/*.h",
             "csrc/include/**/*.cuh",
         ],

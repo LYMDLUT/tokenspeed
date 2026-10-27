@@ -616,6 +616,18 @@ ts serve zai-org/GLM-5.3 \
   --gpu-memory-utilization 0.8 --disable-kvstore
 ```
 
+## HY4 Preview
+
+HY4 Preview's ModelOpt MXFP8 checkpoint uses E4M3 weights and E8M0 scales
+with groups of 32 input channels. The Hopper baseline uses Marlin W8A16
+for quantized dense and expert projections, and shared FlashMLA for its
+gated sparse attention with learnable sinks. It also supports the checkpoint's
+MTP block; keep MTP off for the initial backend comparison.
+
+See [HY4 Preview MXFP8 on Hopper](hyv4-mxfp8-marlin.md) for the required
+kernel capabilities, numerical boundaries, topology constraints and a
+four-node launch template.
+
 ## GLM 5.3 Flash
 
 GLM-5.3-Flash automatically configures its KDA/DSA backends and supports MTP from

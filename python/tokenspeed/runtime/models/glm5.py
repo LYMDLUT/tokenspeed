@@ -58,7 +58,7 @@ from tokenspeed.runtime.layers.linear import (
 from tokenspeed.runtime.layers.paged_attention import QueryShardGather
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.utils import block_dequant
-from tokenspeed.runtime.layers.rotary_embedding import get_rope
+from tokenspeed.runtime.layers.rotary_embedding import RotaryEmbedding, get_rope
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.base.decoder_layer import capture_layer_input
@@ -161,6 +161,8 @@ class GlmDsaIndexer(nn.Module):
         max_position_embeddings: int,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        fused_only: bool,
     ) -> None:
         super().__init__()
         self.index_topk = config.index_topk
@@ -186,20 +188,25 @@ class GlmDsaIndexer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("wq_b", prefix),
         )
-        self.wk = ReplicatedLinear(
-            hidden_size,
-            self.index_head_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("wk", prefix),
-        )
-        self.weights_proj = ReplicatedLinear(
-            hidden_size,
-            self.index_n_heads,
-            bias=False,
-            quant_config=None,
-            prefix=add_prefix("weights_proj", prefix),
-        )
+        # HY's wk is dequantized into this BF16 fused projection at load time;
+        # do not allocate or prepare an unused quantized standalone copy.
+        self.wk: ReplicatedLinear | None = None
+        self.weights_proj: ReplicatedLinear | None = None
+        if not fused_only:
+            self.wk = ReplicatedLinear(
+                hidden_size,
+                self.index_head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("wk", prefix),
+            )
+            self.weights_proj = ReplicatedLinear(
+                hidden_size,
+                self.index_n_heads,
+                bias=False,
+                quant_config=None,
+                prefix=add_prefix("weights_proj", prefix),
+            )
         self.wk_weights_proj = MergedColumnParallelLinear(
             hidden_size,
             [self.index_head_dim, self.index_n_heads],
@@ -211,13 +218,33 @@ class GlmDsaIndexer(nn.Module):
         self.k_norm = LayerNorm(self.index_head_dim, eps=1e-6)
 
         rope_scaling = _glm_dsa_rope_scaling(rope_scaling)
-        self.rotary_emb = get_rope(
-            self.rope_head_dim,
+        self.rotary_emb = self._make_rotary_embedding(
+            head_size=self.rope_head_dim,
             rotary_dim=self.rope_head_dim,
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
             is_neox_style=not getattr(config, "indexer_rope_interleave", False),
+        )
+
+    def _make_rotary_embedding(
+        self,
+        *,
+        head_size: int,
+        rotary_dim: int,
+        max_position: int,
+        base: float,
+        rope_scaling: dict[str, Any] | None,
+        is_neox_style: bool,
+    ) -> RotaryEmbedding:
+        """Build the indexer's model-specific RoPE coefficient table."""
+        return get_rope(
+            head_size,
+            rotary_dim=rotary_dim,
+            max_position=max_position,
+            base=base,
+            rope_scaling=rope_scaling,
+            is_neox_style=is_neox_style,
         )
 
     def set_wk_weights_proj_loaded(self, loaded: bool = True) -> None:
@@ -238,6 +265,10 @@ class GlmDsaIndexer(nn.Module):
                 dim=-1,
             )
         else:
+            if self.wk is None or self.weights_proj is None:
+                raise RuntimeError(
+                    "Fused indexer weights must be loaded before forward"
+                )
             index_k = self.wk(hidden_states)[0]
             weights = self.weights_proj(hidden_states)[0]
         index_k = self.k_norm(index_k)
@@ -330,6 +361,7 @@ class GlmMoeDsaAttention(DeepseekV3AttentionMLA):
             self.indexer = None
         else:
             self.indexer = GlmDsaIndexer(
+                fused_only=False,
                 config=config,
                 hidden_size=hidden_size,
                 q_lora_rank=q_lora_rank,
