@@ -49,7 +49,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cases", choices=("all", "indexer", "sink"), default="all")
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--run-id", help="Unique identifier shared by this run's ranks")
     args = parser.parse_args()
+    if args.output_dir is not None and not args.run_id:
+        parser.error(
+            "--output-dir requires --run-id and a fresh directory for this run"
+        )
     local_rank = int(os.environ["LOCAL_RANK"])
     local_world_size = int(os.environ["LOCAL_WORLD_SIZE"])
     torch.cuda.set_device(local_rank)
@@ -92,6 +97,7 @@ def main() -> None:
     # A rank writes success only after every rank reached the same boundary.
     dist.barrier()
     result = {
+        "run_id": args.run_id,
         "rank": rank,
         "local_rank": local_rank,
         "world_size": world_size,
@@ -102,9 +108,10 @@ def main() -> None:
     }
     if args.output_dir is not None:
         args.output_dir.mkdir(parents=True, exist_ok=True)
-        (args.output_dir / f"rank-{rank:03d}.json").write_text(
-            json.dumps(result, indent=2) + "\n"
-        )
+        # Refuse to overwrite evidence from another launch. The collector must
+        # check this run id, every expected rank, and every torchrun exit code.
+        with (args.output_dir / f"rank-{rank:03d}.json").open("x") as stream:
+            stream.write(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result), flush=True)
     dist.destroy_process_group()
 
@@ -448,11 +455,15 @@ def _run_sink_attention(group: tuple[int, ...], rank: int) -> list[str]:
     keys = torch.randn((pages * page_size, 1, 576), device="cuda", dtype=torch.bfloat16)
     query = torch.randn((tokens, heads, 576), device="cuda", dtype=torch.bfloat16)
     keys[..., :512].add_(2)
-    query.mul_(0.125)
+    query.mul_(0.5)
     # Match the ordinary row's KV mass so counting the sink once per rank
     # instead of once globally produces a large, detectable error even at TP2.
-    global_sink = torch.full(
-        (heads,), math.log(2 * degree), device="cuda", dtype=torch.float32
+    global_sink = torch.linspace(
+        math.log(4 * degree) - 1,
+        math.log(4 * degree) + 1,
+        heads,
+        device="cuda",
+        dtype=torch.float32,
     )
     global_sink[1::local_heads] = -torch.inf
     global_sink[2::local_heads] = torch.inf
@@ -509,7 +520,8 @@ def _run_sink_attention(group: tuple[int, ...], rank: int) -> list[str]:
             chosen = torch.tensor(
                 [
                     page * page_size + offset
-                    for page in range(1, active + 1)
+                    for cycle in range(2)
+                    for page in range(1 + cycle * degree, active + 1 + cycle * degree)
                     for offset in (0, 63)
                 ],
                 device="cuda",
