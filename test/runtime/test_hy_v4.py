@@ -392,6 +392,112 @@ def test_lm_head_keeps_fp32_logits_with_bf16_weight_storage(runtime_settings):
     assert not torch.equal(output, expected.bfloat16().float())
 
 
+@pytest.fixture(params=[True, False], ids=["reduced-allowed", "reduced-disabled"])
+def lm_head_precision(request):
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    previous_reduction = (
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
+    )
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = request.param
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = (
+            previous_reduction
+        )
+
+
+def _cuda_lm_head(hidden, vocab):
+    config = _config(hidden_size=hidden, vocab_size=vocab)
+    processor = LogitsProcessor(config, dp_lm_head_tp=False)
+    with torch.device("cuda"):
+        head = ParallelLMHead(
+            vocab,
+            hidden,
+            params_dtype=torch.bfloat16,
+            padding_size=1,
+            tp_rank=0,
+            tp_size=1,
+            tp_group=(0,),
+        )
+    return processor, head
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA LM head")
+@pytest.mark.parametrize("rows,vocab", [(1, 3776), (4, 3776), (32, 3776), (1, 120832)])
+def test_lm_head_gpu_fp32_output_matches_fp32_operand_reference(
+    rows, vocab, runtime_settings, lm_head_precision
+):
+    # 3776 is HY4's TP32 vocabulary shard. Only M=1 uses the full vocabulary.
+    processor, head = _cuda_lm_head(6144, vocab)
+    generator = torch.Generator(device="cuda").manual_seed(20261028)
+    with torch.no_grad():
+        head.weight.normal_(0, 0.03125, generator=generator)
+    hidden = torch.randn(
+        rows, 6144, dtype=torch.bfloat16, device="cuda", generator=generator
+    ).mul_(0.125)
+    reference = hidden.float() @ head.weight.float().T
+    actual = processor._get_logits(hidden, head, None, require_full_vocab=True)
+    assert actual.dtype == torch.float32
+    assert torch.isfinite(actual).all()
+    # Both paths accumulate in FP32, but their reduction orders may differ.
+    delta = (actual - reference).double()
+    relative_error = torch.linalg.vector_norm(delta) / torch.linalg.vector_norm(
+        reference.double()
+    )
+    assert relative_error.item() < 1e-5
+    assert delta.abs().max().item() < 5e-5
+    assert not torch.equal(actual, actual.bfloat16().float())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA LM head")
+@pytest.mark.parametrize("hidden_size", [6144, 32768])
+def test_lm_head_gpu_preserves_small_terms_across_large_cancellation(
+    hidden_size, runtime_settings, lm_head_precision
+):
+    processor, head = _cuda_lm_head(hidden_size, 17)
+    hidden = torch.ones(4, hidden_size, dtype=torch.bfloat16, device="cuda")
+    hidden[:, 0] = 65536
+    hidden[:, -1] = -65536
+    hidden.mul_(torch.tensor([1, 2, 0.5, -1], device="cuda")[:, None])
+    powers = torch.arange(17, device="cuda").remainder(7) - 3
+    with torch.no_grad():
+        head.weight.copy_(torch.exp2(powers.float())[:, None].expand_as(head.weight))
+    # All operands and all possible FP32 partial sums are exactly representable.
+    # A BF16 partial reduction can lose the small terms beside +/-65536.
+    reference = hidden.cpu().double() @ head.weight.cpu().double().T
+    actual = processor._get_logits(hidden, head, None, require_full_vocab=True)
+    torch.testing.assert_close(actual.cpu().double(), reference, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA LM head")
+def test_lm_head_fp32_cuda_graph_reads_changed_bf16_inputs(
+    runtime_settings, lm_head_precision
+):
+    processor, head = _cuda_lm_head(6144, 3776)
+    generator = torch.Generator(device="cuda").manual_seed(20261028)
+    with torch.no_grad():
+        head.weight.normal_(0, 0.03125, generator=generator)
+    hidden = torch.randn(
+        4, 6144, dtype=torch.bfloat16, device="cuda", generator=generator
+    ).mul_(0.125)
+    for _ in range(3):
+        processor._get_logits(hidden, head, None, require_full_vocab=True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = processor._get_logits(hidden, head, None, require_full_vocab=True)
+    graph.replay()
+    first = output.clone()
+    hidden.mul_(0.5)
+    graph.replay()
+    eager = processor._get_logits(hidden, head, None, require_full_vocab=True)
+    torch.testing.assert_close(output, eager, rtol=0, atol=0)
+    assert not torch.equal(first, output)
+    assert output.dtype == torch.float32
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="real linear gate requires CUDA"
 )

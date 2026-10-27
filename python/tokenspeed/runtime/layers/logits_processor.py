@@ -1183,6 +1183,8 @@ class LogitsProcessor(nn.Module):
                 if self._fp32_lm_head:
                     # The head's logits stay FP32. CUDA's BF16-input FP32-output
                     # GEMM avoids keeping a second full-vocabulary weight copy.
+                    # FP32 accumulation/output does not imply the reduction
+                    # order is bitwise identical to an FP32-input GEMM.
                     weight = lm_head.weight
                     if cast_hidden.is_cuda and weight.dtype in (
                         torch.bfloat16,
