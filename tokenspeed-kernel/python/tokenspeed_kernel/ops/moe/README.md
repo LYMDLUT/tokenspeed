@@ -431,3 +431,13 @@ E8M0 byte `0` represents `2**-127`, but Marlin's BF16 scale decoder flushes
 that encoding; preparation therefore rejects it along with NaN byte `255`
 before publishing any prepared weight. Supported scale bytes do not guarantee
 that an arbitrary weight/scale product remains finite.
+
+### Humming group32 MXFP8 on Hopper
+
+The optional W8A8 path uses a fixed native MMA tile with FP32 group reductions
+and no Stream-K. Upstream WGMMA heuristics can lose small terms for E4M3 inputs
+with varied exponents, which can change the following BF16 and FP8 rounding.
+The bridge therefore compiles the verified MMA tile at startup for all supported
+route counts. Checkpoint E4M3 weights and E8M0 group32 scales remain unchanged.
+The conservative tile is a correctness choice; speed relative to Marlin depends
+on model shapes and routing and requires measurement.

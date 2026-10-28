@@ -25,7 +25,7 @@ repacks E4M3 weights and E8M0 scales. Activations arrive already quantized, with
 power-of-two scales represented as FP32; Humming's default FP32-scale quantizer
 uses a different numerical rule and is intentionally not used here.
 
-The prepared plan compiles every tuning interval before serving. Stream-K is
+The prepared plan compiles a fixed Hopper MMA tile before serving. Stream-K is
 disabled so each output has one FP32 reduction followed by one BF16 store.
 Routing, the activation, and weighted reduction belong to the calling op.
 """
@@ -48,7 +48,6 @@ class _HummingImports:
     dtypes: ModuleType
     schema: ModuleType
     transform: ModuleType
-    tune: ModuleType
     kernel: ModuleType
     launcher: ModuleType
 
@@ -65,7 +64,6 @@ def _require_humming() -> _HummingImports:
                 dtypes=importlib.import_module("humming.dtypes"),
                 schema=importlib.import_module("humming.schema"),
                 transform=importlib.import_module("humming.transform"),
-                tune=importlib.import_module("humming.tune"),
                 kernel=importlib.import_module("humming.kernel.humming"),
                 launcher=importlib.import_module("humming.ops.launcher"),
             )
@@ -206,7 +204,7 @@ def prepare_humming_mxfp8_weights(
 
 
 def prepare_humming_indexed(state: HummingMXFP8WeightState) -> HummingIndexedPlan:
-    """Compile all route-count intervals for the explicit W8A8 indexed path.
+    """Compile the fixed MMA tile for the explicit W8A8 indexed path.
 
     The returned plan owns immutable configuration strings and a cached launch
     table. Preparing it may compile kernels; launching it never tunes or JITs.
@@ -219,10 +217,27 @@ def prepare_humming_indexed(state: HummingMXFP8WeightState) -> HummingIndexedPla
         "use_batch_invariant": False,
         "use_m_major_input_scale": False,
     }
-    candidates = api.tune.get_heuristics_config(
-        json.loads(state.layer_config), device=state.device, **compute
+    # The upstream Hopper WGMMA heuristic loses small terms with varied FP8
+    # exponents, including within one group32 dot product. Use the verified
+    # MMA tile and FP32 group promotion for every route count. K is not split
+    # across CTAs; the result rounds to BF16 only after the complete reduction.
+    upper = 1 << 30
+    tuning_config = json.dumps(
+        [
+            (
+                0,
+                upper,
+                {
+                    "mma_type": "mma",
+                    "block_shape": [32, 64, 64],
+                    "warp_shape": [16, 32, 64],
+                    "num_stages": 3,
+                    "use_stream_k": False,
+                },
+            )
+        ]
     )
-    tuning_config, intervals = _indexed_tuning(candidates)
+    intervals = ((0, upper, 32),)
     compute_config = json.dumps(compute)
     kernels = api.kernel.HummingKernel.prepare_kernels(
         state.layer_config, compute_config, tuning_config, state.device
@@ -234,30 +249,6 @@ def prepare_humming_indexed(state: HummingMXFP8WeightState) -> HummingIndexedPla
         intervals=intervals,
         kernels=kernels,
     )
-
-
-def _indexed_tuning(candidates: list) -> tuple[str, tuple[tuple[int, int, int], ...]]:
-    """Freeze alignment and disable cross-CTA reductions in every interval."""
-    tuning = []
-    intervals = []
-    previous_upper = 0
-    for lower, upper, candidate in candidates:
-        if lower != previous_upper or upper <= lower:
-            raise ValueError(
-                "Humming tuning intervals must cover consecutive route counts"
-            )
-        block_m = candidate["block_shape"][0]
-        if block_m <= 0:
-            raise ValueError("Humming tuning block M must be positive")
-        # Do not mutate upstream's cached heuristic dictionaries. Stream-K can
-        # use BF16 atomics and adds extra rounding before the final BF16 result.
-        candidate = dict(candidate, use_stream_k=False)
-        tuning.append((lower, upper, candidate))
-        intervals.append((lower, upper, block_m))
-        previous_upper = upper
-    if not intervals:
-        raise ValueError("Humming did not produce any indexed GEMM tuning intervals")
-    return json.dumps(tuning), tuple(intervals)
 
 
 def humming_indexed_gemm(

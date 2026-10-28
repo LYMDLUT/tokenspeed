@@ -237,6 +237,63 @@ def test_fixed_quantized_gemm_matches_fp32_without_activation_error(
     assert actual.data_ptr() == output.data_ptr()
 
 
+@pytest.mark.parametrize("stage", ["gate_up", "down"])
+@pytest.mark.parametrize("tokens", [19, 65])
+def test_fixed_fp8_exponents_preserve_small_terms(prepared, stage, tokens):
+    state = prepared.layer._moe_backend_state
+    plan = state.gate_up if stage == "gate_up" else state.down
+    prefix = "w13" if stage == "gate_up" else "w2"
+    top_k = TOP_K if stage == "gate_up" else 1
+    generator = torch.Generator().manual_seed(34)
+    values = (
+        torch.randn(tokens, plan.state.size_k, generator=generator) * 1.25
+    ).bfloat16()
+    values[0, :32] = 0
+    values[1, :32] = 1e-5
+    values[2, 0] = 64
+    groups = values.float().unflatten(-1, (-1, 32))
+    scales = torch.exp2(
+        torch.ceil(torch.log2(groups.abs().amax(-1).clamp_min(1e-4) / 448))
+    )
+    codes = (groups / scales[..., None]).to(torch.float8_e4m3fn).flatten(-2)
+    operands = (
+        codes.double().unflatten(-1, (-1, 32)) * scales.double()[..., None]
+    ).flatten(-2)
+    weights = dequantize_weight(
+        prepared.canonical[prefix + "_weight"],
+        prepared.canonical[prefix + "_weight_scale_inv"],
+    ).double()
+    ids = (torch.arange(tokens * top_k) % EXPERTS).reshape(tokens, top_k)
+    global_ids = (ids + EXPERT_START).to(torch.int32).cuda()
+    routes = align_humming_routes(
+        global_ids,
+        num_local_experts=EXPERTS,
+        expert_start=EXPERT_START,
+        block_size=plan.block_m(global_ids.numel()),
+    )
+    output = torch.empty(
+        (global_ids.numel(), plan.state.size_n), device="cuda", dtype=torch.bfloat16
+    )
+    actual = humming_indexed_gemm(
+        plan,
+        codes.cuda(),
+        scales.cuda(),
+        output,
+        *routes,
+        top_k=top_k,
+        valid_shape_m=global_ids.numel(),
+    )
+    expected = torch.stack(
+        [
+            operands[r // top_k] @ weights[e].T
+            for r, e in enumerate(ids.flatten().tolist())
+        ]
+    ).bfloat16()
+    # Dyadic E4M3 operands with bounded power-of-two weight scales make the
+    # FP64 reference exact here. Integer-only operands missed the WGMMA loss.
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("code", [0, 255])
 def test_unsupported_scale_codes_fail_before_upstream_preparation(code: int) -> None:
     _require_sm90()

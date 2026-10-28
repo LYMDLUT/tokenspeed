@@ -20,14 +20,11 @@
 
 """CPU contracts that do not require installing the optional Humming backend."""
 
-import json
-
 import pytest
 import torch
 from tokenspeed_kernel.thirdparty.humming import (
     HummingIndexedPlan,
     HummingMXFP8WeightState,
-    _indexed_tuning,
     _validate_mxfp8_weights,
     humming_indexed_gemm,
 )
@@ -110,32 +107,6 @@ def test_route_alignment_matches_interval_boundaries(
 def test_uncovered_route_capacity_is_rejected(routes: int) -> None:
     with pytest.raises(ValueError, match="No Humming tuning interval"):
         _plan().block_m(routes)
-
-
-def test_all_intervals_disable_stream_k_without_mutating_cached_candidates() -> None:
-    candidates = [
-        (0, 8, {"block_shape": (16, 128, 64), "use_stream_k": True}),
-        (8, 1024, {"block_shape": (64, 128, 64), "use_stream_k": True}),
-    ]
-    tuning, intervals = _indexed_tuning(candidates)
-    assert intervals == ((0, 8, 16), (8, 1024, 64))
-    assert all(not config["use_stream_k"] for _, _, config in json.loads(tuning))
-    assert all(config["use_stream_k"] for _, _, config in candidates)
-
-
-@pytest.mark.parametrize("lower", [7, 9])
-def test_overlapping_or_gapped_tuning_intervals_are_rejected(lower: int) -> None:
-    candidates = [
-        (0, 8, {"block_shape": (16, 128, 64)}),
-        (lower, 1024, {"block_shape": (64, 128, 64)}),
-    ]
-    with pytest.raises(ValueError, match="consecutive route counts"):
-        _indexed_tuning(candidates)
-
-
-def test_empty_tuning_table_is_rejected() -> None:
-    with pytest.raises(ValueError, match="did not produce any"):
-        _indexed_tuning([])
 
 
 def test_unquantized_inputs_are_rejected_without_automatic_quantization() -> None:
