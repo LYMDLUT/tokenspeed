@@ -504,10 +504,9 @@ class HYV4Attention(GlmMoeDsaAttention):
             [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
             dim=-1,
         )
-        kv_a = latent_cache[..., : self.kv_lora_rank]
-        q_norm = torch.empty_like(q_a)
-        if q_a.size(0) > 0:
-            self.fused_qk_layernorm(input_q_a=q_a, input_kv_a=kv_a, output_q_a=q_norm)
+        # The packed-cache prologue normalizes KV while writing it. Share
+        # its normalization boundary so the learned weight is applied once.
+        q_norm = self._norm_qkv(q_a, latent_cache, ctx)
 
         should_compute_indexer = not self.skip_indexer_topk
         if should_compute_indexer or self.linear_gate is not None:

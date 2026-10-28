@@ -2483,22 +2483,22 @@ def _ihc_boundary(
     single_pass = block_h <= 8192
     if not single_pass:
         block_h = _IHC_BLOCK_H
-    _ihc_gate_reduce_kernel[(num_tokens,)](
-        mix,
-        sqrsum,
-        hc_scale,
-        hc_base,
-        residual_flat,
+    reduce_launch = dict(
+        mix=mix,
+        sqrsum=sqrsum,
+        hc_scale=hc_scale,
+        hc_base=hc_base,
+        residual=residual_flat,
         # Unused when ``apply_norm`` is False; a real tensor keeps the launcher's
         # pointer argument well typed.
-        norm_weight if norm_weight is not None else hc_base,
-        post if post is not None else sqrsum,
-        layer_input,
-        float(magnitude),
-        num_tokens,
-        total_k,
-        hidden_size,
-        n_splits,
+        norm_weight=norm_weight if norm_weight is not None else hc_base,
+        post_out=post if post is not None else sqrsum,
+        layer_input=layer_input,
+        magnitude=float(magnitude),
+        num_tokens=num_tokens,
+        total_k=total_k,
+        hidden_size=hidden_size,
+        n_splits=n_splits,
         hc_mult=hc_mult,
         gate_count=gate_count,
         GATE_P2=gate_p2,
@@ -2513,6 +2513,35 @@ def _ihc_boundary(
         SINGLE_PASS=single_pass,
         num_warps=8 if single_pass else 4,
     )
+    from tokenspeed_kernel.ops.tuning import is_warming_up
+
+    if is_warming_up():
+        # Serving can choose a different split bucket even when the startup
+        # forward uses the largest token batch. Preserve its reduction tree
+        # and compile the finite choices without executing on live operands.
+        minimum_block_k = 32 if fp32_residual else _IHC_BLOCK_K
+        max_splits = _ihc_num_splits(device, total_k, 1, minimum_block_k)
+        max_bound = triton.next_power_of_2(max_splits)
+        split_bound = 1
+        while split_bound <= max_bound:
+            split_counts = (
+                (split_bound,)
+                if split_bound < 16
+                else (split_bound // 2 + 1, split_bound)
+            )
+            for warm_tokens in (1, 16, 17):
+                for warm_splits in split_counts:
+                    _ihc_gate_reduce_kernel.warmup(
+                        **{
+                            **reduce_launch,
+                            "num_tokens": warm_tokens,
+                            "n_splits": warm_splits,
+                            "SPLITS_P2": split_bound,
+                        },
+                        grid=(warm_tokens,),
+                    )
+            split_bound *= 2
+    _ihc_gate_reduce_kernel[(num_tokens,)](**reduce_launch)
     return layer_input, post, residual_flat
 
 

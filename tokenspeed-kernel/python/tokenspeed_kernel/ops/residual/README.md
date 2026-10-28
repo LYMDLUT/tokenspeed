@@ -45,3 +45,8 @@ Both implementations support empty token batches. Shape, dtype and device
 validation reads metadata only. Token counts and split extents are runtime
 kernel arguments; compile-time tiles and reduction bounds use bounded
 buckets. Consecutive sub-blocks compose `ihc_post` and `ihc_pre` explicitly.
+
+Startup warmup compiles the gate reduction's finite split buckets, including
+the runtime integer specialization classes used by smaller serving batches.
+It uses compile-only calls, so preparation neither writes extra outputs nor
+changes the split selection, reduction tree or precision boundaries.

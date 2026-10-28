@@ -466,6 +466,69 @@ def test_ihc_pre_at_hy4_projection_width(
         record_property(name, value)
 
 
+@requires_gpu
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_ihc_startup_prepares_split_buckets_for_serving_rows(dtype):
+    from tokenspeed_kernel.ops.residual.triton import _ihc_gate_reduce_kernel
+    from tokenspeed_kernel.ops.tuning import kernel_warmup
+
+    residual, fn, scale, base, norm = _inputs(512, 4, 6144, dtype, "cuda")
+    original = residual.clone()
+
+    def execute(rows):
+        pre = ihc_pre(
+            residual[:rows],
+            fn,
+            scale,
+            base,
+            MAGNITUDE,
+            RMS_EPS,
+            HC_EPS,
+            norm_weight=norm,
+            norm_eps=NORM_EPS,
+            solution="triton",
+        )
+        head = ihc_head(
+            residual[:rows],
+            fn[:4],
+            scale[:1],
+            base[:4],
+            RMS_EPS,
+            HC_EPS,
+            solution="triton",
+        )
+        return pre, head
+
+    ordinary = execute(512)
+    with kernel_warmup(enabled=True):
+        warmed = execute(512)
+    torch.testing.assert_close(residual, original, rtol=0, atol=0)
+    for expected, actual in zip(ordinary[0], warmed[0], strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(warmed[1], ordinary[1], rtol=0, atol=0)
+
+    results = []
+    with assert_no_triton_compile(_ihc_gate_reduce_kernel):
+        for rows in (1, 3, 16, 17, 32, 33, 64, 65, 128, 257, 511):
+            results.append((rows, execute(rows)))
+    for rows, (pre, head) in results:
+        _assert_pre_stages(
+            pre,
+            partial(ihc_pre, solution="triton"),
+            residual[:rows],
+            fn,
+            scale,
+            base,
+            norm,
+        )
+        torch.testing.assert_close(
+            head,
+            _reference_head(residual[:rows], fn[:4], scale[:1], base[:4]),
+            rtol=2**-7,
+            atol=2**-10,
+        )
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_torch_ihc_empty_rows(dtype: torch.dtype) -> None:
     residual, fn, scale, base, norm = _inputs(0, 4, 64, dtype, "cpu")
