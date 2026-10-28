@@ -50,6 +50,9 @@ The adapter preserves HY4's numerical boundaries around these GEMMs:
   the trailing RoPE slice in interleaved pairs; GLM's indexer layout differs.
 - iHC checkpoint parameters retain FP32 precision, and each boundary uses
   the configured normalization epsilon.
+- Latent KV normalization applies its learned weight once. BF16 caches use
+  the dual Q/KV norm before the prologue; packed FP8 caches leave KV raw for
+  the prologue's fused normalization and write.
 - The expert output and its routing weight round separately to BF16, their
   product rounds to BF16, and the top-k sum accumulates in FP32.
 

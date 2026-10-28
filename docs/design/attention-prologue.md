@@ -52,6 +52,12 @@ fp16.
 
 ## Accepted inputs
 
+Startup warmup compiles the fused MLA writer's finite token-tile choices and
+runtime integer specialization classes. Compilation does not execute extra
+rotations or cache writes: an in-place query is rotated exactly once. Prefix
+chunk gathers also compile when startup has an empty prefix, and metadata
+slice alignment does not create additional serving specializations.
+
 The entries validate each request once, from metadata only, and raise
 `ValueError` when it breaks one of these rules:
 
