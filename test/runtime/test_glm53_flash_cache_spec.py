@@ -195,14 +195,15 @@ def test_mtp_layout_reserves_a_separate_index_plane() -> None:
         mla_cache_dtype=torch.float8_e4m3fn,
         draft_layers=1,
     )
-    group_ids = tuple(split_recurrent_state_groups(_TARGET_LAYER_TYPES)) + (
-        FULL_ATTENTION,
+    recipe = _recipe(
+        tp_size=4,
+        mla_cache_dtype=torch.float8_e4m3fn,
+        kv_cache_quant_method="none",
+        draft_layers=1,
     )
 
     assert len(layout.plane_bytes) == 13
-    Glm53FlashRecipe.check_layout(
-        type("Recipe", (), {"group_ids": group_ids})(), layout
-    )
+    recipe.check_layout(layout)
 
 
 @pytest.mark.parametrize(
@@ -381,4 +382,11 @@ def test_packed_fp8_rows_fit_the_hybrid_arena(tp_size, draft_layers):
         assert field.shape == (64, 1, 656)
         assert field.payload_bytes == 64 * 656
         assert field.page_stride_bytes == field.payload_bytes
+    latent_planes = {field.plane_id for field in latent}
+    state_planes = {
+        field.plane_id
+        for field in plan.fields
+        if field.field_id.endswith((".conv_state", ".recurrent_state"))
+    }
+    assert latent_planes.isdisjoint(state_planes)
     assert plan.arena_bytes + setup.fixed_workspace_bytes <= recipe.cache_budget_bytes
