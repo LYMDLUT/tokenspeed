@@ -37,6 +37,12 @@ finite scale; byte `0` is also rejected because this Marlin conversion does
 not support that encoding. Every tensor-parallel input partition must be a
 multiple of 32.
 
+The target and MTP loaders declare that attention-TP peers consume the same
+filtered checkpoint stream. Ranks on each node divide background shard reads
+within that group instead of each prefetching the full checkpoint. Every rank
+still consumes its complete selected tensor stream and applies its usual
+parameter sharding.
+
 The adapter preserves HY4's numerical boundaries around these GEMMs:
 
 - The attention gate rounds the sigmoid to BF16 before multiplication.

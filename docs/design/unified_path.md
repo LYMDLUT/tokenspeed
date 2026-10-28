@@ -1596,6 +1596,11 @@ refuses it again at executor construction. The MTP shape is:
   DSpark's stage-subset filter group, still wins). With no producer configured
   the last stage's target forward captures `CaptureHiddenMode.FULL` for its
   drafter.
+  A declared checkpoint load group also promises the same filtered tensor
+  stream within that group. Safetensors prefetch divides shard reads among
+  its node-local participants; consumers still read their complete selected
+  stream without a prefetch collective. Filtered models with no declared
+  group retain independent reads because their shard lists may differ.
 * **Cache.** Nothing changes: `CacheLayerOwnership` already places the draft
   cache layers as the last stage's trailing producer step, the draft backend
   and pool exist only there, and the merged plan, bootstrap placement and

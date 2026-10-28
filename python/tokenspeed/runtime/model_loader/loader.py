@@ -383,10 +383,12 @@ class DefaultModelLoader(BaseModelLoader):
             source.model_or_path, source.revision, source.fall_back_to_pt
         )
         hf_weights_files.sort()
-        # Filtered models can consume different shard lists on different ranks.
-        # Keep their independent prefetch rather than assign reads to absent peers.
+        # An explicit load group consumes the same checkpoint stream. Filtered
+        # models without that contract may select different shards per rank.
         local_rank, local_world_size = 0, 1
-        if use_safetensors and weight_name_filter is None:
+        if use_safetensors and (
+            weight_name_filter is None or checkpoint_load_group is not None
+        ):
             node_start = mapping.node_rank * mapping.nprocs_per_node
             local_ranks = tuple(
                 rank

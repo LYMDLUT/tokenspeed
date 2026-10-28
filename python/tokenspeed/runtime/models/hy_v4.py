@@ -1218,6 +1218,11 @@ class HYV4ForCausalLM(GlmMoeDsaForCausalLM):
             "draft; use --speculative-algorithm MTP."
         )
 
+    @property
+    def checkpoint_load_group(self) -> tuple[int, ...]:
+        """TP peers consume the same filtered target or MTP checkpoint stream."""
+        return self.mapping.attn.tp_group
+
     def checkpoint_weight_name_filter(self, name: str) -> bool:
         """Skip the MTP block, which the NextN draft model loads."""
         return not name.startswith("model.mtp_layers.")
