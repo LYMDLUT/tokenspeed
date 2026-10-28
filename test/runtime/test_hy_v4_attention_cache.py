@@ -28,14 +28,15 @@ import pytest
 import torch
 from tokenspeed_kernel.platform import current_platform
 
-from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.configs.model_config import AttentionArch, ModelConfig
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
-from tokenspeed.runtime.layers.attention.backends.paged.dsa import DSABackend
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
+from tokenspeed.runtime.layers.attention.registry import create_paged_router
+from tokenspeed.runtime.layers.paged_attention import bind_cache_groups
 from tokenspeed.runtime.models.glm5 import GlmDsaDecodeTopK
 from tokenspeed.runtime.models.hy_v4 import HYV4Attention
 from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -81,7 +82,6 @@ def test_attention_forward_normalizes_latent_once(
         str(tmp_path), dtype="bfloat16", model_override_args="{}", server_args=args
     )
     attn_config = DSAConfig.generate(args, model)
-    spec = attn_config.component(DSAConfig)
     for key, value in (
         ("mapping", args.mapping),
         ("dsa_slot_order", "selection"),
@@ -89,20 +89,25 @@ def test_attention_forward_normalizes_latent_once(
         ("moe_combine_order", "auto"),
     ):
         monkeypatch.setitem(global_server_args_dict, key, value)
-    _, pool = _pool(args, model, attn_config, device="cuda")
-    backend = DSABackend(attn_config, spec, kernel_page_size=64)
+    setup, pool = _pool(args, model, attn_config, device="cuda")
+    backend = create_paged_router(attn_config, AttentionArch.DSA, backend_name="dsa")
+    backend.set_cache_pool(pool)
     backend.init_cuda_graph_state(3)
     positions = torch.zeros(3, dtype=torch.int64, device="cuda")
     pages = torch.tensor([[1], [2], [3]], dtype=torch.int32, device="cuda")
     backend.refresh_decode_metadata(
         3,
         3,
+        torch.arange(3, dtype=torch.int32, device="cuda"),
         torch.ones(3, dtype=torch.int32, device="cuda"),
-        pages,
-        num_extends=0,
-        for_graph_replay=False,
+        forward_mode=ForwardMode.DECODE,
+        block_tables={group_id: pages for group_id in pool.paged_group_ids},
     )
-    slots = pages[:, 0].long() * 64
+    group_id = pool.history_group_by_layer()[1]
+    group = next(
+        group for group in setup.spec.cache_group_specs if group.group_id == group_id
+    )
+    slots = pages[:, 0].long() * group.block_granularity
     selected = torch.full((3, 2048), -1, dtype=torch.int32, device="cuda")
     selected[:, 0] = slots
     backend.sparse_topk.decode = GlmDsaDecodeTopK(
@@ -121,6 +126,7 @@ def test_attention_forward_normalizes_latent_once(
     )
     with torch.device("cuda"):
         attention = HYV4Attention(config, args.mapping, layer_id=1, is_nextn=False)
+    bind_cache_groups(attention, pool)
     communication = CommManager(
         args.mapping,
         layer_id=1,
@@ -143,8 +149,8 @@ def test_attention_forward_normalizes_latent_once(
     attention.q_a_layernorm.weight.fill_(1)
     attention.kv_a_layernorm.weight.copy_(weight)
     attention.q_b_proj.weight.zero_()
-    attention.w_kc = torch.zeros((8, 512, 128), dtype=torch.bfloat16, device="cuda")
-    attention.w_vc = torch.zeros_like(attention.w_kc)
+    attention.w_kc = torch.zeros((8, 128, 512), dtype=torch.bfloat16, device="cuda")
+    attention.w_vc = torch.zeros((8, 512, 128), dtype=torch.bfloat16, device="cuda")
     diagonal = torch.arange(128, device="cuda")
     attention.w_vc[:, diagonal, diagonal] = 1
     attention.learnable_sink_param.fill_(-torch.inf)
