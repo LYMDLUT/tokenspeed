@@ -41,6 +41,8 @@ pytestmark = pytest.mark.skipif(
 def _backend(monkeypatch, *, width: int, draft: bool) -> DSABackend:
     monkeypatch.setitem(global_server_args_dict, "numerics", "auto")
     monkeypatch.setitem(global_server_args_dict, "dsa_slot_order", "selection")
+    monkeypatch.setitem(global_server_args_dict, "chunked_prefill_size", 2048)
+    monkeypatch.setitem(global_server_args_dict, "mla_chunk_multiplier", 1)
     spec = DSAConfig(
         backend_name="dsa",
         num_attention_heads=8,
