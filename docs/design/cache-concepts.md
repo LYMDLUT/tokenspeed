@@ -1167,6 +1167,14 @@ strides chosen by the common packer.
 Groups whose fields do not fit the attention planes, or whose exact strides
 require inconsistent packing ratios, retain separate planes.
 
+GLM-5.3-Flash uses dedicated planes for packed FlashMLA latent pages. Their
+656-byte rows do not divide the KDA slab alignment, so sharing those slabs
+would introduce padding that FlashMLA's implicit page addressing cannot read.
+Ordinary MLA retains its shared planes; pooled Index-K fields retain explicit
+strides. The common arena budget includes the separate packed planes.
+Each group's unused planes reduce capacity relative to an exact shared layout;
+this recipe accepts that space cost while retaining exact-stride validation.
+
 **No round-trip reconciliation.** The pipeline is arranged so that pairs which
 would otherwise need cross-checking cannot differ:
 

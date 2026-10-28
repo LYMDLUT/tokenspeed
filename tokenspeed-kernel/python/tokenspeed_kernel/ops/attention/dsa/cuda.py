@@ -213,8 +213,8 @@ def _pad_attention_sink(
     )
 
 
-def _pad_sparse_slots(slots: torch.Tensor) -> torch.Tensor:
-    padded_topk = (slots.shape[-1] + 63) // 64 * 64
+def _pad_sparse_slots(slots: torch.Tensor, *, alignment: int) -> torch.Tensor:
+    padded_topk = (slots.shape[-1] + alignment - 1) // alignment * alignment
     if padded_topk == slots.shape[-1]:
         return slots
     return torch.nn.functional.pad(slots, (0, padded_topk - slots.shape[-1]), value=-1)
@@ -303,7 +303,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         num_reqs = q_padded.shape[0]
         kv_paged = _paged_sparse_kv_cache(sparse_kv_cache, page_size)
         slots = _mask_sparse_slots(topk_slots, topk_lens).to(torch.int32)
-        slots = _pad_sparse_slots(slots)
+        slots = _pad_sparse_slots(slots, alignment=64)
         result, lse = flash_mla_with_kvcache(
             q=q_padded,
             k_cache=kv_paged,
@@ -478,7 +478,12 @@ if platform.is_nvidia and platform.is_hopper_plus:
             raise RuntimeError("FlashMLA sparse prefill does not support logit_cap")
         q_kernel, actual_heads = _pad_prefill_query(q)
         kv = _flatten_regular_kv_cache(kv_cache, page_size)
-        slots = _pad_sparse_slots(_mask_sparse_slots(topk_slots, topk_lens))
+        # SM90 sparse prefill consumes pairs of 64-slot tiles, unlike the
+        # packed decode kernel's single-tile alignment. Keep invalid tails
+        # masked while satisfying that native launch contract.
+        slots = _pad_sparse_slots(
+            _mask_sparse_slots(topk_slots, topk_lens), alignment=128
+        )
         result, _, lse = flash_mla_sparse_fwd(
             q=q_kernel,
             kv=kv,

@@ -132,7 +132,7 @@ def test_mixed_prefill_reuses_the_decode_topk_workspace(tmp_path, monkeypatch, w
     monkeypatch.setitem(global_server_args_dict, "mapping", args.mapping)
     monkeypatch.setitem(global_server_args_dict, "attention_backend", "dsa")
     monkeypatch.setitem(global_server_args_dict, "numerics", "auto")
-    monkeypatch.setitem(global_server_args_dict, "dsa_slot_order", "sorted")
+    monkeypatch.setitem(global_server_args_dict, "dsa_slot_order", "selection")
     attention = GlmMoeDsaAttention(
         config=model.hf_text_config,
         mapping=args.mapping,
@@ -203,6 +203,10 @@ def test_mixed_prefill_reuses_the_decode_topk_workspace(tmp_path, monkeypatch, w
     assert attention._retired_decode_workspaces == []
     assert (decode.row_offset, mixed.row_offset) == (0, 8192)
     indices, lengths = attention._slice_decode_topk(mixed, 8192, 8192 + 2 * width)
-    torch.testing.assert_close(indices, expected[0], rtol=0, atol=0)
+    # The production native selector does not promise tie/selection order.
+    # Both rounds must select the same slots without growing the workspace.
+    torch.testing.assert_close(
+        indices.sort(dim=-1).values, expected[0].sort(dim=-1).values, rtol=0, atol=0
+    )
     torch.testing.assert_close(lengths, expected[1], rtol=0, atol=0)
     assert lengths.tolist() == list(range(65 - width, 65)) * 2

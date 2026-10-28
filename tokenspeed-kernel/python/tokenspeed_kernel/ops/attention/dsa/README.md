@@ -227,7 +227,9 @@ FlashMLA sparse prefill and decode support regular BF16 KV and packed FP8 KV.
 Regular BF16 decode with a sink reuses the sparse prefill kernel with one
 selected slot row per query, including multi-token verify rows. Its registration
 requires `has_attention_sink=True`, preserving the existing provider selection
-for no-sink BF16 decode and context-sharded partials. Packed FP8 prefill retains the
+for no-sink BF16 decode and context-sharded partials. BF16 sparse prefill
+pads slot widths to a pair of 64-slot tiles (128 entries), while packed FP8
+decode keeps its 64-entry alignment; padded entries are always invalid. Packed FP8 prefill retains the
 sparse decode route. Both return natural-log FP32 LSE `[tokens, heads]` and
 normalize empty rows to zero output / negative-infinite LSE for the shared
 DCP merge. Packed decode converts the native `[batch, heads, query]` LSE to

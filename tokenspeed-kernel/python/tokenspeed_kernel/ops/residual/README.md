@@ -35,6 +35,11 @@ For BF16 residuals, it decomposes FP32 projection weights into three BF16
 terms and accumulates the products in FP32. FP32 residuals use FP32 products.
 Different reduction orders can produce small floating-point differences;
 these implementations do not promise bitwise equality with one another.
+Numerical tests check the gates, channel reduction and normalization separately.
+A reduction near a BF16 midpoint can round differently from an FP64 reference;
+normalization can propagate that first rounding into more than one output ULP.
+The tests retain the stage tolerances and bound their composition using the
+FP32 reduction error, rather than assuming a single final BF16 rounding.
 
 Both implementations support empty token batches. Shape, dtype and device
 validation reads metadata only. Token counts and split extents are runtime
