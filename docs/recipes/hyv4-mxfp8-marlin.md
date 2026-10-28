@@ -95,6 +95,12 @@ the first generated token.
 
 ### Optional group32 W8A8 comparison
 
+This experiment currently quantizes operands to FP8 but does **not** pass native
+FP8 compute acceptance on H20. The selected Humming MMA binary unpacks E4M3 to
+FP16 and executes FP16 HMMA. The upstream native WGMMA path fails the existing
+numerical criteria. Keep these instruction and numerical results distinct;
+the experimental launch below is not a validated native-FP8 deployment recipe.
+
 Install the optional Humming dependency into the same environment as
 TokenSpeed:
 
@@ -135,8 +141,8 @@ compares the complete local chain, including routing and activation
 quantization, from captured checkpoint weights and activations. It records
 the selected kernels, scheduling policy, numerical references and memory.
 Hardware acceptance must also record profiler traces and inspect the
-generated Humming binary's FP8 WGMMA instructions; a backend name alone does
-not prove the arithmetic that executed. Report the earlier composite
+generated Humming binary's actual instructions. The current FP16 HMMA result
+does not satisfy the native-FP8 gate. Report the earlier composite
 Marlin/GEMV/BF16 implementation separately if it is included as a comparator.
 W8A8 does not reduce the 8-bit weight payload relative to pure Marlin;
 activation buffers and scratch space determine the measured memory change.

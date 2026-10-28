@@ -27,6 +27,8 @@ uses a different numerical rule and is intentionally not used here.
 
 The prepared plan compiles a fixed Hopper MMA tile before serving. Stream-K is
 disabled so each output has one FP32 reduction followed by one BF16 store.
+On the validated H20 compiler, this MMA instruction unpacks E4M3 to FP16 before
+HMMA. It is an FP8-operand experiment, not an accepted native-FP8 compute path.
 Routing, the activation, and weighted reduction belong to the calling op.
 """
 
@@ -219,8 +221,9 @@ def prepare_humming_indexed(state: HummingMXFP8WeightState) -> HummingIndexedPla
     }
     # The upstream Hopper WGMMA heuristic loses small terms with varied FP8
     # exponents, including within one group32 dot product. Use the verified
-    # MMA tile and FP32 group promotion for every route count. K is not split
-    # across CTAs; the result rounds to BF16 only after the complete reduction.
+    # MMA tile and FP32 group promotion for every route count. The H20 compiler
+    # lowers this MMA to FP16 HMMA; it does not meet native-FP8 acceptance. K is
+    # not split across CTAs; BF16 rounding follows the complete reduction.
     upper = 1 << 30
     tuning_config = json.dumps(
         [

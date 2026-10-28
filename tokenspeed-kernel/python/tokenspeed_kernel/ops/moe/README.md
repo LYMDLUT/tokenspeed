@@ -434,10 +434,14 @@ that an arbitrary weight/scale product remains finite.
 
 ### Humming group32 MXFP8 on Hopper
 
-The optional W8A8 path uses a fixed native MMA tile with FP32 group reductions
-and no Stream-K. Upstream WGMMA heuristics can lose small terms for E4M3 inputs
-with varied exponents, which can change the following BF16 and FP8 rounding.
-The bridge therefore compiles the verified MMA tile at startup for all supported
-route counts. Checkpoint E4M3 weights and E8M0 group32 scales remain unchanged.
-The conservative tile is a correctness choice; speed relative to Marlin depends
-on model shapes and routing and requires measurement.
+The optional FP8-operand path uses a fixed MMA tile with FP32 group reductions
+and no Stream-K. On the validated H20 compiler, its binary unpacks E4M3 to FP16
+and executes FP16 HMMA. It has passed numerical tests, but native FP8 compute
+acceptance failed. Upstream native WGMMA loses small terms for E4M3 inputs with
+varied exponents, which can change the following BF16 and FP8 rounding and fail
+the existing MoE tolerances. Those tolerances remain unchanged.
+
+The bridge compiles the fixed MMA tile at startup for all supported route
+counts. Checkpoint E4M3 weights and E8M0 group32 scales remain unchanged. This
+is an experimental activation-quantization path; neither a native-FP8 speedup
+nor production readiness has been established.
