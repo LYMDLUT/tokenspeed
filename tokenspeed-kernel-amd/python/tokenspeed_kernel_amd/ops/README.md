@@ -1454,8 +1454,11 @@ as the gfx950 kernels, with WMMA and TDM.
 - The output is BF16 unless the caller passes a buffer, which may be any
   floating dtype with a contiguous last dimension. The optional log-sum-exp
   is FP32 in natural-log units.
-- The grid is one workgroup per sequence, head, and 128-row query block.
-  `max_seqlen_kv` and `seq_lens_kv` are ignored.
+- The grid is one workgroup per head, 128-row query block and key split,
+  and sequence. `max_seqlen_kv` bounds the split count; `seq_lens_kv` is
+  ignored.
+- Split FP8 launches add a merge kernel and a transient workspace of one BF16
+  output tile and one FP32 LSE row per split.
 
 #### Algorithm
 
@@ -1468,10 +1471,34 @@ row's causal limit skip masking.
 the causal limit mask the scores and zero the value rows past the key tail.
 
 FP8 inputs stage Q in LDS, split the NoPE QK into two 64-wide WMMAs, and run
-three waves per SIMD. Fully visible tiles run in their own loop without mask
-code, and the boundary tiles mask keys only, since rows past `q_len` are
-never stored. V is not masked: TDM zero-fills tile rows past `kv_len`, and
-those keys score `-inf`.
+three waves per SIMD. Every FP8 product is 64 deep, so it uses the 64-deep
+FP8 WMMA rather than padding the 128-deep one with zeros. Fully visible tiles
+run in their own loop without mask code, and the boundary tiles mask keys
+only, since rows past `q_len` are never stored. V is not masked: TDM
+zero-fills tile rows past `kv_len`, and those keys score `-inf`.
+
+FP8 launches that would leave workgroup slots idle split each query block's
+keys into equal tile ranges, one workgroup per range:
+
+- Non-causal launches of up to 16 sequences split every block with keys into
+  the same number of ranges (at most 8, of at least 16 tiles), enough for
+  three workgroups per CU. The device derives the split from `cu_seqlens`;
+  the host bounds it.
+- Causal single-sequence launches cut long blocks into pieces of about 1.5
+  per-slot shares of the work and dispatch the heaviest blocks first, so the
+  causal tail does not wait on one workgroup.
+- Split workgroups publish a normalized BF16 output and base-2 LSE, which
+  `gluon_mla_prefill_merge_gfx1250` combines with max-shifted weights. The
+  merge is a separate launch because any side effect after the tile loop,
+  such as a completion counter, spills the accumulator inside the loop.
+
+Sequences are the slowest grid axis, so one sequence's blocks dispatch
+together instead of interleaving with those of sequences that have no keys.
+
+Non-causal FP8 launches with prefixes of at most 16 tiles compile with
+`amdgpu-sched-strategy=max-memory-clause`: each block walks only a few tiles,
+so one block's latency bounds the launch. Longer prefixes keep the default
+scheduler, which is 3–5% faster there.
 
 ### gfx950 GDN decode and MTP verify
 
