@@ -11,6 +11,16 @@ prefix granularity, cache groups, LCM blocks).
 
 ## 1. Admission is per chunk
 
+An optional `--chunk-prefill-kv-size` also bounds the KV read by a local
+prefill batch. The runtime converts its token capacity to
+`max_kv_page_num` using `prefix_granularity`. Admission rounds each request's
+cached-prefix-plus-current-chunk length up separately, then sums those page
+counts; shared prefixes still count for every request. A candidate may use only
+the remaining pages. When configured, the page-aligned token capacity must be
+strictly greater than `max_req_input_len`; startup rejects an undersized budget
+instead of reducing the prompt limit. Decode and remote PD landing do not spend
+this local-prefill budget. Omitting the limit preserves the existing policy.
+
 The scheduler schedules a prompt's prefill in chunks bounded by
 `max_scheduled_tokens` (`--chunked-prefill-size`). It admits capacity **for
 the chunk being

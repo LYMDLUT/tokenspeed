@@ -1883,6 +1883,17 @@ including QSA's full-KV, compressed, and recent cache groups. Verify-state layer
 ownership and cache addresses come from the bound plan's layer window,
 including under PP and target/draft sharing. Cache recipes reserve verify
 workspace before sizing the arena.
+Side-stream allocations retain their own workspace owner through execution,
+separate from scratch that main-stream operations can overwrite.
+Ascend native Prefill keeps receive, send, packed history, and commit slots in
+disjoint views of a backend-owned `WorkspacePool`, allocated on first Prefill
+use and reused thereafter. Cache binding carries only the bounded configuration;
+cache capacity planning does not reserve this runtime allocation. Without
+native pool options, the backend retains its ordinary collective path and
+creates no native transport.
+Native Prefill requires an explicit `chunk_prefill_kv_size`: its page limit is
+the scheduler's rounded batch budget, and exceeding it raises before transport.
+The null page and alignment are physical overhead, not additional batch capacity.
 A Qwen4 PD prefill role retains the target/draft cache layout for transfer,
 but reserves no speculative verify workspace: only the decode role verifies.
 
