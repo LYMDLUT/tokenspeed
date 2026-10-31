@@ -2136,6 +2136,7 @@ class DeepseekV3Model(nn.Module):
 
 class DeepseekV3ForCausalLM(BaseCausalLM):
     model_cls = DeepseekV3Model
+    supports_aux_capture = True
 
     def __init__(
         self,
@@ -2183,6 +2184,7 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
         return self._routed_experts_weights_of_layer.value
 
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None):
+        self.require_aux_capture()
         # layer_ids are 0-indexed from the external API; +1 because a layer
         # captures the residual entering it, so index i captures layer i-1's output.
         if layer_ids is None:
@@ -2192,6 +2194,7 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
             self.model.layers_to_capture = {val + 1 for val in layer_ids}
 
     def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+        self.require_aux_capture()
         # DFlash checkpoints name 0-indexed target layer outputs. A layer
         # captures the residual entering it, so capture at i + 1 for layer i's output.
         num_layers = len(self.model.layers)

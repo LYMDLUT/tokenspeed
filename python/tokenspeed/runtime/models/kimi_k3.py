@@ -3878,6 +3878,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
     """
 
     model_cls = KimiLinearModel
+    supports_aux_capture = True
 
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
         shared_mlps = [
@@ -3934,6 +3935,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
 
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
         """Take the draft config's one-based completed-layer ids unchanged."""
+        self.require_aux_capture()
         num_layers = len(self.model.layers)
         selected = (
             [2, num_layers // 2, num_layers - 3]
@@ -3960,6 +3962,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
         per-layer return has already accumulated the layer output into K3's
         prefix stream, matching vLLM's target-side capture contract.
         """
+        self.require_aux_capture()
         num_layers = len(self.model.layers)
         if len(set(layer_ids)) != len(layer_ids):
             raise ValueError("DFLASH target_layer_ids must be unique.")
