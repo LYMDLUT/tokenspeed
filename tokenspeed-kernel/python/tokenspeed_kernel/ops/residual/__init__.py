@@ -1239,6 +1239,7 @@ from tokenspeed_kernel.ops.residual.gated_boundary import (  # noqa: E402
 from tokenspeed_kernel.ops.residual.ihc import (  # noqa: E402
     ihc_head,
     ihc_post,
+    ihc_post_and_pre,
     ihc_pre,
 )
 
@@ -1253,6 +1254,7 @@ __all__ = [
     "gated_residual_mix",
     "ihc_head",
     "ihc_post",
+    "ihc_post_and_pre",
     "ihc_pre",
     "mhc_apply_pre",
     "mhc_apply_pre_quantize_fp8",
