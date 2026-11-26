@@ -26,7 +26,11 @@ from dataclasses import dataclass, replace
 
 import torch
 from tokenspeed_kernel.ops.attention import apply_attention_sink
+from tokenspeed_kernel.ops.attention.dsa.triton import _run_dsa
 from tokenspeed_kernel.ops.attention.mla import mla_prefill
+from tokenspeed_kernel.ops.attention.mla._triton.decode import (
+    _triton_mla_decode_with_kvcache_impl,
+)
 from tokenspeed_kernel.platform import ArchVersion, current_platform
 
 from tokenspeed.runtime.layers.attention.backends.paged.dsa import DSABackend
@@ -55,6 +59,7 @@ class Hy4FlashCacheGroupRouter(CacheGroupRouter):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._hy4_shared_topk_slots: dict[int, torch.Tensor] = {}
+        self._hy4_shared_topk_lens: dict[int, torch.Tensor] = {}
 
     def leaf_for(self, layer) -> Hy4FlashDSABackend | Hy4FlashSWABackend:
         """Return the paged leaf serving ``layer``'s bound cache group."""
@@ -84,19 +89,36 @@ class Hy4FlashCacheGroupRouter(CacheGroupRouter):
             default=0,
         )
 
-    def record_shared_topk_slots(self, layer_id: int, slots: torch.Tensor) -> None:
-        """Record the latest global KV slots selected by DSA layer ``layer_id``."""
-        self._hy4_shared_topk_slots[int(layer_id)] = slots
+    def record_shared_topk_slots(
+        self,
+        layer_id: int,
+        slots: torch.Tensor,
+        lens: torch.Tensor | None = None,
+    ) -> None:
+        """Record the latest global KV slots (and valid counts) selected by DSA layer ``layer_id``."""
+        key = int(layer_id)
+        self._hy4_shared_topk_slots[key] = slots
+        if lens is not None:
+            self._hy4_shared_topk_lens[key] = lens
+        else:
+            self._hy4_shared_topk_lens.pop(key, None)
 
     def get_shared_topk_slots(self, layer_id: int) -> torch.Tensor | None:
         """Return the most recently recorded global KV slots for ``layer_id``."""
         return self._hy4_shared_topk_slots.get(int(layer_id))
 
+    def get_shared_topk_lens(self, layer_id: int) -> torch.Tensor | None:
+        """Return the most recently recorded valid top-k lengths for ``layer_id``."""
+        return self._hy4_shared_topk_lens.get(int(layer_id))
+
     def clear_shared_topk_slots(self) -> None:
         self._hy4_shared_topk_slots.clear()
+        self._hy4_shared_topk_lens.clear()
 
     def clear_shared_topk_slots_for_layer(self, layer_id: int) -> None:
-        self._hy4_shared_topk_slots.pop(int(layer_id), None)
+        key = int(layer_id)
+        self._hy4_shared_topk_slots.pop(key, None)
+        self._hy4_shared_topk_lens.pop(key, None)
 
 
 class Hy4FlashDSABackend(DSABackend):
@@ -117,7 +139,7 @@ class Hy4FlashDSABackend(DSABackend):
     def _make_dense_leaf(config, spec, platform, kernel_page_size):
         # TRTLLM dense MLA requires Blackwell (SM100+); Hopper (SM90) uses Triton MLA.
         if platform.is_nvidia and platform.arch_version < ArchVersion(10, 0):
-            leaf = MLAAttnBackend(
+            leaf = _Hy4TritonMLABackend(
                 config,
                 replace(spec, backend_name="mla"),
                 kernel_page_size=kernel_page_size,
@@ -133,13 +155,163 @@ class Hy4FlashDSABackend(DSABackend):
             return self.cache_pool.kpool_tail_slot_rows(slot)
         return super().slot_state_rows(slot)
 
+    def forward_sparse_decode(
+        self,
+        *,
+        q: torch.Tensor,
+        layer,
+        token_to_kv_pool,
+        bs: int,
+        topk_indices: torch.Tensor,
+        topk_lens: torch.Tensor | None,
+        topk_owned: bool = False,
+        gathered_query: torch.Tensor | None = None,
+        value_projection=None,
+        sinks: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        # Fuse attention sink rescaling directly into the Triton DSA merge/store
+        # kernel on Hopper to eliminate 12 LSE writes and 12 sink launches/step.
+        if (
+            self.kernel_solution == "triton"
+            and sinks is not None
+            and len(self.kvp_group) == 1
+            and value_projection is None
+            and not topk_owned
+            and gathered_query is None
+            and topk_lens is not None
+            and layer.logit_cap == 0.0
+            and self.decode_kernel_plan is None
+            and q.is_cuda
+            and q.dtype == torch.bfloat16
+            and getattr(token_to_kv_pool, "quant_method", None) != "per_token_head"
+        ):
+            kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
+            if kv_cache.dtype == self.data_type:
+                heads = layer.tp_q_head_num
+                q_view = q.view(-1, heads, layer.head_dim)
+                slots = (
+                    topk_indices
+                    if topk_indices.dtype == torch.int32
+                    else topk_indices.to(torch.int32)
+                )
+                out = _run_dsa(
+                    q=q_view,
+                    kv_cache=kv_cache,
+                    packed_kv_cache=None,
+                    topk_slots=slots,
+                    topk_lens=topk_lens,
+                    kv_lora_rank=self.kv_lora_rank,
+                    qk_rope_head_dim=self.qk_rope_head_dim,
+                    softmax_scale=layer.scaling,
+                    k_scale=1.0,
+                    out=None,
+                    return_lse=False,
+                    sinks=sinks,
+                )
+                return out.reshape(-1, heads * layer.v_head_dim)
+        return super().forward_sparse_decode(
+            q=q,
+            layer=layer,
+            token_to_kv_pool=token_to_kv_pool,
+            bs=bs,
+            topk_indices=topk_indices,
+            topk_lens=topk_lens,
+            topk_owned=topk_owned,
+            gathered_query=gathered_query,
+            value_projection=value_projection,
+            sinks=sinks,
+        )
+
+
+class _Hy4TritonMLABackend(MLAAttnBackend):
+    """SM90 Triton MLA leaf with query-axis multi-q verify and fused attention sink."""
+
+    def _takes_query_blocks(
+        self, num_q_heads: int, q_len: int, sliding_window: bool
+    ) -> bool:
+        if (
+            self.kernel_solution == "triton"
+            and self.decode_kernel_plan is None
+            and 1 < q_len <= 16
+            and (not self.block_decode_active or self._expands_block)
+        ):
+            return True
+        return super()._takes_query_blocks(num_q_heads, q_len, sliding_window)
+
+    def forward_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor | None,
+        v: torch.Tensor | None,
+        layer,
+        out_cache_loc: torch.Tensor,
+        token_to_kv_pool,
+        bs: int,
+        **kwargs,
+    ) -> torch.Tensor:
+        sinks = kwargs.get("sinks")
+        metadata = self.forward_decode_metadata
+        if (
+            self.kernel_solution == "triton"
+            and sinks is not None
+            and metadata is not None
+            and self.decode_kernel_plan is None
+            and not self._dcp_active
+            and not self.block_decode_active
+            and kwargs.get("value_weight") is None
+            and layer.logit_cap == 0.0
+            and q.is_cuda
+            and q.dtype == self.data_type
+            and bs > 0
+            and q.shape[0] % bs == 0
+        ):
+            q_len_per_req = q.shape[0] // bs
+            if 1 <= q_len_per_req <= 16:
+                num_extends = metadata.num_extends or 0
+                query = q.view(bs, q_len_per_req, layer.tp_q_head_num, layer.head_dim)
+                page_table = metadata.page_table[num_extends:]
+                cache_seqlens = metadata.seq_lens[num_extends:]
+                if q_len_per_req > 1 and self.is_draft:
+                    cache_seqlens = cache_seqlens + (q_len_per_req - 1)
+                kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
+                if self.data_type != kv_cache.dtype:
+                    kv_cache = kv_cache.to(self.data_type)
+                kv_cache = kv_cache.view(
+                    -1, self.kernel_page_size, 1, self.kv_cache_dim
+                )
+                window_left = (
+                    -1
+                    if layer.sliding_window_size is None
+                    else int(layer.sliding_window_size)
+                )
+                output = _triton_mla_decode_with_kvcache_impl(
+                    q=query,
+                    kv_cache=kv_cache,
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    max_seqlen_k=self.max_context_len,
+                    qk_nope_head_dim=self.qk_nope_head_dim,
+                    kv_lora_rank=self.kv_lora_rank,
+                    qk_rope_head_dim=self.qk_rope_head_dim,
+                    softmax_scale=layer.scaling,
+                    logit_cap=0.0,
+                    return_lse=False,
+                    window_left=window_left,
+                    noncausal_block_size=1,
+                    sinks=sinks,
+                )
+                return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+        return super().forward_decode(
+            q, k, v, layer, out_cache_loc, token_to_kv_pool, bs, **kwargs
+        )
+
 
 @dataclass(kw_only=True)
 class Hy4FlashSWAPrefillMetadata(MLAPrefillMetadata):
     prefix_query_start_offsets: tuple[torch.Tensor, ...]
 
 
-class Hy4FlashSWABackend(MLAAttnBackend):
+class Hy4FlashSWABackend(_Hy4TritonMLABackend):
     """64-head SWA-MLA leaf with bounded prefix replay, sink support, and SM90 q_len>=1 verify."""
 
     default_kernel_page_size = HY4_FLASH_LOGICAL_BLOCK_TOKENS

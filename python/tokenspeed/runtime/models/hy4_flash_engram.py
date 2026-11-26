@@ -30,6 +30,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.embedding import host_gather
+from tokenspeed_kernel.ops.model.hy4_flash.engram import (
+    hy4_build_engram_inputs_from_history,
+    hy4_engram_gate_combine,
+    hy4_engram_hash_and_embed,
+    hy4_engram_hash_ngrams,
+    hy4_engram_lookup_norm_flatten,
+)
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
@@ -92,6 +99,19 @@ def build_hy4_engram_inputs(
             positions,
             max_ngram_size=max_ngram_size,
             pad_id=pad_id,
+        )
+    elif input_ids.is_cuda and request_token_history.req_pool_indices.shape[0] <= 4096:
+        return hy4_build_engram_inputs_from_history(
+            input_ids,
+            request_token_history.history_token_ids,
+            request_token_history.committed_lengths,
+            request_token_history.req_pool_indices,
+            request_token_history.input_start_offsets,
+            request_token_history.active_request_mask,
+            max_ngram_size=max_ngram_size,
+            pad_id=pad_id,
+            image_token_id=config.image_token_id,
+            video_token_id=config.video_token_id,
         )
     else:
         history = request_token_history.history_token_ids
@@ -419,6 +439,60 @@ class HYV4FlashEngramLayer(nn.Module):
             self.hc_mult, self.hidden_size
         )
 
+        # Packed weight views materialized by prepare_packed_weights() after loading
+        # so CUDA forward replaces per-head/per-branch Python loops with single ops.
+        self._packed_lookup_norm_weight: torch.Tensor | None = None
+        self._packed_key_proj_weight: torch.Tensor | None = None
+        self._packed_key_proj_bias: torch.Tensor | None = None
+        self._packed_kv_proj_weight: torch.Tensor | None = None
+        self._packed_kv_proj_bias: torch.Tensor | None = None
+        self._packed_norm_key_weight: torch.Tensor | None = None
+        self._packed_norm_query_weight: torch.Tensor | None = None
+        self._packed_branch_scales: torch.Tensor | None = None
+
+    def prepare_packed_weights(self) -> None:
+        """Pack per-head norm, key/value projection, and branch scale weights for fused forward."""
+        self._packed_lookup_norm_weight = (
+            torch.stack(
+                [norm.weight.detach() for norm in self.lookup_per_head_norms], dim=0
+            )
+            .unsqueeze(0)
+            .contiguous()
+        )
+        self._packed_key_proj_weight = torch.cat(
+            [proj.weight.detach() for proj in self.key_projs], dim=0
+        ).contiguous()
+        self._packed_key_proj_bias = torch.cat(
+            [proj.bias.detach() for proj in self.key_projs], dim=0
+        ).contiguous()
+        self._packed_kv_proj_weight = torch.cat(
+            (self._packed_key_proj_weight, self.value_proj.weight.detach()), dim=0
+        ).contiguous()
+        self._packed_kv_proj_bias = torch.cat(
+            (self._packed_key_proj_bias, self.value_proj.bias.detach()), dim=0
+        ).contiguous()
+        self._packed_norm_key_weight = (
+            torch.stack([norm.weight.detach() for norm in self.norm_key], dim=0)
+            .unsqueeze(0)
+            .contiguous()
+        )
+        self._packed_norm_query_weight = (
+            torch.stack([norm.weight.detach() for norm in self.norm_query], dim=0)
+            .unsqueeze(0)
+            .contiguous()
+        )
+        self._packed_branch_scales = (
+            torch.stack(
+                [
+                    getattr(self.unified_per_hc_scales, str(i)).detach()
+                    for i in range(self.hc_mult)
+                ],
+                dim=0,
+            )
+            .unsqueeze(0)
+            .contiguous()
+        )
+
     def draw_hash_multipliers(self, compressed_vocab_size: int) -> torch.Tensor:
         """Draw the exact odd int64 multipliers used by official Hy4-flash."""
         half_bound = max(1, np.iinfo(np.int64).max // compressed_vocab_size // 2)
@@ -441,16 +515,39 @@ class HYV4FlashEngramLayer(nn.Module):
 
     def hash_ngrams(self, ngram_tokens: torch.Tensor) -> torch.Tensor:
         """Mix ``[T, max_ngram_size]`` shifted token ids into ``[T, num_hash_heads]``."""
-        table_size = self.lookup_table.shape[0]
-        lookup = self.lookup_table.to(ngram_tokens.device)
+        lookup = (
+            self.lookup_table
+            if self.lookup_table.device == ngram_tokens.device
+            else self.lookup_table.to(ngram_tokens.device)
+        )
+        multipliers = (
+            self.hash_multipliers
+            if self.hash_multipliers.device == ngram_tokens.device
+            else self.hash_multipliers.to(ngram_tokens.device)
+        )
+        moduli_all = (
+            self.head_vocab_sizes
+            if self.head_vocab_sizes.device == ngram_tokens.device
+            else self.head_vocab_sizes.to(ngram_tokens.device)
+        )
+        if ngram_tokens.is_cuda:
+            return hy4_engram_hash_ngrams(
+                ngram_tokens,
+                lookup,
+                multipliers,
+                moduli_all,
+                pad_id=self.pad_id,
+                max_ngram_size=self.max_ngram_size,
+                n_head_per_ngram=self.n_head_per_ngram,
+            )
+
+        table_size = lookup.shape[0]
         clamped = ngram_tokens.clamp(min=0, max=table_size - 1)
         compressed = lookup[clamped]
         valid_id = (ngram_tokens >= 0) & (ngram_tokens < table_size)
         compressed = torch.where(valid_id, compressed, lookup[self.pad_id])
 
-        multipliers = self.hash_multipliers.to(ngram_tokens.device)
         mixed = compressed.to(torch.int64) * multipliers
-        moduli_all = self.head_vocab_sizes.to(ngram_tokens.device)
 
         hash_ids = []
         for ngram_size in range(2, self.max_ngram_size + 1):
@@ -467,12 +564,175 @@ class HYV4FlashEngramLayer(nn.Module):
         hidden_states: torch.Tensor,
         ngram_tokens: torch.Tensor,
         engram_mask: torch.Tensor,
+        *,
+        add_to_hidden: bool = False,
     ) -> torch.Tensor:
         """Compute ``[T, hc_mult, hidden_size]`` Engram residual for packed tokens."""
+        inv_sqrt_d = self.hidden_size**-0.5
+        if (
+            hidden_states.is_cuda
+            and self._packed_lookup_norm_weight is not None
+            and self._packed_kv_proj_weight is not None
+            and self._packed_kv_proj_bias is not None
+            and self._packed_norm_key_weight is not None
+            and self._packed_norm_query_weight is not None
+            and self._packed_branch_scales is not None
+            and self._packed_lookup_norm_weight.device == hidden_states.device
+            and self._packed_lookup_norm_weight.dtype == hidden_states.dtype
+            and self._packed_kv_proj_weight.dtype == hidden_states.dtype
+        ):
+            emb_mod = self.multi_head_embedding
+            if emb_mod.host_table:
+                lookup = (
+                    self.lookup_table
+                    if self.lookup_table.device == ngram_tokens.device
+                    else self.lookup_table.to(ngram_tokens.device)
+                )
+                multipliers = (
+                    self.hash_multipliers
+                    if self.hash_multipliers.device == ngram_tokens.device
+                    else self.hash_multipliers.to(ngram_tokens.device)
+                )
+                moduli_all = (
+                    self.head_vocab_sizes
+                    if self.head_vocab_sizes.device == ngram_tokens.device
+                    else self.head_vocab_sizes.to(ngram_tokens.device)
+                )
+                offsets = (
+                    emb_mod.offsets
+                    if emb_mod.offsets.device == ngram_tokens.device
+                    else emb_mod.offsets.to(ngram_tokens.device)
+                )
+                local_ids = hy4_engram_hash_ngrams(
+                    ngram_tokens,
+                    lookup,
+                    multipliers,
+                    moduli_all,
+                    pad_id=self.pad_id,
+                    max_ngram_size=self.max_ngram_size,
+                    n_head_per_ngram=self.n_head_per_ngram,
+                    offsets=offsets,
+                    row_start=emb_mod.row_start,
+                    row_end=emb_mod.row_end,
+                )
+                weight = emb_mod.embedding.weight
+                table_u8 = (
+                    emb_mod._host_u8
+                    if emb_mod._host_u8 is not None
+                    else weight.data.view(torch.uint8)
+                )
+                embeddings = host_gather.uint8_row_gather(
+                    table_u8, local_ids, None
+                ).view(weight.dtype)
+                if emb_mod.row_sharded and emb_mod.tp_group is not None:
+                    embeddings = all_reduce(embeddings, group=emb_mod.tp_group)
+                if embeddings.dtype != hidden_states.dtype:
+                    embeddings = embeddings.to(hidden_states.dtype)
+            elif emb_mod.embedding.weight.device == hidden_states.device:
+                lookup = (
+                    self.lookup_table
+                    if self.lookup_table.device == ngram_tokens.device
+                    else self.lookup_table.to(ngram_tokens.device)
+                )
+                multipliers = (
+                    self.hash_multipliers
+                    if self.hash_multipliers.device == ngram_tokens.device
+                    else self.hash_multipliers.to(ngram_tokens.device)
+                )
+                moduli_all = (
+                    self.head_vocab_sizes
+                    if self.head_vocab_sizes.device == ngram_tokens.device
+                    else self.head_vocab_sizes.to(ngram_tokens.device)
+                )
+                offsets = (
+                    emb_mod.offsets
+                    if emb_mod.offsets.device == ngram_tokens.device
+                    else emb_mod.offsets.to(ngram_tokens.device)
+                )
+                embeddings = hy4_engram_hash_and_embed(
+                    ngram_tokens,
+                    lookup,
+                    multipliers,
+                    moduli_all,
+                    offsets,
+                    emb_mod.embedding.weight,
+                    pad_id=self.pad_id,
+                    max_ngram_size=self.max_ngram_size,
+                    n_head_per_ngram=self.n_head_per_ngram,
+                    row_start=emb_mod.row_start,
+                    row_end=emb_mod.row_end,
+                    out_dtype=hidden_states.dtype,
+                )
+                if emb_mod.row_sharded and emb_mod.tp_group is not None:
+                    embeddings = all_reduce(embeddings, group=emb_mod.tp_group)
+            else:
+                hash_ids = self.hash_ngrams(ngram_tokens)
+                embeddings = emb_mod(hash_ids).to(hidden_states.dtype)
+
+            embeddings = hy4_engram_lookup_norm_flatten(
+                embeddings,
+                self._packed_lookup_norm_weight,
+                fp8_round_trip=self.fp8_embedding,
+            )
+            kv_out = F.linear(
+                embeddings,
+                self._packed_kv_proj_weight,
+                self._packed_kv_proj_bias,
+            )
+            return hy4_engram_gate_combine(
+                kv_out,
+                hidden_states,
+                self._packed_norm_key_weight,
+                self._packed_norm_query_weight,
+                self.unified_pre_gamma,
+                self._packed_branch_scales,
+                engram_mask,
+                inv_sqrt_d=inv_sqrt_d,
+                add_to_hidden=add_to_hidden,
+            )
+
         hash_ids = self.hash_ngrams(ngram_tokens)
         embeddings = self.multi_head_embedding(hash_ids).to(hidden_states.dtype)
         if self.fp8_embedding:
             embeddings = _fp8_round_trip(embeddings)
+
+        if (
+            self._packed_lookup_norm_weight is not None
+            and self._packed_lookup_norm_weight.device == embeddings.device
+            and self._packed_lookup_norm_weight.dtype == embeddings.dtype
+        ):
+            head_dim = embeddings.shape[-1]
+            embeddings = (
+                F.rms_norm(embeddings, (head_dim,)) * self._packed_lookup_norm_weight
+            ).flatten(start_dim=-2)
+
+            assert self._packed_key_proj_weight is not None
+            assert self._packed_key_proj_bias is not None
+            assert self._packed_norm_key_weight is not None
+            assert self._packed_norm_query_weight is not None
+            assert self._packed_branch_scales is not None
+
+            keys = F.linear(
+                embeddings,
+                self._packed_key_proj_weight,
+                self._packed_key_proj_bias,
+            ).view(embeddings.shape[0], self.hc_mult, self.hidden_size)
+            keys = F.rms_norm(keys, (self.hidden_size,)) * self._packed_norm_key_weight
+            queries = (
+                F.rms_norm(hidden_states, (self.hidden_size,))
+                * self._packed_norm_query_weight
+            )
+            gate = (keys * queries).sum(dim=-1) * inv_sqrt_d
+            gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
+            gates_tensor = gate.sigmoid().unsqueeze(-1)
+
+            main_signal = self.unified_pre_gamma * self.unified_rmsnorm(
+                self.value_proj(embeddings)
+            )
+            branch = main_signal.unsqueeze(1) * self._packed_branch_scales
+            engram_output = gates_tensor * main_signal.unsqueeze(1) + branch
+            masked = engram_output.masked_fill(~engram_mask[:, None, None], 0.0)
+            return hidden_states + masked if add_to_hidden else masked
 
         embeddings = torch.stack(
             [
@@ -484,7 +744,6 @@ class HYV4FlashEngramLayer(nn.Module):
         embeddings = embeddings.flatten(start_dim=-2)
 
         gates = []
-        inv_sqrt_d = self.hidden_size**-0.5
         for hc_index in range(self.hc_mult):
             key = self.norm_key[hc_index](self.key_projs[hc_index](embeddings))
             query = self.norm_query[hc_index](hidden_states[:, hc_index])
@@ -498,7 +757,8 @@ class HYV4FlashEngramLayer(nn.Module):
         )
         branch = self.unified_per_hc_scales(main_signal)
         engram_output = gates_tensor * main_signal.unsqueeze(1) + branch
-        return engram_output.masked_fill(~engram_mask[:, None, None], 0.0)
+        masked = engram_output.masked_fill(~engram_mask[:, None, None], 0.0)
+        return hidden_states + masked if add_to_hidden else masked
 
 
 __all__ = [

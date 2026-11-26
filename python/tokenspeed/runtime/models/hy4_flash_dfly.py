@@ -49,13 +49,30 @@ from collections.abc import Iterable
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.ops.activation import silu_and_mul
 from tokenspeed_kernel.ops.attention import apply_attention_sink
 from tokenspeed_kernel.ops.attention.dsa import dsa_decode
 from tokenspeed_kernel.ops.attention.kpool.hy4_compress import (
     apply_interleaved_rope_last_dim,
     compute_hy4_mrope_cos_sin,
+    hy4_apply_interleaved_rope_inplace,
+    hy4_kv_latent_norm_and_rope_inplace,
+    hy4_split_qkv_indexer_norm_rope,
 )
 from tokenspeed_kernel.ops.attention.mla import mla_project_value
+from tokenspeed_kernel.ops.gemm import bmm
+from tokenspeed_kernel.ops.gemm.triton_skinny import skinny_mm, skinny_mm_supported
+from tokenspeed_kernel.ops.model.hy4_flash.dfly import (
+    hy4_dfly_block_attn_merge_sink,
+    hy4_dfly_shared_kv_dsa,
+    hy4_dual_rmsnorm_cat,
+    hy4_merge_attention_and_sink,
+)
+from tokenspeed_kernel.ops.model.hy4_flash.fusion import (
+    hy4_add_rmsnorm_quantize_fp8,
+    hy4_sigmoid_gate_quantize_fp8,
+    hy4_silu_and_mul_quantize_fp8,
+)
 from torch import nn
 
 from tokenspeed.runtime.configs.hy4_flash_config import (
@@ -84,9 +101,13 @@ from tokenspeed.runtime.model_loader.weight_utils import (
 )
 from tokenspeed.runtime.models.base import BaseCausalLM
 from tokenspeed.runtime.models.hy4_flash import (
+    HYV4FlashLogitsProcessor,
     _apply_hy4_rmsnorm,
     _dequantize_fp8_blockwise,
+    _enable_hopper_deepgemm,
+    _is_unquantized_no_bias_linear,
     _linear_cpu_or_cuda,
+    _o_proj_fp8_block_mode,
     build_hy4_lm_head,
 )
 from tokenspeed.runtime.utils import add_prefix
@@ -226,6 +247,19 @@ class HYV4FlashDFlyMTPFusion(nn.Module):
         self, anchor_embeds: torch.Tensor, prev_hidden: torch.Tensor
     ) -> torch.Tensor:
         """Compute ``eh_proj(cat([enorm(E(x_a)), hnorm(h_{a-1})]))``."""
+        if (
+            anchor_embeds.is_cuda
+            and prev_hidden.dtype == anchor_embeds.dtype
+            and self.enorm.variance_epsilon == self.hnorm.variance_epsilon
+        ):
+            concat = hy4_dual_rmsnorm_cat(
+                anchor_embeds,
+                prev_hidden,
+                self.enorm.weight,
+                self.hnorm.weight,
+                eps=self.enorm.variance_epsilon,
+            )
+            return _linear_cpu_or_cuda(self.eh_proj, concat)
         norm_e = _apply_hy4_rmsnorm(anchor_embeds, self.enorm)
         norm_h = _apply_hy4_rmsnorm(prev_hidden.to(anchor_embeds.dtype), self.hnorm)
         concat = torch.cat((norm_e, norm_h), dim=-1)
@@ -290,6 +324,21 @@ class HYV4FlashDFlyHiddenCorrection(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("down_proj", prefix),
         )
+        self._packed_gate_up_weight: torch.Tensor | None = None
+
+    def prepare_packed_weights(self) -> None:
+        """Pack unquantized ``[gate_proj; up_proj]`` weights into one contiguous GEMM."""
+        if (
+            _is_unquantized_no_bias_linear(self.gate_proj)
+            and _is_unquantized_no_bias_linear(self.up_proj)
+            and self.gate_proj.weight.dtype == self.up_proj.weight.dtype
+            and self.gate_proj.weight.device == self.up_proj.weight.device
+        ):
+            self._packed_gate_up_weight = torch.cat(
+                (self.gate_proj.weight.detach(), self.up_proj.weight.detach()), dim=0
+            ).contiguous()
+        else:
+            self._packed_gate_up_weight = None
 
     def forward(
         self,
@@ -297,6 +346,46 @@ class HYV4FlashDFlyHiddenCorrection(nn.Module):
         prev_token_embeds: torch.Tensor,
     ) -> torch.Tensor:
         """Return ``h + down(silu(gate(cat(hnorm(h), enorm(e)))) * up(...))``."""
+        packed_gu = self._packed_gate_up_weight
+        if (
+            hidden_states.is_cuda
+            and packed_gu is not None
+            and packed_gu.device == hidden_states.device
+            and packed_gu.dtype == hidden_states.dtype
+            and prev_token_embeds.dtype == hidden_states.dtype
+            and self.hidden_norm.variance_epsilon == self.embed_norm.variance_epsilon
+        ):
+            gate_in = hy4_dual_rmsnorm_cat(
+                hidden_states,
+                prev_token_embeds,
+                self.hidden_norm.weight,
+                self.embed_norm.weight,
+                eps=self.hidden_norm.variance_epsilon,
+            )
+            if skinny_mm_supported(gate_in, packed_gu):
+                gate_up = skinny_mm(
+                    gate_in,
+                    packed_gu,
+                    None,
+                    out_dtype=gate_in.dtype,
+                    compact_m=True,
+                )
+            else:
+                gate_up = F.linear(gate_in, packed_gu)
+            act = silu_and_mul(gate_up)
+            if _is_unquantized_no_bias_linear(self.down_proj) and skinny_mm_supported(
+                act, self.down_proj.weight
+            ):
+                delta = skinny_mm(
+                    act,
+                    self.down_proj.weight,
+                    None,
+                    out_dtype=act.dtype,
+                    compact_m=True,
+                )
+            else:
+                delta = _linear_cpu_or_cuda(self.down_proj, act)
+            return hidden_states + delta.to(hidden_states.dtype)
         h_norm = _apply_hy4_rmsnorm(hidden_states, self.hidden_norm)
         e_norm = _apply_hy4_rmsnorm(
             prev_token_embeds.to(hidden_states.dtype), self.embed_norm
@@ -454,6 +543,26 @@ class HYV4FlashDFlyAttention(nn.Module):
         # Absorbed MLA weight slices populated by prepare_absorbed_mla_weights().
         self.w_kc: torch.Tensor | None = None
         self.w_vc: torch.Tensor | None = None
+        self._packed_in_proj_weight: torch.Tensor | None = None
+        self._causal_mask_cache: dict[tuple[int, torch.device], torch.Tensor] = {}
+
+    def prepare_packed_bf16_projections(self) -> None:
+        """Pack ``[q_a_proj; kv_a_proj_with_mqa]`` into one BF16 GEMM matrix."""
+        if (
+            _is_unquantized_no_bias_linear(self.q_a_proj)
+            and _is_unquantized_no_bias_linear(self.kv_a_proj_with_mqa)
+            and self.q_a_proj.weight.dtype == self.kv_a_proj_with_mqa.weight.dtype
+            and self.q_a_proj.weight.device == self.kv_a_proj_with_mqa.weight.device
+        ):
+            self._packed_in_proj_weight = torch.cat(
+                (
+                    self.q_a_proj.weight.detach(),
+                    self.kv_a_proj_with_mqa.weight.detach(),
+                ),
+                dim=0,
+            ).contiguous()
+        else:
+            self._packed_in_proj_weight = None
 
     def prepare_absorbed_mla_weights(self) -> None:
         """Materialize absorbed ``w_kc`` and ``w_vc`` from ``kv_b_proj``."""
@@ -482,39 +591,109 @@ class HYV4FlashDFlyAttention(nn.Module):
         self,
         draft_hidden: torch.Tensor,
         positions_3d: torch.Tensor,
+        *,
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
+        apply_q_rope: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project draft hidden ``[B, S, D]`` to ``(q_nope, q_pe, latent_draft)``."""
         bsz, block_size, hidden_dim = draft_hidden.shape
         flat_hidden = draft_hidden.reshape(bsz * block_size, hidden_dim)
-        flat_pos = positions_3d.reshape(3, bsz * block_size)
+        if rope_cos_sin is not None:
+            cos_cast, sin_cast = rope_cos_sin
+        else:
+            flat_pos = positions_3d.reshape(3, bsz * block_size)
+            cos, sin = compute_hy4_mrope_cos_sin(
+                flat_pos, self.rope_inv_freq, self.mrope_section
+            )
+            cos_cast = cos.to(draft_hidden.dtype).contiguous()
+            sin_cast = sin.to(draft_hidden.dtype).contiguous()
 
-        cos, sin = compute_hy4_mrope_cos_sin(
-            flat_pos, self.rope_inv_freq, self.mrope_section
-        )
-        cos_cast = cos.to(draft_hidden.dtype)
-        sin_cast = sin.to(draft_hidden.dtype)
+        packed_w = self._packed_in_proj_weight
+        if (
+            flat_hidden.is_cuda
+            and packed_w is not None
+            and packed_w.device == flat_hidden.device
+            and packed_w.dtype == flat_hidden.dtype
+        ):
+            if skinny_mm_supported(flat_hidden, packed_w):
+                packed_out = skinny_mm(
+                    flat_hidden,
+                    packed_w,
+                    None,
+                    out_dtype=flat_hidden.dtype,
+                    compact_m=True,
+                )
+            else:
+                packed_out = F.linear(flat_hidden, packed_w)
+            q_b_fp8, q_b_mn = _o_proj_fp8_block_mode(self.q_b_proj)
+            if q_b_fp8 and q_b_mn:
+                _, latent_flat, _, _, q_fp8, q_scale = hy4_split_qkv_indexer_norm_rope(
+                    packed_out,
+                    self.q_a_layernorm.weight,
+                    self.kv_a_layernorm.weight,
+                    cos_cast,
+                    sin_cast,
+                    q_eps=self.q_a_layernorm.variance_epsilon,
+                    kv_eps=self.kv_a_layernorm.variance_epsilon,
+                    quantize_q_fp8_mn_major=True,
+                    write_q_bf16=False,
+                )
+                q_states = self.q_b_proj(
+                    q_fp8, block_scale=q_scale, output_dtype=flat_hidden.dtype
+                )[0].view(bsz * block_size, self.num_local_heads, self.qk_head_dim)
+            else:
+                q_resid, latent_flat, _, _ = hy4_split_qkv_indexer_norm_rope(
+                    packed_out,
+                    self.q_a_layernorm.weight,
+                    self.kv_a_layernorm.weight,
+                    cos_cast,
+                    sin_cast,
+                    q_eps=self.q_a_layernorm.variance_epsilon,
+                    kv_eps=self.kv_a_layernorm.variance_epsilon,
+                )
+                q_states = _linear_cpu_or_cuda(self.q_b_proj, q_resid).view(
+                    bsz * block_size, self.num_local_heads, self.qk_head_dim
+                )
+            if apply_q_rope:
+                hy4_apply_interleaved_rope_inplace(q_states, cos_cast, sin_cast)
+            q_nope, q_pe = q_states.split(
+                [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+            )
+            latent_draft = latent_flat.view(
+                bsz, block_size, self.kv_lora_rank + self.qk_rope_head_dim
+            )
+        else:
+            q_resid = _apply_hy4_rmsnorm(
+                _linear_cpu_or_cuda(self.q_a_proj, flat_hidden),
+                self.q_a_layernorm,
+            )
+            q_states = _linear_cpu_or_cuda(self.q_b_proj, q_resid).view(
+                bsz * block_size, self.num_local_heads, self.qk_head_dim
+            )
+            if apply_q_rope:
+                hy4_apply_interleaved_rope_inplace(q_states, cos_cast, sin_cast)
+            q_nope, q_pe = q_states.split(
+                [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+            )
 
-        q_resid = _apply_hy4_rmsnorm(
-            _linear_cpu_or_cuda(self.q_a_proj, flat_hidden),
-            self.q_a_layernorm,
-        )
-        q_states = _linear_cpu_or_cuda(self.q_b_proj, q_resid).view(
-            bsz * block_size, self.num_local_heads, self.qk_head_dim
-        )
-        q_nope, q_pe = q_states.split(
-            [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-        )
-        q_pe = apply_interleaved_rope_last_dim(
-            q_pe, cos_cast.unsqueeze(1), sin_cast.unsqueeze(1)
-        )
-
-        kv_raw = _linear_cpu_or_cuda(self.kv_a_proj_with_mqa, flat_hidden)
-        kv_pass, k_pe = kv_raw.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        k_pass = _apply_hy4_rmsnorm(kv_pass, self.kv_a_layernorm)
-        k_pe = apply_interleaved_rope_last_dim(k_pe, cos_cast, sin_cast)
-        latent_draft = torch.cat((k_pass, k_pe), dim=-1).view(
-            bsz, block_size, self.kv_lora_rank + self.qk_rope_head_dim
-        )
+            kv_raw = _linear_cpu_or_cuda(self.kv_a_proj_with_mqa, flat_hidden)
+            if kv_raw.is_cuda:
+                latent_draft = hy4_kv_latent_norm_and_rope_inplace(
+                    kv_raw,
+                    self.kv_a_layernorm.weight,
+                    cos_cast,
+                    sin_cast,
+                    eps=self.kv_a_layernorm.variance_epsilon,
+                ).view(bsz, block_size, self.kv_lora_rank + self.qk_rope_head_dim)
+            else:
+                kv_pass, k_pe = kv_raw.split(
+                    [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+                )
+                k_pass = _apply_hy4_rmsnorm(kv_pass, self.kv_a_layernorm)
+                k_pe = apply_interleaved_rope_last_dim(k_pe, cos_cast, sin_cast)
+                latent_draft = torch.cat((k_pass, k_pe), dim=-1).view(
+                    bsz, block_size, self.kv_lora_rank + self.qk_rope_head_dim
+                )
         return (
             q_nope.view(bsz, block_size, self.num_local_heads, self.qk_nope_head_dim),
             q_pe.view(bsz, block_size, self.num_local_heads, self.qk_rope_head_dim),
@@ -525,6 +704,9 @@ class HYV4FlashDFlyAttention(nn.Module):
         self,
         latent_out: torch.Tensor,
         draft_hidden: torch.Tensor,
+        *,
+        linear_gate_fp8: tuple[torch.Tensor, torch.Tensor] | None = None,
+        skip_post_norm: bool = False,
     ) -> torch.Tensor:
         """Up-project absorbed latent ``[B, S, H, kv_lora]`` -> gate -> o_proj -> norm."""
         bsz, block_size, num_heads, _ = latent_out.shape
@@ -551,26 +733,93 @@ class HYV4FlashDFlyAttention(nn.Module):
             ).to(latent_out.dtype)
 
         flat_hidden = draft_hidden.reshape(num_tokens, draft_hidden.shape[-1])
+        flat_attn = attn_out.reshape(num_tokens, num_heads * self.v_head_dim)
         if self.linear_gate is not None:
-            gate = _linear_cpu_or_cuda(self.linear_gate, flat_hidden).view(
-                num_tokens, num_heads, self.v_head_dim
-            )
-            attn_out = attn_out * torch.sigmoid(gate)
-
-        projected = _linear_cpu_or_cuda(
-            self.o_proj, attn_out.reshape(num_tokens, num_heads * self.v_head_dim)
-        )
-        if self.post_proj_norm is not None:
+            if linear_gate_fp8 is not None:
+                gate = self.linear_gate(
+                    linear_gate_fp8[0],
+                    block_scale=linear_gate_fp8[1],
+                    output_dtype=flat_hidden.dtype,
+                )[0]
+            else:
+                gate = _linear_cpu_or_cuda(self.linear_gate, flat_hidden)
+            fused_fp8_gate, use_mn_major = _o_proj_fp8_block_mode(self.o_proj)
+            if (
+                flat_attn.is_cuda
+                and fused_fp8_gate
+                and flat_attn.dtype in (torch.bfloat16, torch.float16)
+            ):
+                q_fp8, q_scale = hy4_sigmoid_gate_quantize_fp8(
+                    flat_attn, gate, mn_major_tma=use_mn_major
+                )
+                projected = self.o_proj(q_fp8, scale=q_scale)[0]
+            else:
+                flat_attn = flat_attn * torch.sigmoid(gate)
+                projected = _linear_cpu_or_cuda(self.o_proj, flat_attn)
+        else:
+            projected = _linear_cpu_or_cuda(self.o_proj, flat_attn)
+        if self.post_proj_norm is not None and not skip_post_norm:
             projected = _apply_hy4_rmsnorm(projected, self.post_proj_norm)
         return projected.view(bsz, block_size, -1)
 
-    def _absorb_q(self, q_nope: torch.Tensor, q_pe: torch.Tensor) -> torch.Tensor:
+    def _absorb_q(
+        self,
+        q_nope: torch.Tensor,
+        q_pe: torch.Tensor,
+        *,
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
         """Compute absorbed query ``[B, S, H, kv_lora + qk_rope]``."""
         w_kc, _ = self._ensure_absorbed_weights()
+        if q_nope.is_cuda:
+            bsz, block_size, num_heads, _ = q_nope.shape
+            num_tokens = bsz * block_size
+            q_abs = torch.empty(
+                (num_tokens, num_heads, self.kv_lora_rank + self.qk_rope_head_dim),
+                dtype=q_nope.dtype,
+                device=q_nope.device,
+            )
+            if rope_cos_sin is not None:
+                hy4_apply_interleaved_rope_inplace(
+                    q_pe.reshape(num_tokens, num_heads, self.qk_rope_head_dim),
+                    rope_cos_sin[0],
+                    rope_cos_sin[1],
+                    out=q_abs[..., self.kv_lora_rank :],
+                )
+            else:
+                q_abs[..., self.kv_lora_rank :].copy_(
+                    q_pe.reshape(num_tokens, num_heads, self.qk_rope_head_dim)
+                )
+            if num_tokens > 0:
+                bmm(
+                    q_nope.reshape(
+                        num_tokens, num_heads, self.qk_nope_head_dim
+                    ).transpose(0, 1),
+                    w_kc.to(q_nope.dtype).transpose(1, 2),
+                    out=q_abs[..., : self.kv_lora_rank].transpose(0, 1),
+                )
+            return q_abs.view(bsz, block_size, num_heads, -1)
         q_lat = torch.einsum("bshd,hdm->bshm", q_nope.float(), w_kc.float()).to(
             q_nope.dtype
         )
+        if rope_cos_sin is not None:
+            bsz, block_size, num_heads, _ = q_pe.shape
+            q_pe = apply_interleaved_rope_last_dim(
+                q_pe.reshape(bsz * block_size, num_heads, self.qk_rope_head_dim),
+                rope_cos_sin[0].unsqueeze(1),
+                rope_cos_sin[1].unsqueeze(1),
+            ).view(bsz, block_size, num_heads, self.qk_rope_head_dim)
         return torch.cat((q_lat, q_pe), dim=-1)
+
+    def _get_causal_mask(self, block_size: int, device: torch.device) -> torch.Tensor:
+        key = (block_size, device)
+        mask = self._causal_mask_cache.get(key)
+        if mask is None:
+            q_idx = torch.arange(block_size, device=device).unsqueeze(1)
+            k_idx = torch.arange(block_size, device=device).unsqueeze(0)
+            mask = (k_idx > q_idx).unsqueeze(0).unsqueeze(0)
+            self._causal_mask_cache[key] = mask
+        return mask
 
     def _attend_draft_block_absorbed(
         self,
@@ -578,7 +827,7 @@ class HYV4FlashDFlyAttention(nn.Module):
         latent_draft: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute exact intra-block absorbed attention ``(out_latent, lse)``."""
-        bsz, block_size, num_heads, _ = q_absorbed.shape
+        _, block_size, _, _ = q_absorbed.shape
         # Attention logits shaped [B, H, S, S].
         scores = (
             torch.einsum(
@@ -589,10 +838,8 @@ class HYV4FlashDFlyAttention(nn.Module):
             * self.scaling
         )
         if self.attn_causal:
-            q_idx = torch.arange(block_size, device=scores.device).unsqueeze(1)
-            k_idx = torch.arange(block_size, device=scores.device).unsqueeze(0)
             scores = scores.masked_fill(
-                (k_idx > q_idx).unsqueeze(0).unsqueeze(0), float("-inf")
+                self._get_causal_mask(block_size, scores.device), float("-inf")
             )
         lse = torch.logsumexp(scores, dim=-1)  # [B, H, S]
         probs = torch.softmax(scores, dim=-1)  # [B, H, S, S]
@@ -608,6 +855,8 @@ class HYV4FlashDFlyAttention(nn.Module):
         target_kv_buffer: torch.Tensor,
         ctx_slots: torch.Tensor,
         ctx_lens: torch.Tensor | None,
+        *,
+        skip_zero_ctx_mask: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Attend absorbed query ``[B, S, H, D]`` over target paged KV slots ``[B, K]``."""
         bsz, block_size, num_heads, head_dim = q_absorbed.shape
@@ -625,6 +874,32 @@ class HYV4FlashDFlyAttention(nn.Module):
                 device=q_absorbed.device,
             )
             return empty_out, empty_lse
+
+        # Fast zero-copy CUDA path sharing per-request ctx_slots [B, K] across
+        # all block_size queries without broadcasting slots/lens or copying output.
+        if (
+            q_absorbed.is_cuda
+            and ctx_lens is not None
+            and q_absorbed.dtype in (torch.bfloat16, torch.float16)
+            and target_kv_buffer.dtype in (torch.bfloat16, torch.float16)
+            and target_kv_buffer.ndim >= 2
+            and q_absorbed.stride(-1) == 1
+            and ctx_slots.stride(-1) == 1
+            and ctx_lens.is_contiguous()
+            and self.kv_lora_rank in (128, 512)
+            and self.qk_rope_head_dim in (0, 64)
+            and num_heads >= 16
+            and num_heads % 16 == 0
+        ):
+            return hy4_dfly_shared_kv_dsa(
+                q_absorbed,
+                target_kv_buffer,
+                ctx_slots,
+                ctx_lens,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                softmax_scale=self.scaling,
+            )
 
         # On CUDA, use Triton sparse MLA decode directly against the target KV
         # buffer without gathering a [B, K, 576] temporary tensor whenever the
@@ -657,10 +932,18 @@ class HYV4FlashDFlyAttention(nn.Module):
                 .to(torch.int32)
                 .contiguous()
             )
-            out_buf = torch.zeros(
-                (bsz * block_size, num_heads, self.kv_lora_rank),
-                dtype=q_absorbed.dtype,
-                device=q_absorbed.device,
+            out_buf = (
+                torch.empty(
+                    (bsz * block_size, num_heads, self.kv_lora_rank),
+                    dtype=q_absorbed.dtype,
+                    device=q_absorbed.device,
+                )
+                if skip_zero_ctx_mask
+                else torch.zeros(
+                    (bsz * block_size, num_heads, self.kv_lora_rank),
+                    dtype=q_absorbed.dtype,
+                    device=q_absorbed.device,
+                )
             )
             page_size = (
                 int(target_kv_buffer.shape[1]) if target_kv_buffer.ndim == 4 else 64
@@ -683,10 +966,16 @@ class HYV4FlashDFlyAttention(nn.Module):
                 solution="triton",
                 slot_order="selection",
             )
+            out_ctx_4d = out_ctx.view(bsz, block_size, num_heads, self.kv_lora_rank)
+            lse_ctx_3d = (
+                lse_ctx.view(bsz, block_size, num_heads)
+                if lse_ctx.dtype == torch.float32
+                else lse_ctx.view(bsz, block_size, num_heads).float()
+            )
+            if skip_zero_ctx_mask:
+                return out_ctx_4d, lse_ctx_3d
             # For requests with ctx_lens == 0, ensure lse_ctx is -inf so merge ignores context.
             zero_ctx = (topk_lens_rep <= 0).view(bsz, block_size, 1)
-            out_ctx_4d = out_ctx.view(bsz, block_size, num_heads, self.kv_lora_rank)
-            lse_ctx_3d = lse_ctx.view(bsz, block_size, num_heads).float()
             out_ctx_4d = torch.where(
                 zero_ctx.unsqueeze(-1), torch.zeros_like(out_ctx_4d), out_ctx_4d
             )
@@ -753,31 +1042,74 @@ class HYV4FlashDFlyAttention(nn.Module):
         target_kv_buffer: torch.Tensor,
         ctx_slots: torch.Tensor,
         ctx_lens: torch.Tensor | None = None,
+        *,
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
+        linear_gate_fp8: tuple[torch.Tensor, torch.Tensor] | None = None,
+        skip_post_norm: bool = False,
     ) -> torch.Tensor:
         """Serving forward reusing target KV buffer at ``ctx_slots [B, K]``."""
         bsz, block_size, _ = draft_hidden.shape
         positions_3d = _normalize_block_positions_3d(
             draft_positions, batch_size=bsz, block_size=block_size
         )
-        q_nope, q_pe, latent_draft = self._project_draft_q_and_latent(
-            draft_hidden, positions_3d
-        )
-        q_absorbed = self._absorb_q(q_nope, q_pe)
-
-        out_ctx, lse_ctx = self._attend_context_absorbed_from_slots(
-            q_absorbed, target_kv_buffer, ctx_slots, ctx_lens
-        )
-        out_draft, lse_draft = self._attend_draft_block_absorbed(
-            q_absorbed, latent_draft
-        )
-        merged_out, merged_lse = _merge_two_attention_states(
-            out_ctx, lse_ctx, out_draft, lse_draft
-        )
-        if self.learnable_sink_param is not None:
-            merged_out = _apply_sink_to_latent(
-                merged_out, merged_lse, self.learnable_sink_param
+        if rope_cos_sin is None:
+            flat_pos = positions_3d.reshape(3, bsz * block_size)
+            cos, sin = compute_hy4_mrope_cos_sin(
+                flat_pos, self.rope_inv_freq, self.mrope_section
             )
-        return self._project_output_tail(merged_out, draft_hidden)
+            rope_cos_sin = (
+                cos.to(draft_hidden.dtype).contiguous(),
+                sin.to(draft_hidden.dtype).contiguous(),
+            )
+        q_nope, q_pe, latent_draft = self._project_draft_q_and_latent(
+            draft_hidden,
+            positions_3d,
+            rope_cos_sin=rope_cos_sin,
+            apply_q_rope=False,
+        )
+        q_absorbed = self._absorb_q(q_nope, q_pe, rope_cos_sin=rope_cos_sin)
+
+        use_fused_merge = q_absorbed.is_cuda and block_size <= 32
+        out_ctx, lse_ctx = self._attend_context_absorbed_from_slots(
+            q_absorbed,
+            target_kv_buffer,
+            ctx_slots,
+            ctx_lens,
+            skip_zero_ctx_mask=use_fused_merge and ctx_lens is not None,
+        )
+        if use_fused_merge:
+            merged_out = hy4_dfly_block_attn_merge_sink(
+                q_absorbed,
+                latent_draft,
+                out_ctx,
+                lse_ctx,
+                self.learnable_sink_param,
+                scaling=self.scaling,
+                causal=self.attn_causal,
+                ctx_lens=ctx_lens,
+            )
+        else:
+            out_draft, lse_draft = self._attend_draft_block_absorbed(
+                q_absorbed, latent_draft
+            )
+            if out_draft.is_cuda:
+                merged_out = hy4_merge_attention_and_sink(
+                    out_ctx, lse_ctx, out_draft, lse_draft, self.learnable_sink_param
+                )
+            else:
+                merged_out, merged_lse = _merge_two_attention_states(
+                    out_ctx, lse_ctx, out_draft, lse_draft
+                )
+                if self.learnable_sink_param is not None:
+                    merged_out = _apply_sink_to_latent(
+                        merged_out, merged_lse, self.learnable_sink_param
+                    )
+        return self._project_output_tail(
+            merged_out,
+            draft_hidden,
+            linear_gate_fp8=linear_gate_fp8,
+            skip_post_norm=skip_post_norm,
+        )
 
 
 class HYV4FlashDFlyMLP(nn.Module):
@@ -820,11 +1152,35 @@ class HYV4FlashDFlyMLP(nn.Module):
 
         self.act_fn = gated_activation(hidden_act, swiglu_limit=None)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        gate_up_fp8: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
         orig_shape = hidden_states.shape
         flat = hidden_states.reshape(-1, orig_shape[-1])
-        gate_up = _linear_cpu_or_cuda(self.gate_up_proj, flat)
+        if gate_up_fp8 is not None:
+            gate_up = self.gate_up_proj(
+                gate_up_fp8[0],
+                block_scale=gate_up_fp8[1],
+                output_dtype=flat.dtype,
+            )[0]
+        else:
+            gate_up = _linear_cpu_or_cuda(self.gate_up_proj, flat)
         if flat.is_cuda:
+            fused_down, down_mn = _o_proj_fp8_block_mode(self.down_proj)
+            if (
+                self.hidden_act == "silu"
+                and fused_down
+                and gate_up.dtype in (torch.bfloat16, torch.float16)
+                and (gate_up.shape[-1] // 2) % 128 == 0
+            ):
+                q_fp8, q_scale = hy4_silu_and_mul_quantize_fp8(
+                    gate_up, mn_major_tma=down_mn
+                )
+                out = self.down_proj(q_fp8, scale=q_scale)[0]
+                return out.view(orig_shape)
             activated = self.act_fn(gate_up)
         else:
             gate, up = gate_up.chunk(2, dim=-1)
@@ -866,6 +1222,113 @@ class HYV4FlashDFlyLayer(nn.Module):
             prefix=add_prefix("mlp", prefix),
         )
 
+    def _forward_with_residual(
+        self,
+        draft_hidden: torch.Tensor,
+        residual: torch.Tensor | None,
+        draft_positions: torch.Tensor,
+        target_kv_buffer: torch.Tensor,
+        ctx_slots: torch.Tensor,
+        ctx_lens: torch.Tensor | None = None,
+        *,
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run one DFly2 layer returning ``(mlp_out, residual)`` for cross-layer add+norm fusion."""
+        linear_gate_fp8: tuple[torch.Tensor, torch.Tensor] | None = None
+        if draft_hidden.is_cuda and draft_hidden.dtype in (
+            torch.bfloat16,
+            torch.float16,
+        ):
+            orig_shape = draft_hidden.shape
+            dim = orig_shape[-1]
+            fused_gate, gate_mn = (
+                _o_proj_fp8_block_mode(self.self_attn.linear_gate)
+                if self.self_attn.linear_gate is not None
+                else (False, False)
+            )
+            if fused_gate:
+                new_res, normed, gate_q, gate_s = hy4_add_rmsnorm_quantize_fp8(
+                    draft_hidden,
+                    self.input_layernorm.weight,
+                    residual=residual,
+                    eps=self.input_layernorm.variance_epsilon,
+                    mn_major_tma=gate_mn,
+                    write_bf16=True,
+                )
+                assert normed is not None
+                res_after_in = draft_hidden if new_res is None else new_res
+                linear_gate_fp8 = (gate_q, gate_s)
+            elif residual is not None:
+                normed_2d, res_2d = self.input_layernorm(
+                    draft_hidden.reshape(-1, dim), residual.reshape(-1, dim)
+                )
+                normed = normed_2d.view(orig_shape)
+                res_after_in = res_2d.view(orig_shape)
+            else:
+                res_after_in = draft_hidden
+                normed = self.input_layernorm(draft_hidden.reshape(-1, dim)).view(
+                    orig_shape
+                )
+        else:
+            res_after_in = (
+                draft_hidden if residual is None else (draft_hidden + residual)
+            )
+            normed = _apply_hy4_rmsnorm(res_after_in, self.input_layernorm)
+
+        can_fuse_mlp_norm = (
+            normed.is_cuda
+            and normed.dtype in (torch.bfloat16, torch.float16)
+            and _o_proj_fp8_block_mode(self.mlp.gate_up_proj)[0]
+        )
+        fuse_post_proj_norm = (
+            can_fuse_mlp_norm and self.self_attn.post_proj_norm is not None
+        )
+        attn_out = self.self_attn.forward_with_target_kv(
+            normed,
+            draft_positions,
+            target_kv_buffer,
+            ctx_slots,
+            ctx_lens=ctx_lens,
+            rope_cos_sin=rope_cos_sin,
+            linear_gate_fp8=linear_gate_fp8,
+            skip_post_norm=fuse_post_proj_norm,
+        )
+
+        if attn_out.is_cuda and attn_out.dtype in (torch.bfloat16, torch.float16):
+            orig_shape = attn_out.shape
+            dim = orig_shape[-1]
+            fused_mlp, mlp_mn = _o_proj_fp8_block_mode(self.mlp.gate_up_proj)
+            if fused_mlp:
+                post_norm = (
+                    self.self_attn.post_proj_norm if fuse_post_proj_norm else None
+                )
+                hidden, _, mlp_q, mlp_s = hy4_add_rmsnorm_quantize_fp8(
+                    attn_out,
+                    self.post_attention_layernorm.weight,
+                    residual=res_after_in,
+                    eps=self.post_attention_layernorm.variance_epsilon,
+                    pre_norm_weight=(
+                        post_norm.weight if post_norm is not None else None
+                    ),
+                    pre_eps=(
+                        post_norm.variance_epsilon if post_norm is not None else 1e-5
+                    ),
+                    mn_major_tma=mlp_mn,
+                    write_bf16=False,
+                )
+                assert hidden is not None
+                mlp_out = self.mlp(hidden, gate_up_fp8=(mlp_q, mlp_s))
+                return mlp_out, hidden
+            mlp_in_2d, hidden_2d = self.post_attention_layernorm(
+                attn_out.reshape(-1, dim), res_after_in.reshape(-1, dim)
+            )
+            mlp_out = self.mlp(mlp_in_2d.view(orig_shape))
+            return mlp_out, hidden_2d.view(orig_shape)
+
+        hidden = res_after_in + attn_out
+        mlp_out = self.mlp(_apply_hy4_rmsnorm(hidden, self.post_attention_layernorm))
+        return mlp_out, hidden
+
     def forward_with_target_kv(
         self,
         draft_hidden: torch.Tensor,
@@ -873,15 +1336,18 @@ class HYV4FlashDFlyLayer(nn.Module):
         target_kv_buffer: torch.Tensor,
         ctx_slots: torch.Tensor,
         ctx_lens: torch.Tensor | None = None,
+        *,
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        residual = draft_hidden
-        normed = _apply_hy4_rmsnorm(draft_hidden, self.input_layernorm)
-        attn_out = self.self_attn.forward_with_target_kv(
-            normed, draft_positions, target_kv_buffer, ctx_slots, ctx_lens=ctx_lens
+        mlp_out, residual = self._forward_with_residual(
+            draft_hidden,
+            None,
+            draft_positions,
+            target_kv_buffer,
+            ctx_slots,
+            ctx_lens=ctx_lens,
+            rope_cos_sin=rope_cos_sin,
         )
-        hidden = residual + attn_out
-        residual = hidden
-        mlp_out = self.mlp(_apply_hy4_rmsnorm(hidden, self.post_attention_layernorm))
         return residual + mlp_out
 
 
@@ -1000,18 +1466,46 @@ class HYV4FlashDFlyModel(nn.Module):
     ) -> torch.Tensor:
         """Run all 5 DFly2 layers against the target's shared DSA KV pool."""
         hidden = self.build_block_inputs(anchor_tokens, prev_hidden, block_size)
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None
+        if len(self.layers) > 0 and hidden.shape[0] > 0:
+            bsz = hidden.shape[0]
+            positions_3d = _normalize_block_positions_3d(
+                draft_positions, batch_size=bsz, block_size=block_size
+            )
+            first_attn = self.layers[0].self_attn
+            cos, sin = compute_hy4_mrope_cos_sin(
+                positions_3d.reshape(3, bsz * block_size),
+                first_attn.rope_inv_freq,
+                first_attn.mrope_section,
+            )
+            rope_cos_sin = (
+                cos.to(hidden.dtype).contiguous(),
+                sin.to(hidden.dtype).contiguous(),
+            )
+        residual: torch.Tensor | None = None
         for idx, layer in enumerate(self.layers):
             target_kv_buf = target_kv_pool.get_key_buffer(
                 layer.self_attn.target_kv_layer
             )
             ctx_lens = None if ctx_lens_per_layer is None else ctx_lens_per_layer[idx]
-            hidden = layer.forward_with_target_kv(
+            hidden, residual = layer._forward_with_residual(
                 draft_hidden=hidden,
+                residual=residual,
                 draft_positions=draft_positions,
                 target_kv_buffer=target_kv_buf,
                 ctx_slots=ctx_slots_per_layer[idx],
                 ctx_lens=ctx_lens,
+                rope_cos_sin=rope_cos_sin,
             )
+        if residual is not None:
+            if hidden.is_cuda:
+                orig_shape = hidden.shape
+                dim = orig_shape[-1]
+                normed_2d, _ = self.final_norm(
+                    hidden.reshape(-1, dim), residual.reshape(-1, dim)
+                )
+                return normed_2d.view(orig_shape)
+            hidden = hidden + residual
         return _apply_hy4_rmsnorm(hidden, self.final_norm)
 
     def correct_hidden(
@@ -1101,6 +1595,7 @@ class HYV4FlashForCausalLMDFly(BaseCausalLM):
     """Hy4-flash DFly2 speculative draft model entry point."""
 
     model_cls = HYV4FlashDFlyModel
+    logits_processor_cls = HYV4FlashLogitsProcessor
 
     def __init__(
         self,
@@ -1164,8 +1659,12 @@ class HYV4FlashForCausalLMDFly(BaseCausalLM):
     def post_load_weights(self) -> None:
         if self.model is None:
             return
+        _enable_hopper_deepgemm(self)
         for layer in self.model.layers:
             layer.self_attn.prepare_absorbed_mla_weights()
+            layer.self_attn.prepare_packed_bf16_projections()
+        if self.model.hidden_correction is not None:
+            self.model.hidden_correction.prepare_packed_weights()
 
 
 EntryClass = [HYV4FlashForCausalLMDFly]

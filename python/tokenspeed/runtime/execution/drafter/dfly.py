@@ -44,6 +44,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel.ops.model.hy4_flash.dfly import (
+    hy4_dfly_build_decode_round_inputs,
+    hy4_vocab_argmax_into,
+)
 from typing_extensions import override
 
 from tokenspeed.runtime.configs.hy4_flash_config import HYV4FlashDFlyConfig
@@ -58,6 +62,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.hybrid_hy4_flash import (
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from tokenspeed.runtime.models.hy4_flash import HYV4FlashLMHeadFP32Method
 from tokenspeed.runtime.models.hy4_flash_dfly import HYV4FlashForCausalLMDFly
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
@@ -245,33 +250,20 @@ class DFly(BaseDrafter):
             )
             metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
             logits = processor._get_logits(
-                corrected_hidden,
-                head,
-                metadata,
-                require_full_vocab=require_full_vocab,
+                corrected_hidden, head, metadata, require_full_vocab=require_full_vocab
             )
         else:
-            weight = head.weight
-            logits = torch.nn.functional.linear(
-                corrected_hidden.to(weight.dtype), weight
-            )
+            quant_method = getattr(head, "quant_method", None)
+            if isinstance(quant_method, HYV4FlashLMHeadFP32Method):
+                logits = quant_method.apply(head, corrected_hidden, None)
+            else:
+                logits = torch.nn.functional.linear(
+                    corrected_hidden.to(head.weight.dtype), head.weight
+                )
             if isinstance(head, VocabParallelEmbedding):
                 if head.tp_size > 1:
                     logits = all_gather(logits, head.tp_group, dim=-1)
-                if not head.num_added_embeddings:
-                    logits = logits[:, : head.org_vocab_size]
-                else:
-                    shards = logits.unflatten(
-                        1, (head.tp_size, head.num_embeddings_per_partition)
-                    )
-                    base_width = head.shard_indices.num_org_elements_padded
-                    base = shards[:, :, :base_width].flatten(1)[
-                        :, : head.org_vocab_size
-                    ]
-                    added = shards[:, :, base_width:].flatten(1)[
-                        :, : head.num_added_embeddings
-                    ]
-                    logits = torch.cat((base, added), dim=1)
+                logits = head.unpad_gathered_logits(logits)
         if self.vocab_size is not None and self.vocab_size < logits.shape[1]:
             return logits[:, : self.vocab_size]
         return logits
@@ -308,20 +300,29 @@ class DFly(BaseDrafter):
         )
 
         sampler = self.draft_sampler
+        step_tok_buf = (
+            torch.empty((bsz,), dtype=torch.int32, device=draft_hidden.device)
+            if sampler is None
+            else None
+        )
         for slot in range(1, block_size):
             corrected = self.model.correct_hidden(draft_hidden[:, slot, :], prev_token)
             logits = self._project_step_logits(corrected)
             if sampler is not None:
                 # FlashInfer softmax requires dense rows after vocabulary slicing.
-                next_tok = sampler.propose(logits.contiguous(), step=slot - 1).to(
+                prev_token = sampler.propose(logits.contiguous(), step=slot - 1).to(
                     torch.int32
                 )
+                proposals[:, slot] = prev_token
             else:
-                next_tok = logits.argmax(dim=-1).to(torch.int32)
-                if max_token_id is not None:
-                    next_tok = next_tok.clamp(0, max_token_id)
-            proposals[:, slot] = next_tok
-            prev_token = next_tok
+                assert step_tok_buf is not None
+                hy4_vocab_argmax_into(
+                    logits,
+                    proposals[:, slot],
+                    out_contig=step_tok_buf,
+                    max_token_id=max_token_id,
+                )
+                prev_token = step_tok_buf
 
         if sampler is not None and max_token_id is not None:
             proposals.clamp_(0, max_token_id)
@@ -347,6 +348,40 @@ class DFly(BaseDrafter):
         num_decodes = bs - num_extends
         verify_width = self.verify_width
         device = output_tokens.device
+
+        # Pure-decode CUDA hot path (used in every decode CUDA graph step): fuse all
+        # scalar index/clamp/offset ops into a single Triton launch.
+        if (
+            num_extends == 0
+            and num_prefill_outputs == 0
+            and num_decodes == bs
+            and bs > 0
+            and output_tokens.is_cuda
+            and accept_lengths.is_cuda
+            and base_ctx.input_num_tokens == num_decodes * verify_width
+        ):
+            use_mrope = (
+                self.is_mrope and self.input_buffers.mrope_positions_buf is not None
+            )
+            pos_buf = (
+                self.input_buffers.mrope_positions_buf
+                if use_mrope
+                else self.input_buffers.positions_buf
+            )
+            anchor_tokens, safe_rows, ctx_lens, block_positions = (
+                hy4_dfly_build_decode_round_inputs(
+                    output_tokens,
+                    accept_lengths,
+                    self.input_buffers.seq_lens_buf,
+                    pos_buf,
+                    bs=bs,
+                    verify_width=verify_width,
+                    hidden_rows=hidden_states.shape[0],
+                    is_mrope=use_mrope,
+                )
+            )
+            prev_hidden = hidden_states.index_select(0, safe_rows)
+            return anchor_tokens, prev_hidden, safe_rows, ctx_lens, block_positions
 
         anchor_tokens = torch.zeros((bs,), dtype=torch.int32, device=device)
         last_rows = torch.zeros((bs,), dtype=torch.int64, device=device)
@@ -435,8 +470,19 @@ class DFly(BaseDrafter):
             shared_topk = router.get_shared_topk_slots(idx_layer)
             if shared_topk is not None and shared_topk.shape[0] > 0:
                 safe_idx = last_rows.clamp(max=shared_topk.shape[0] - 1)
-                selected = shared_topk.index_select(0, safe_idx).to(torch.int32)
-                valid_counts = (selected >= 0).sum(dim=-1, dtype=torch.int32)
+                selected = shared_topk.index_select(0, safe_idx)
+                if selected.dtype != torch.int32:
+                    selected = selected.to(torch.int32)
+                shared_lens = router.get_shared_topk_lens(idx_layer)
+                if (
+                    shared_lens is not None
+                    and shared_lens.shape[0] == shared_topk.shape[0]
+                ):
+                    valid_counts = shared_lens.index_select(0, safe_idx)
+                    if valid_counts.dtype != torch.int32:
+                        valid_counts = valid_counts.to(torch.int32)
+                else:
+                    valid_counts = (selected >= 0).sum(dim=-1, dtype=torch.int32)
                 ctx_slots_per_layer.append(selected)
                 ctx_lens_per_layer.append(valid_counts)
             else:

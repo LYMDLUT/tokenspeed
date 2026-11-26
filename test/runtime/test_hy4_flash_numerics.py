@@ -51,8 +51,11 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (  # noqa: E402
 )
 from tokenspeed.runtime.models.hy4_flash import (  # noqa: E402
     HYV4FlashForCausalLM,
+    HYV4FlashLMHeadFP32Method,
+    HYV4FlashLogitsProcessor,
     _apply_hy4_rmsnorm,
     _linear_cpu_or_cuda,
+    build_hy4_lm_head,
 )
 from tokenspeed.runtime.models.hy4_flash_dfly import (  # noqa: E402
     HYV4FlashDFlyModel,
@@ -491,16 +494,46 @@ def test_backbone_and_dfly2_target_kv_exact_equivalence_and_chain_walk():
     assert torch.equal(proposals, expected)
 
 
-def _make_vocab_heads(
-    weights: torch.Tensor,
-    base_vocab: int,
-    head_type: type[VocabParallelEmbedding] = ParallelLMHead,
-) -> list[VocabParallelEmbedding]:
-    heads: list[VocabParallelEmbedding] = []
+def test_engram_packed_weights_matches_unpacked_loop():
+    """Verify vectorized Engram packed weights match the per-head/per-branch reference loop."""
+    torch.manual_seed(42)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    cfg = HYV4FlashTextConfig(
+        vocab_size=128,
+        hidden_size=64,
+        hc_mult=4,
+        engram_layer_ids=[2],
+        engram_max_ngram_size=3,
+        engram_n_head_per_ngram=2,
+        engram_n_embed_per_ngram=32,
+        engram_layer_head_vocab_sizes={"2": [[17, 19], [23, 29]]},
+        engram_pad_id=0,
+        engram_lookup_table_size=128,
+    )
+    engram = HYV4FlashEngramLayer(cfg, layer_id=2, host_table=False).to(
+        device=device, dtype=dtype
+    )
+    with torch.no_grad():
+        for p in engram.parameters():
+            torch.nn.init.normal_(p, mean=0.0, std=0.1)
+    hidden = torch.randn(7, 4, 64, device=device, dtype=dtype)
+    ngrams = torch.randint(0, 128, (7, 3), device=device, dtype=torch.int64)
+    mask = torch.tensor([True, False, True, True, False, True, True], device=device)
+
+    with torch.no_grad():
+        ref = engram(hidden, ngrams, mask)
+        engram.prepare_packed_weights()
+        packed = engram(hidden, ngrams, mask)
+    atol = 2e-2 if dtype == torch.bfloat16 else 1e-5
+    torch.testing.assert_close(packed, ref, rtol=1e-2, atol=atol)
+
+
+def _make_vocab_heads(weights, base_vocab, head_type=ParallelLMHead):
+    heads = []
     for rank in range(2):
         head = head_type(
-            weights.shape[0],
-            weights.shape[1],
+            *weights.shape,
             org_num_embeddings=base_vocab,
             tp_rank=rank,
             tp_size=2,
@@ -508,15 +541,14 @@ def _make_vocab_heads(
             params_dtype=weights.dtype,
         )
         shard = head.shard_indices
-        with torch.no_grad():
-            head.weight.fill_(99)  # Padding must never win a selection.
-            head.weight[: shard.num_org_elements].copy_(
-                weights[shard.org_vocab_start_index : shard.org_vocab_end_index]
-            )
-            first = shard.num_org_elements_padded
-            head.weight[first : first + shard.num_added_elements].copy_(
-                weights[shard.added_vocab_start_index : shard.added_vocab_end_index]
-            )
+        head.weight.fill_(99)  # Padding must never win a selection.
+        head.weight[: shard.num_org_elements].copy_(
+            weights[shard.org_vocab_start_index : shard.org_vocab_end_index]
+        )
+        first = shard.num_org_elements_padded
+        head.weight[first : first + shard.num_added_elements].copy_(
+            weights[shard.added_vocab_start_index : shard.added_vocab_end_index]
+        )
         heads.append(head)
     return heads
 
@@ -526,8 +558,8 @@ def _make_vocab_heads(
     [
         (128, 0, 128, "prepared_argmax"),
         (17, 0, 17, "prepared_argmax"),  # Rank 1 contains only padding.
-        (106, 0, 106, "greedy"),
-        (106, 0, 103, "sample"),
+        (67, 39, 106, "greedy"),
+        (67, 39, 103, "sample"),
         (67, 39, 103, "no_processor"),
     ],
 )
@@ -535,7 +567,7 @@ def _make_vocab_heads(
 def test_dfly_propose_chain_tp_vocab(
     monkeypatch, base_vocab, added_vocab, valid_vocab, mode
 ):
-    """DFly selects from valid global columns across TP shards."""
+    """DFly selects from valid global columns, including the two padded TP regions."""
     from tokenspeed.runtime.execution.drafter import dfly
     from tokenspeed.runtime.layers import logits_processor
 
@@ -607,3 +639,138 @@ def test_dfly_propose_chain_tp_vocab(
     torch.testing.assert_close(
         drafter.propose_chain(hidden, anchors), expected.to(torch.int32)
     )
+
+
+@pytest.mark.parametrize(
+    ("base", "added", "winner", "greedy", "dp_head", "head_type"),
+    [
+        (67, 39, 105, False, False, ParallelLMHead),
+        (64, 64, 64, True, False, VocabParallelEmbedding),
+        (67, 39, 105, True, True, ParallelLMHead),
+    ],
+)
+@torch.no_grad()
+def test_hy4_target_added_vocab(
+    monkeypatch, base, added, winner, greedy, dp_head, head_type
+):
+    from tokenspeed.runtime.layers import logits_processor
+
+    vocab = base + added
+    weights = torch.zeros(vocab, 2)
+    weights[winner] = 3
+    weights[2, 1] = 3
+    hidden = torch.eye(2)
+    peer, head = _make_vocab_heads(weights, base, head_type)
+    proc = HYV4FlashLogitsProcessor(
+        HYV4FlashTextConfig(vocab_size=vocab),
+        tp_rank=1,
+        tp_size=2,
+        tp_group=(0, 1),
+        attn_tp_size=2,
+        do_argmax=greedy,
+        skip_all_gather=dp_head,
+        dp_lm_head_tp=dp_head,
+    )
+    proc.prepare_communication(head)
+    proc._all_gather_state = None
+
+    def gather(output, local, group):
+        torch.testing.assert_close(local, hidden @ head.weight.T)
+        output.copy_(torch.cat((hidden @ peer.weight.T, local)))
+
+    monkeypatch.setattr(logits_processor, "all_gather_single", gather)
+    metadata = logits_processor.LogitsMetadata(
+        forward_mode=logits_processor.ForwardMode.DECODE, query_shard=None
+    )
+    result = proc(None, hidden, head, metadata)
+    torch.testing.assert_close(result.next_token_logits, hidden @ weights.T)
+    if greedy:
+        torch.testing.assert_close(result.next_token_ids, torch.tensor([winner, 2]))
+
+
+@pytest.mark.parametrize(("base", "added", "tp"), [(1023, 0, 2), (2045, 1, 4)])
+def test_hy4_sampled_vocab_agrees_on_all_ranks(base, added, tp):
+    vocab = base + added
+    for rank in range(tp):
+        group = tuple(range(tp))
+        proc = HYV4FlashLogitsProcessor(
+            HYV4FlashTextConfig(vocab_size=vocab),
+            tp_rank=rank,
+            tp_size=tp,
+            tp_group=group,
+            attn_tp_size=tp,
+            dp_lm_head_tp=False,
+        )
+        head = ParallelLMHead(
+            vocab,
+            2,
+            org_num_embeddings=base,
+            params_dtype=torch.bfloat16,
+            tp_rank=rank,
+            tp_size=tp,
+            tp_group=group,
+        )
+        kept = proc.keep_sampled_logits_vocab_sharded(
+            head, lambda dtype, columns, size: columns >= 128
+        )
+        assert kept == (added == 0)
+        if kept:
+            shard = proc.sampled_vocab_shard(
+                torch.empty(1, head.num_embeddings_per_partition), head
+            )
+            assert shard.vocab_start == rank * 512
+            assert shard.columns == (512 if rank == 0 else 511)
+
+
+def test_hy4_flash_lm_head_bf16_to_fp32_parity():
+    """Verify BF16-weight FP32-output LM head matches FP32 reference and DFly projection."""
+    if not torch.cuda.is_available():
+        return
+    torch.manual_seed(7)
+    cfg = HYV4FlashTextConfig(
+        vocab_size=256,
+        hidden_size=128,
+        enable_lm_head_fp32=True,
+    )
+    mapping = Mapping(rank=0, world_size=1)
+    prev_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.bfloat16)
+        with torch.device("cuda"):
+            lm_head = build_hy4_lm_head(
+                config=cfg, mapping=mapping, quant_config=None, prefix=""
+            )
+    finally:
+        torch.set_default_dtype(prev_dtype)
+
+    from tokenspeed_kernel.platform import Platform
+
+    if Platform.get().is_hopper_plus:
+        assert lm_head.weight.dtype == torch.bfloat16
+        assert isinstance(lm_head.quant_method, HYV4FlashLMHeadFP32Method)
+    else:
+        assert lm_head.weight.dtype == torch.float32
+
+    proc = HYV4FlashLogitsProcessor(cfg, dp_lm_head_tp=False, attn_tp_size=1)
+    assert proc.sampled_shard_dtype(lm_head) == torch.float32
+
+    with torch.no_grad():
+        torch.nn.init.normal_(lm_head.weight, mean=0.0, std=0.05)
+        x = torch.randn(6, 128, device="cuda", dtype=torch.bfloat16)
+        out = lm_head.quant_method.apply(lm_head, x)
+        ref = F.linear(x.float(), lm_head.weight.float())
+        assert out.dtype == torch.float32
+        torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-4)
+
+        empty_out = lm_head.quant_method.apply(lm_head, x[:0])
+        assert empty_out.shape == (0, 256)
+        assert empty_out.dtype == torch.float32
+
+        # Verify DFly._project_step_logits routes through HYV4FlashLMHeadFP32Method
+        drafter = object.__new__(DFly)
+        drafter.lm_head = lm_head
+        drafter.logits_processor = None
+        drafter.vocab_size = cfg.vocab_size
+        step_logits = drafter._project_step_logits(x)
+        assert step_logits.dtype == torch.float32
+        torch.testing.assert_close(step_logits, ref, rtol=1e-4, atol=1e-4)

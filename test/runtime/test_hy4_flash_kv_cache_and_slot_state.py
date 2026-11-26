@@ -129,16 +129,22 @@ def test_hybrid_hy4_pool_index_k_views_and_tail_state():
 def test_hy4_router_shared_topk_slots_lifecycle():
     router = Hy4FlashCacheGroupRouter.__new__(Hy4FlashCacheGroupRouter)
     router._hy4_shared_topk_slots = {}
+    router._hy4_shared_topk_lens = {}
 
     t25 = torch.tensor([[0, 1, 2, -1]], dtype=torch.int32)
-    router.record_shared_topk_slots(25, t25)
+    l25 = torch.tensor([3], dtype=torch.int32)
+    router.record_shared_topk_slots(25, t25, l25)
     assert router.get_shared_topk_slots(25) is t25
+    assert router.get_shared_topk_lens(25) is l25
     assert router.get_shared_topk_slots(29) is None
+    assert router.get_shared_topk_lens(29) is None
 
     router.clear_shared_topk_slots_for_layer(25)
     assert router.get_shared_topk_slots(25) is None
+    assert router.get_shared_topk_lens(25) is None
 
     router.record_shared_topk_slots(33, t25)
+    assert router.get_shared_topk_lens(33) is None
     router.clear_shared_topk_slots()
     assert router.get_shared_topk_slots(33) is None
 

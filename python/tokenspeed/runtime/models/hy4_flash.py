@@ -50,6 +50,7 @@ from dataclasses import replace
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel._optional import has_optional_package
 from tokenspeed_kernel.ops.attention import (
     apply_attention_sink,
     attn_merge_state,
@@ -61,13 +62,30 @@ from tokenspeed_kernel.ops.attention.kpool import (
 from tokenspeed_kernel.ops.attention.kpool.hy4_compress import (
     apply_interleaved_rope_last_dim,
     compute_hy4_mrope_cos_sin,
+    hy4_apply_interleaved_rope_inplace,
+    hy4_kpool_decode_update_and_gather,
+    hy4_kpool_finalize_rope_store,
+    hy4_kpool_project_finalize_rope_store,
+    hy4_kv_latent_norm_and_rope_inplace,
     hy4_pool_group_keys,
-    hy4_quantize_and_store_index_k,
+    hy4_split_qkv_indexer_norm_rope,
 )
 from tokenspeed_kernel.ops.attention.mla import mla_project_value
-from tokenspeed_kernel.ops.attention.prologue import MLAExpandedKV
-from tokenspeed_kernel.ops.gemm import bmm
-from tokenspeed_kernel.ops.residual import ihc_head, ihc_post, ihc_pre
+from tokenspeed_kernel.ops.attention.prologue import (
+    KVCacheFormat,
+    LatentKVCache,
+    MLAExpandedKV,
+)
+from tokenspeed_kernel.ops.gemm import bmm, mm
+from tokenspeed_kernel.ops.gemm._triton.gemv import triton_rowcta_gemm_fp32
+from tokenspeed_kernel.ops.gemm.triton_skinny import skinny_mm, skinny_mm_supported
+from tokenspeed_kernel.ops.model.hy4_flash.fusion import (
+    hy4_sigmoid_bias_topk,
+    hy4_sigmoid_gate_quantize_fp8,
+    hy4_split_routed_and_shared_swiglu,
+)
+from tokenspeed_kernel.ops.residual import ihc_head, ihc_post, ihc_post_and_pre, ihc_pre
+from tokenspeed_kernel.platform import Platform, pdl_enabled
 from torch import nn
 
 from tokenspeed.runtime.configs.hy4_flash_config import (
@@ -79,6 +97,7 @@ from tokenspeed.runtime.configs.hy4_flash_config import (
 )
 from tokenspeed.runtime.configs.model_config import configure_dsa_attention
 from tokenspeed.runtime.configs.model_profile import ModelProfile
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
@@ -96,6 +115,7 @@ from tokenspeed.runtime.layers.attention.configs.hy4_flash import (
 from tokenspeed.runtime.layers.attention.kv_cache.hybrid_hy4_flash import (
     HybridHy4FlashTokenToKVPool,
 )
+from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -103,6 +123,7 @@ from tokenspeed.runtime.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
 from tokenspeed.runtime.layers.mlp import gated_activation
 from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
@@ -117,6 +138,7 @@ from tokenspeed.runtime.layers.paged_attention import (
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
+    UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
 from tokenspeed.runtime.model_loader.weight_utils import (
@@ -133,6 +155,7 @@ from tokenspeed.runtime.models.hy4_flash_vision import HYV4FlashVisionTower
 from tokenspeed.runtime.multimodal.embedder import EncoderSpec, VisionEmbedder
 from tokenspeed.runtime.multimodal.inputs import Modality
 from tokenspeed.runtime.utils import add_prefix
+from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = logging.getLogger(__name__)
 
@@ -201,6 +224,69 @@ def _linear_cpu_or_cuda(layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
     return F.linear(x, w, bias)
 
 
+def _is_unquantized_no_bias_linear(layer: nn.Module) -> bool:
+    """Return True when ``layer`` is a bias-free dense 16/32-bit projection."""
+    weight = getattr(layer, "weight", None)
+    if weight is None or weight.ndim != 2:
+        return False
+    return (
+        weight.dtype in (torch.bfloat16, torch.float16, torch.float32)
+        and getattr(layer, "bias", None) is None
+    )
+
+
+def _o_proj_fp8_block_mode(layer: nn.Module) -> tuple[bool, bool]:
+    """Return ``(supports_fused_fp8_gate, use_mn_major_tma)`` for an ``o_proj``."""
+    qm = getattr(layer, "quant_method", None)
+    if not isinstance(qm, Fp8LinearMethod) or not qm.block_quant:
+        return False, False
+    if tuple(qm.quant_config.weight_block_size) != (128, 128):
+        return False, False
+    weight = getattr(layer, "weight", None)
+    scale_inv = getattr(layer, "weight_scale_inv", None)
+    if (
+        weight is None
+        or scale_inv is None
+        or not weight.is_cuda
+        or weight.dtype != torch.float8_e4m3fn
+        or scale_inv.dtype != torch.float32
+        or weight.shape[1] % 128 != 0
+    ):
+        return False, False
+    solution = qm._get_block_solution()
+    use_mn_major = solution == "trtllm_cutedsl" or (
+        solution == "deepgemm" and Platform.get().is_hopper
+    )
+    return True, use_mn_major
+
+
+def _enable_hopper_deepgemm(module: nn.Module) -> None:
+    """Opt Hy4-flash block-128x128 FP8 linears into Hopper SM90 DeepGEMM when auto."""
+    if (
+        not Platform.get().is_hopper
+        or not has_optional_package("deep_gemm")
+        or global_server_args_dict["dense_gemm_backend"] != "auto"
+    ):
+        return
+    for sub in module.modules():
+        qm = getattr(sub, "quant_method", None)
+        if not isinstance(qm, Fp8LinearMethod) or not qm.block_quant:
+            continue
+        if tuple(qm.quant_config.weight_block_size) != (128, 128):
+            continue
+        weight = getattr(sub, "weight", None)
+        if (
+            weight is None
+            or not weight.is_cuda
+            or weight.dtype != torch.float8_e4m3fn
+            or weight.ndim != 2
+        ):
+            continue
+        n, k = weight.shape
+        if n % 64 == 0 and k % 128 == 0:
+            qm.block_solution = "deepgemm"
+
+
 # ===----------------------------------------------------------------------=== #
 # Independent Hyper-Connections (iHC)
 # ===----------------------------------------------------------------------=== #
@@ -235,8 +321,14 @@ class HYV4FlashHyperConnection(nn.Module):
         self.rms_norm_eps = config.rms_norm_eps
         self.hc_pre = HYV4FlashHyperPre(config.hc_mult, config.hidden_size)
 
-    def pre(self, hidden_streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Collapse ``[T, M, H]`` streams into ``(post_coeff [T, M], branch_in [T, H])``."""
+    def pre(
+        self,
+        hidden_streams: torch.Tensor,
+        *,
+        norm: RMSNorm | None = None,
+        return_fp8_mn_major: bool = False,
+    ):
+        """Collapse ``[T, M, H]`` streams into ``(post_coeff [T, M], branch_in [T, H](, q_fp8, q_scale))``."""
         return ihc_pre(
             hidden_streams,
             self.hc_pre.hc_fn,
@@ -245,6 +337,9 @@ class HYV4FlashHyperConnection(nn.Module):
             hc_eps=self.hc_eps,
             hc_magnitude=self.hc_magnitude,
             rms_norm_eps=self.rms_norm_eps,
+            norm_weight=norm.weight if norm is not None else None,
+            norm_eps=norm.variance_epsilon if norm is not None else None,
+            return_fp8_mn_major=return_fp8_mn_major,
         )
 
     def post(
@@ -252,9 +347,50 @@ class HYV4FlashHyperConnection(nn.Module):
         hidden_streams: torch.Tensor,
         branch_output: torch.Tensor,
         post_coeff: torch.Tensor,
+        *,
+        inplace: bool = False,
+        norm: RMSNorm | None = None,
     ) -> torch.Tensor:
-        """Broadcast-add ``branch_output [T, H]`` back into ``hidden_streams [T, M, H]``."""
-        return ihc_post(hidden_streams, branch_output, post_coeff)
+        """Broadcast-add (optionally RMS-normed) ``branch_output [T, H]`` into ``hidden_streams``."""
+        return ihc_post(
+            hidden_streams,
+            branch_output,
+            post_coeff,
+            inplace=inplace,
+            norm_weight=norm.weight if norm is not None else None,
+            norm_eps=norm.variance_epsilon if norm is not None else 1e-5,
+        )
+
+    def post_into_next_pre(
+        self,
+        hidden_streams: torch.Tensor,
+        branch_output: torch.Tensor,
+        post_coeff: torch.Tensor,
+        next_hc: HYV4FlashHyperConnection,
+        *,
+        inplace: bool = False,
+        post_norm: RMSNorm | None = None,
+        pre_norm: RMSNorm | None = None,
+        return_fp8_mn_major: bool = False,
+    ):
+        """Fuse this sublayer's iHC post update with ``next_hc``'s pre collapse."""
+        return ihc_post_and_pre(
+            hidden_streams,
+            branch_output,
+            post_coeff,
+            next_hc.hc_pre.hc_fn,
+            next_hc.hc_pre.hc_scale,
+            next_hc.hc_pre.hc_base,
+            inplace=inplace,
+            post_norm_weight=post_norm.weight if post_norm is not None else None,
+            post_norm_eps=post_norm.variance_epsilon if post_norm is not None else 1e-5,
+            hc_eps=next_hc.hc_eps,
+            hc_magnitude=next_hc.hc_magnitude,
+            rms_norm_eps=next_hc.rms_norm_eps,
+            pre_norm_weight=pre_norm.weight if pre_norm is not None else None,
+            pre_norm_eps=pre_norm.variance_epsilon if pre_norm is not None else None,
+            return_fp8_mn_major=return_fp8_mn_major,
+        )
 
 
 class HYV4FlashHyperHead(nn.Module):
@@ -383,27 +519,99 @@ class HYV4FlashCompressedIndexer(nn.Module):
         self._decode_topk_workspace: torch.Tensor | None = None
         self._decode_topk_lens_workspace: torch.Tensor | None = None
         self._retired_decode_workspaces: list[torch.Tensor] = []
+        self._packed_val_gate_weight: torch.Tensor | None = None
+        self._packed_val_gate_weight_t: torch.Tensor | None = None
+
+    def prepare_pooling_weights(self) -> None:
+        """Pack FP32 value and gate pooling weights into one [2*D, D] matrix (and [D, 2*D] transpose)."""
+        self._packed_val_gate_weight = torch.cat(
+            (
+                self.key_value_projection.weight.detach().float(),
+                self.key_gate_projection.weight.detach().float(),
+            ),
+            dim=0,
+        ).contiguous()
+        self._packed_val_gate_weight_t = self._packed_val_gate_weight.t().contiguous()
 
     def _rotate_trailing(
         self,
         tensor: torch.Tensor,
         positions_3d: torch.Tensor,
+        *,
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Apply interleaved 3D M-RoPE to the trailing ``qk_rope_head_dim`` channels."""
-        cos, sin = compute_hy4_mrope_cos_sin(
-            positions_3d, self.inv_freq, self.mrope_section
+        if rope_cos_sin is not None:
+            cos_cast, sin_cast = rope_cos_sin
+        else:
+            cos, sin = compute_hy4_mrope_cos_sin(
+                positions_3d, self.inv_freq, self.mrope_section
+            )
+            # Match HF rotary embedding dtype rounding before FP32 rotation.
+            cos_cast = cos.to(tensor.dtype)
+            sin_cast = sin.to(tensor.dtype)
+        return hy4_apply_interleaved_rope_inplace(tensor, cos_cast, sin_cast)
+
+    def _pool_rotate_and_store(
+        self,
+        grouped_token_keys: torch.Tensor,
+        group_pos: torch.Tensor,
+        write_slots: torch.Tensor,
+        index_values: torch.Tensor,
+        index_scales: torch.Tensor,
+    ) -> None:
+        """Run fused [w_val; w_gate] projection + softmax/norm/M-RoPE/FP8 scatter."""
+        num_groups, kpool, head_dim = grouped_token_keys.shape
+        if num_groups == 0:
+            return
+        packed_wt = self._packed_val_gate_weight_t
+        if (
+            grouped_token_keys.is_cuda
+            and packed_wt is not None
+            and packed_wt.device == grouped_token_keys.device
+            and kpool == 4
+            and head_dim == 128
+        ):
+            hy4_kpool_project_finalize_rope_store(
+                grouped_token_keys,
+                packed_wt,
+                self.intra_group_ape,
+                self.key_norm.weight,
+                group_pos,
+                self.inv_freq,
+                self.mrope_section,
+                write_slots,
+                index_values,
+                index_scales,
+                eps=self.rms_norm_eps,
+            )
+            return
+        packed_w = self._packed_val_gate_weight
+        if packed_w is None or packed_w.device != grouped_token_keys.device:
+            packed_w = torch.cat(
+                (
+                    self.key_value_projection.weight.float(),
+                    self.key_gate_projection.weight.float(),
+                ),
+                dim=0,
+            )
+        val_gate = F.linear(
+            grouped_token_keys.reshape(num_groups * kpool, head_dim).float(),
+            packed_w,
+        ).view(num_groups, kpool, 2 * head_dim)
+        hy4_kpool_finalize_rope_store(
+            val_gate,
+            self.intra_group_ape,
+            self.key_norm.weight,
+            group_pos,
+            self.inv_freq,
+            self.mrope_section,
+            write_slots,
+            index_values,
+            index_scales,
+            orig_dtype=grouped_token_keys.dtype,
+            eps=self.rms_norm_eps,
         )
-        # Match HF rotary embedding dtype rounding before FP32 rotation.
-        cos_cast = cos.to(tensor.dtype)
-        sin_cast = sin.to(tensor.dtype)
-        if tensor.ndim == 3:
-            cos_cast = cos_cast.unsqueeze(1)
-            sin_cast = sin_cast.unsqueeze(1)
-        nope = tensor[..., : self.nope_dim]
-        rot = apply_interleaved_rope_last_dim(
-            tensor[..., self.nope_dim :], cos_cast, sin_cast
-        )
-        return torch.cat((nope, rot), dim=-1)
 
     def pool_groups(self, grouped_token_keys: torch.Tensor) -> torch.Tensor:
         """Pool ``[G, index_kpool, head_dim]`` normalized token keys into ``[G, head_dim]``."""
@@ -425,17 +633,34 @@ class HYV4FlashCompressedIndexer(nn.Module):
         hidden_states: torch.Tensor,
         q_resid: torch.Tensor,
         positions_3d: torch.Tensor,
+        *,
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
+        head_weights: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         num_tokens = hidden_states.shape[0]
-        query = _linear_cpu_or_cuda(self.query_projection, q_resid).view(
-            num_tokens, self.n_heads, self.head_dim
-        )
-        query = self._rotate_trailing(query, positions_3d)
-        weights = (
-            _linear_cpu_or_cuda(self.head_weight_projection, hidden_states).float()
-            * self.weights_scale
-        )
-        return query, weights
+        if (
+            q_resid.is_cuda
+            and num_tokens <= 16
+            and _is_unquantized_no_bias_linear(self.query_projection)
+            and skinny_mm_supported(q_resid, self.query_projection.weight)
+        ):
+            query_flat = skinny_mm(
+                q_resid,
+                self.query_projection.weight,
+                None,
+                out_dtype=q_resid.dtype,
+                compact_m=True,
+            )
+        else:
+            query_flat = _linear_cpu_or_cuda(self.query_projection, q_resid)
+        query = query_flat.view(num_tokens, self.n_heads, self.head_dim)
+        query = self._rotate_trailing(query, positions_3d, rope_cos_sin=rope_cos_sin)
+        if head_weights is None:
+            head_weights = (
+                _linear_cpu_or_cuda(self.head_weight_projection, hidden_states).float()
+                * self.weights_scale
+            )
+        return query, head_weights
 
     def _get_decode_workspaces(
         self,
@@ -543,10 +768,9 @@ class HYV4FlashCompressedIndexer(nn.Module):
                 0, 1
             )  # [3, G]
 
-            pooled = self.pool_groups(grouped)
-            pooled = self._rotate_trailing(pooled, group_pos)
-            hy4_quantize_and_store_index_k(
-                pooled,
+            self._pool_rotate_and_store(
+                grouped,
+                group_pos,
                 plan.pool_write_slots,
                 index_values,
                 index_scales,
@@ -606,73 +830,38 @@ class HYV4FlashCompressedIndexer(nn.Module):
         kpool_rt = dsa_leaf.require_kpool_runtime()
         metadata = dsa_leaf.forward_decode_metadata
         row_start = int(metadata.num_extends or 0)
-        seq_lens = metadata.seq_lens_k[row_start : row_start + num_reqs].to(torch.int64)
-        index_table = dsa_leaf.kpool_decode_page_table(row_start, num_reqs).to(
-            torch.int64
-        )
+        seq_lens = metadata.seq_lens_k[row_start : row_start + num_reqs]
+        index_table = dsa_leaf.kpool_decode_page_table(row_start, num_reqs)
         request_slots = kpool_rt.req_pool_indices
         if request_slots is None:
             raise RuntimeError("Hy4-flash KPool decode requires request-pool indices")
-        req_slots = request_slots[row_start : row_start + num_reqs].to(torch.int64)
+        req_slots = request_slots[row_start : row_start + num_reqs]
 
         index_k_buf, tail_token_keys, group_pos0 = pool.get_hy4_kpool_buffers(
             self.layer_id
         )
         index_values, index_scales = pool.index_k_block_views(index_k_buf)
-        index_rows_per_page = index_values.shape[1]
-        kpool = self.index_kpool
-        tail_width = tail_token_keys.shape[1]
-
-        keys_view = token_keys.view(num_reqs, q_len_per_req, self.head_dim)
-        pos_view = positions_3d.view(3, num_reqs, q_len_per_req)
-        group_offsets = torch.arange(kpool, dtype=torch.int64, device=token_keys.device)
-        req_arange = torch.arange(num_reqs, dtype=torch.int64, device=token_keys.device)
-
-        for step in range(q_len_per_req):
-            tok_pos = (seq_lens - q_len_per_req + step).clamp_min(0)
-            valid_tok = (seq_lens - q_len_per_req + step) >= 0
-            tail_col = torch.remainder(tok_pos, tail_width)
-            step_keys = keys_view[:, step, :].to(tail_token_keys.dtype)
-            # Only overwrite valid slots; padded graph rows have seq_len <= 0.
-            existing = tail_token_keys[req_slots, tail_col]
-            tail_token_keys[req_slots, tail_col] = torch.where(
-                valid_tok.unsqueeze(1), step_keys, existing
+        out_grouped, out_group_pos, out_write_slots = (
+            hy4_kpool_decode_update_and_gather(
+                token_keys,
+                positions_3d,
+                seq_lens,
+                req_slots,
+                index_table,
+                tail_token_keys,
+                group_pos0,
+                index_rows_per_page=index_values.shape[1],
+                kpool=self.index_kpool,
+                q_len_per_req=q_len_per_req,
             )
-
-            is_group_start = valid_tok & (torch.remainder(tok_pos, kpool) == 0)
-            step_pos = pos_view[:, :, step].transpose(0, 1)  # [num_reqs, 3]
-            group_pos0[req_slots] = torch.where(
-                is_group_start.unsqueeze(1), step_pos, group_pos0[req_slots]
-            )
-
-            is_group_end = valid_tok & (torch.remainder(tok_pos, kpool) == (kpool - 1))
-            group_base = tok_pos - (kpool - 1)
-            gather_cols = torch.remainder(
-                group_base.unsqueeze(1) + group_offsets.unsqueeze(0), tail_width
-            )
-            grouped = tail_token_keys[req_slots.unsqueeze(1), gather_cols]  # [R, 4, D]
-            pooled = self.pool_groups(grouped)
-            pooled = self._rotate_trailing(
-                pooled, group_pos0[req_slots].transpose(0, 1)
-            )
-
-            pool_ids = torch.div(tok_pos, kpool, rounding_mode="floor")
-            table_cols = torch.div(
-                pool_ids, index_rows_per_page, rounding_mode="floor"
-            ).clamp(min=0, max=index_table.shape[1] - 1)
-            write_pages = index_table[req_arange, table_cols]
-            raw_slots = write_pages * index_rows_per_page + torch.remainder(
-                pool_ids, index_rows_per_page
-            )
-            masked_slots = torch.where(
-                is_group_end, raw_slots, torch.full_like(raw_slots, -1)
-            )
-            hy4_quantize_and_store_index_k(
-                pooled,
-                masked_slots,
-                index_values,
-                index_scales,
-            )
+        )
+        self._pool_rotate_and_store(
+            out_grouped,
+            out_group_pos,
+            out_write_slots,
+            index_values,
+            index_scales,
+        )
 
     def select_prefill(
         self,
@@ -683,10 +872,14 @@ class HYV4FlashCompressedIndexer(nn.Module):
         ctx: ForwardContext,
         dsa_leaf: Hy4FlashDSABackend,
         num_prefill_tokens: int,
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
+        token_keys: torch.Tensor | None = None,
+        head_weights: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int] | None:
         """Update prefill index cache and select top-k slots when context > ``index_topk``."""
         del num_prefill_tokens
-        token_keys = self._project_token_keys(hidden_states)
+        if token_keys is None:
+            token_keys = self._project_token_keys(hidden_states)
         self.write_prefill_cache(
             token_keys=token_keys,
             positions_3d=positions_3d,
@@ -707,7 +900,11 @@ class HYV4FlashCompressedIndexer(nn.Module):
             return None
 
         query, weights = self._project_queries_and_weights(
-            hidden_states, q_resid, positions_3d
+            hidden_states,
+            q_resid,
+            positions_3d,
+            rope_cos_sin=rope_cos_sin,
+            head_weights=head_weights,
         )
         kpool_rt = dsa_leaf.require_kpool_runtime()
         shared_plan = kpool_rt.prefill_plan
@@ -756,9 +953,13 @@ class HYV4FlashCompressedIndexer(nn.Module):
         dsa_leaf: Hy4FlashDSABackend,
         num_reqs: int,
         q_len_per_req: int,
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
+        token_keys: torch.Tensor | None = None,
+        head_weights: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Update decode index cache and return ``(topk_slots, topk_lens)``."""
-        token_keys = self._project_token_keys(hidden_states)
+        if token_keys is None:
+            token_keys = self._project_token_keys(hidden_states)
         self.write_decode_cache(
             token_keys=token_keys,
             positions_3d=positions_3d,
@@ -768,11 +969,17 @@ class HYV4FlashCompressedIndexer(nn.Module):
             q_len_per_req=q_len_per_req,
         )
         query, weights = self._project_queries_and_weights(
-            hidden_states, q_resid, positions_3d
+            hidden_states,
+            q_resid,
+            positions_3d,
+            rope_cos_sin=rope_cos_sin,
+            head_weights=head_weights,
         )
         metadata = dsa_leaf.forward_decode_metadata
         row_start = int(metadata.num_extends or 0)
-        seq_lens = metadata.seq_lens_k[row_start : row_start + num_reqs].to(torch.int32)
+        seq_lens = metadata.seq_lens_k[row_start : row_start + num_reqs]
+        if seq_lens.dtype != torch.int32:
+            seq_lens = seq_lens.to(torch.int32)
         history_table = dsa_leaf.kpool_decode_page_table(row_start, num_reqs)
         pool = ctx.token_to_kv_pool
         index_cache = pool.get_index_k_buffer(self.layer_id)
@@ -786,9 +993,9 @@ class HYV4FlashCompressedIndexer(nn.Module):
             memory_saver_adapter=pool.arena.memory_saver_adapter,
         )
         kpool_decode_topk(
-            query.to(torch.bfloat16).contiguous(),
+            query if query.dtype == torch.bfloat16 else query.to(torch.bfloat16),
             index_cache,
-            weights.contiguous(),
+            weights,
             seq_lens,
             history_table,
             history_table,
@@ -1038,10 +1245,56 @@ class HYV4FlashAttention(nn.Module):
 
         self.w_kc: torch.Tensor | None = None
         self.w_vc: torch.Tensor | None = None
+        self._packed_in_proj_weight: torch.Tensor | None = None
+        self._packed_includes_indexer: bool = False
 
     def prepare_absorbed_mla_weights(self) -> None:
         """Derive ``w_kc`` and ``w_vc`` from ``kv_b_proj`` for absorbed MLA decode/DSA."""
         absorb_mla_kv_b_proj(self)
+
+    def prepare_packed_bf16_projections(self) -> None:
+        """Pack co-input bias-free BF16 projections into one contiguous GEMM matrix.
+
+        SWA layers pack ``[q_a_proj; kv_a_proj_with_mqa]`` (``[1600, D]``);
+        DSA layers additionally pack ``[token_key_projection; head_weight_projection]``
+        (``[1744, D]``) so one GEMM + one fused Triton epilogue replaces up to
+        4 small GEMMs and 4 normalization/RoPE launches.
+        """
+        if not (
+            _is_unquantized_no_bias_linear(self.q_a_proj)
+            and _is_unquantized_no_bias_linear(self.kv_a_proj_with_mqa)
+        ):
+            self._packed_in_proj_weight = None
+            self._packed_includes_indexer = False
+            return
+        parts = [
+            self.q_a_proj.weight.detach(),
+            self.kv_a_proj_with_mqa.weight.detach(),
+        ]
+        include_indexer = (
+            self.compressed_indexer is not None
+            and _is_unquantized_no_bias_linear(
+                self.compressed_indexer.token_key_projection
+            )
+            and _is_unquantized_no_bias_linear(
+                self.compressed_indexer.head_weight_projection
+            )
+            and self.compressed_indexer.token_key_projection.weight.dtype
+            == parts[0].dtype
+            and self.compressed_indexer.head_weight_projection.weight.dtype
+            == parts[0].dtype
+        )
+        if include_indexer and self.compressed_indexer is not None:
+            parts.append(self.compressed_indexer.token_key_projection.weight.detach())
+            parts.append(self.compressed_indexer.head_weight_projection.weight.detach())
+        if all(
+            p.dtype == parts[0].dtype and p.device == parts[0].device for p in parts
+        ):
+            self._packed_in_proj_weight = torch.cat(parts, dim=0).contiguous()
+            self._packed_includes_indexer = include_indexer
+        else:
+            self._packed_in_proj_weight = None
+            self._packed_includes_indexer = False
 
     def _ensure_absorbed_weights(self) -> None:
         if self.w_kc is None or self.w_vc is None:
@@ -1058,6 +1311,8 @@ class HYV4FlashAttention(nn.Module):
     def _absorb_query(
         self,
         q: torch.Tensor,
+        *,
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         self._ensure_absorbed_weights()
         q_view = q.view(-1, self.num_local_heads, self.qk_head_dim)
@@ -1073,6 +1328,15 @@ class HYV4FlashAttention(nn.Module):
             dtype=q_nope.dtype,
             device=q_nope.device,
         )
+        # Emit out-of-place RoPE on q_pe BEFORE the cuBLAS bmm on q_nope so the
+        # Triton RoPE kernel overlaps with the preceding PDL q_b_proj GEMM.
+        if rope_cos_sin is not None and q_nope.shape[0] > 0:
+            hy4_apply_interleaved_rope_inplace(
+                q_pe,
+                rope_cos_sin[0],
+                rope_cos_sin[1],
+                out=absorbed[..., self.kv_lora_rank :],
+            )
         if q_nope.shape[0] > 0:
             bmm(
                 q_nope.transpose(0, 1),
@@ -1207,6 +1471,9 @@ class HYV4FlashAttention(nn.Module):
         ctx: ForwardContext,
         leaf: Hy4FlashDSABackend,
         slots: torch.Tensor,
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
+        token_keys: torch.Tensor | None = None,
+        head_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run DSA prefill: dense MLA when context <= ``index_topk``, sparse otherwise."""
         assert self.compressed_indexer is not None
@@ -1217,6 +1484,9 @@ class HYV4FlashAttention(nn.Module):
             ctx=ctx,
             dsa_leaf=leaf,
             num_prefill_tokens=hidden_states.shape[0],
+            rope_cos_sin=rope_cos_sin,
+            token_keys=token_keys,
+            head_weights=head_weights,
         )
         num_tokens = q.shape[0]
         sinks = self.learnable_sink_param
@@ -1235,7 +1505,9 @@ class HYV4FlashAttention(nn.Module):
 
         selected_slots, topk_lens, kv_seq_lens, max_seq_len = selected
         if isinstance(ctx.attn_backend, Hy4FlashCacheGroupRouter):
-            ctx.attn_backend.record_shared_topk_slots(self.layer_id, selected_slots)
+            ctx.attn_backend.record_shared_topk_slots(
+                self.layer_id, selected_slots, topk_lens
+            )
 
         absorbed_q, q_pe = self._absorb_query(q)
         rotated_q = self.attn_mqa.latent_prologue(
@@ -1274,30 +1546,42 @@ class HYV4FlashAttention(nn.Module):
         self,
         *,
         hidden_states: torch.Tensor,
-        q_resid: torch.Tensor,
+        q_resid: torch.Tensor | None,
         q: torch.Tensor,
-        latent_cache: torch.Tensor,
+        latent_cache: torch.Tensor | None,
         positions: torch.Tensor,
         positions_3d: torch.Tensor,
         ctx: ForwardContext,
         leaf: Hy4FlashDSABackend | Hy4FlashSWABackend,
         slots: torch.Tensor,
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
+        token_keys: torch.Tensor | None = None,
+        head_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run absorbed MLA decode (and multi-token verify) for DSA or SWA."""
         num_tokens = q.shape[0]
         num_reqs = ctx.bs
         q_len_per_req = num_tokens // max(num_reqs, 1)
-        absorbed_q, q_pe = self._absorb_query(q)
-        rotated_q = self.attn_mqa.latent_prologue(
-            absorbed_q,
-            q_pe,
-            latent_cache,
-            positions,
-            ctx,
-            slots=slots,
-            expanded=None,
-            key_rows=None,
-        ).query
+        if latent_cache is None:
+            # Fast decode path: KV latent+k_pe were scattered directly into the
+            # KV cache inside hy4_split_qkv_indexer_norm_rope; rotate q_pe
+            # straight into absorbed_q[..., kv_lora_rank:] before k_b_proj bmm
+            # to overlap with the preceding PDL q_b_proj GEMM.
+            assert rope_cos_sin is not None
+            absorbed_q, _ = self._absorb_query(q, rope_cos_sin=rope_cos_sin)
+            rotated_q = absorbed_q
+        else:
+            absorbed_q, q_pe = self._absorb_query(q)
+            rotated_q = self.attn_mqa.latent_prologue(
+                absorbed_q,
+                q_pe,
+                latent_cache,
+                positions,
+                ctx,
+                slots=slots,
+                expanded=None,
+                key_rows=None,
+            ).query
 
         decode_kwargs: dict[str, object] = {
             "sinks": self.learnable_sink_param,
@@ -1313,9 +1597,14 @@ class HYV4FlashAttention(nn.Module):
                 dsa_leaf=leaf,
                 num_reqs=num_reqs,
                 q_len_per_req=q_len_per_req,
+                rope_cos_sin=rope_cos_sin,
+                token_keys=token_keys,
+                head_weights=head_weights,
             )
             if isinstance(ctx.attn_backend, Hy4FlashCacheGroupRouter):
-                ctx.attn_backend.record_shared_topk_slots(self.layer_id, topk_slots)
+                ctx.attn_backend.record_shared_topk_slots(
+                    self.layer_id, topk_slots, topk_lens
+                )
             decode_kwargs["topk_indices"] = topk_slots
             decode_kwargs["topk_lens"] = topk_lens
 
@@ -1432,45 +1721,155 @@ class HYV4FlashAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext | None,
+        *,
+        positions_3d: torch.Tensor | None = None,
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
+        prequant_hidden: tuple[torch.Tensor, torch.Tensor] | None = None,
+        skip_post_norm: bool = False,
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
         if ctx is None or not hidden_states.is_cuda:
-            return self.forward_eager_single_seq(hidden_states, positions)
+            out = self.forward_eager_single_seq(hidden_states, positions)
+            return out
 
-        positions_3d = _normalize_positions_3d(positions)
-        gate_states = self.linear_gate(hidden_states)[0]
-        q_resid = self.q_a_layernorm(self.q_a_proj(hidden_states)[0])
-        q = self.q_b_proj(q_resid)[0]
-        raw_latent = self.kv_a_proj_with_mqa(hidden_states)[0]
-        cos, sin = compute_hy4_mrope_cos_sin(
-            positions_3d, self.rope_inv_freq, self.mrope_section
-        )
-        cos_cast = cos.to(q.dtype)
-        sin_cast = sin.to(q.dtype)
-        q_view = q.view(-1, self.num_local_heads, self.qk_head_dim)
-        q_view[..., self.qk_nope_head_dim :].copy_(
-            apply_interleaved_rope_last_dim(
-                q_view[..., self.qk_nope_head_dim :],
-                cos_cast.unsqueeze(1),
-                sin_cast.unsqueeze(1),
+        if positions_3d is None:
+            positions_3d = _normalize_positions_3d(positions)
+        if rope_cos_sin is None:
+            cos, sin = compute_hy4_mrope_cos_sin(
+                positions_3d, self.rope_inv_freq, self.mrope_section
             )
-        )
-        k_rot = apply_interleaved_rope_last_dim(
-            raw_latent[..., self.kv_lora_rank :],
-            cos_cast,
-            sin_cast,
-        )
-        latent_cache = torch.cat(
-            (
-                self.kv_a_layernorm(raw_latent[..., : self.kv_lora_rank]),
-                k_rot,
-            ),
-            dim=-1,
-        ).contiguous()
+            cos_cast = cos.to(hidden_states.dtype).contiguous()
+            sin_cast = sin.to(hidden_states.dtype).contiguous()
+            rope_cos_sin = (cos_cast, sin_cast)
+        else:
+            cos_cast, sin_cast = rope_cos_sin
 
+        if prequant_hidden is not None:
+            gate_states = self.linear_gate(
+                prequant_hidden[0],
+                block_scale=prequant_hidden[1],
+                output_dtype=hidden_states.dtype,
+            )[0]
+        else:
+            gate_states = self.linear_gate(hidden_states)[0]
         leaf = self._resolve_leaf(ctx)
         router = ctx.attn_backend
+        decode_slots: torch.Tensor | None = None
+        direct_kv_cache: torch.Tensor | None = None
+        direct_kv_slots: torch.Tensor | None = None
+        if ctx.forward_mode.is_decode():
+            decode_slots = router.write_locations(self.attn_mqa, ForwardMode.DECODE)
+            if self.attn_mqa.rotary_emb is None:
+                cand_target = self.attn_mqa._local_target(decode_slots, ctx)
+                if (
+                    isinstance(cand_target, LatentKVCache)
+                    and cand_target.format is KVCacheFormat.NATIVE
+                    and not cand_target.sanitize
+                    and cand_target.write_mask is None
+                    and isinstance(cand_target.kv_cache, torch.Tensor)
+                    and cand_target.kv_cache.dtype == hidden_states.dtype
+                    and cand_target.kv_cache.stride(-1) == 1
+                    and cand_target.slots.numel() == hidden_states.shape[0]
+                ):
+                    direct_kv_cache = cand_target.kv_cache
+                    direct_kv_slots = cand_target.slots
+
+        pre_token_keys: torch.Tensor | None = None
+        pre_head_weights: torch.Tensor | None = None
+        packed_w = self._packed_in_proj_weight
+        if (
+            packed_w is not None
+            and packed_w.device == hidden_states.device
+            and packed_w.dtype == hidden_states.dtype
+        ):
+            if skinny_mm_supported(hidden_states, packed_w):
+                packed_out = skinny_mm(
+                    hidden_states,
+                    packed_w,
+                    None,
+                    out_dtype=hidden_states.dtype,
+                    compact_m=True,
+                )
+            else:
+                packed_out = F.linear(hidden_states, packed_w)
+            idx = self.compressed_indexer if self._packed_includes_indexer else None
+            q_b_fp8, q_b_mn = _o_proj_fp8_block_mode(self.q_b_proj)
+            if q_b_fp8 and q_b_mn:
+                (
+                    q_resid,
+                    latent_cache,
+                    pre_token_keys,
+                    pre_head_weights,
+                    q_fp8,
+                    q_scale,
+                ) = hy4_split_qkv_indexer_norm_rope(
+                    packed_out,
+                    self.q_a_layernorm.weight,
+                    self.kv_a_layernorm.weight,
+                    cos_cast,
+                    sin_cast,
+                    q_eps=self.q_a_layernorm.variance_epsilon,
+                    kv_eps=self.kv_a_layernorm.variance_epsilon,
+                    tk_norm_weight=(
+                        idx.token_key_norm.weight if idx is not None else None
+                    ),
+                    tk_eps=(
+                        idx.token_key_norm.variance_epsilon if idx is not None else 1e-5
+                    ),
+                    hw_dim=idx.n_heads if idx is not None else 0,
+                    weights_scale=idx.weights_scale if idx is not None else 1.0,
+                    quantize_q_fp8_mn_major=True,
+                    write_q_bf16=self.is_indexed,
+                    kv_cache_out=direct_kv_cache,
+                    kv_slots=direct_kv_slots,
+                )
+                q = self.q_b_proj(
+                    q_fp8,
+                    block_scale=q_scale,
+                    output_dtype=hidden_states.dtype,
+                )[0]
+            else:
+                q_resid, latent_cache, pre_token_keys, pre_head_weights = (
+                    hy4_split_qkv_indexer_norm_rope(
+                        packed_out,
+                        self.q_a_layernorm.weight,
+                        self.kv_a_layernorm.weight,
+                        cos_cast,
+                        sin_cast,
+                        q_eps=self.q_a_layernorm.variance_epsilon,
+                        kv_eps=self.kv_a_layernorm.variance_epsilon,
+                        tk_norm_weight=(
+                            idx.token_key_norm.weight if idx is not None else None
+                        ),
+                        tk_eps=(
+                            idx.token_key_norm.variance_epsilon
+                            if idx is not None
+                            else 1e-5
+                        ),
+                        hw_dim=idx.n_heads if idx is not None else 0,
+                        weights_scale=idx.weights_scale if idx is not None else 1.0,
+                        kv_cache_out=direct_kv_cache,
+                        kv_slots=direct_kv_slots,
+                    )
+                )
+                q = self.q_b_proj(q_resid)[0]
+        else:
+            q_resid = self.q_a_layernorm(self.q_a_proj(hidden_states)[0])
+            q = self.q_b_proj(q_resid)[0]
+            raw_latent = self.kv_a_proj_with_mqa(hidden_states)[0]
+            latent_cache = hy4_kv_latent_norm_and_rope_inplace(
+                raw_latent,
+                self.kv_a_layernorm.weight,
+                cos_cast,
+                sin_cast,
+                eps=self.kv_a_layernorm.variance_epsilon,
+            )
+
+        if latent_cache is not None:
+            q_view = q.view(-1, self.num_local_heads, self.qk_head_dim)
+            hy4_apply_interleaved_rope_inplace(q_view, cos_cast, sin_cast)
+
         total_tokens = hidden_states.shape[0]
         if ctx.forward_mode.is_mixed():
             prefill_meta = leaf.chunked_prefill_metadata
@@ -1508,6 +1907,20 @@ class HYV4FlashAttention(nn.Module):
                         ctx=prefill_ctx,
                         leaf=leaf,
                         slots=prefill_slots,
+                        rope_cos_sin=(
+                            cos_cast[:num_prefill_tokens],
+                            sin_cast[:num_prefill_tokens],
+                        ),
+                        token_keys=(
+                            pre_token_keys[:num_prefill_tokens]
+                            if pre_token_keys is not None
+                            else None
+                        ),
+                        head_weights=(
+                            pre_head_weights[:num_prefill_tokens]
+                            if pre_head_weights is not None
+                            else None
+                        ),
                     )
                 else:
                     assert isinstance(leaf, Hy4FlashSWABackend)
@@ -1531,7 +1944,9 @@ class HYV4FlashAttention(nn.Module):
                 decode_slots = router.write_locations(self.attn_mqa, ForwardMode.DECODE)
                 attn_output[num_prefill_tokens:] = self._forward_decode(
                     hidden_states=hidden_states[num_prefill_tokens:],
-                    q_resid=q_resid[num_prefill_tokens:],
+                    q_resid=(
+                        q_resid[num_prefill_tokens:] if q_resid is not None else None
+                    ),
                     q=q[num_prefill_tokens:],
                     latent_cache=latent_cache[num_prefill_tokens:],
                     positions=positions[..., num_prefill_tokens:],
@@ -1539,9 +1954,23 @@ class HYV4FlashAttention(nn.Module):
                     ctx=decode_ctx,
                     leaf=leaf,
                     slots=decode_slots,
+                    rope_cos_sin=(
+                        cos_cast[num_prefill_tokens:],
+                        sin_cast[num_prefill_tokens:],
+                    ),
+                    token_keys=(
+                        pre_token_keys[num_prefill_tokens:]
+                        if pre_token_keys is not None
+                        else None
+                    ),
+                    head_weights=(
+                        pre_head_weights[num_prefill_tokens:]
+                        if pre_head_weights is not None
+                        else None
+                    ),
                 )
         elif ctx.forward_mode.is_decode():
-            decode_slots = router.write_locations(self.attn_mqa, ForwardMode.DECODE)
+            assert decode_slots is not None
             attn_output = self._forward_decode(
                 hidden_states=hidden_states,
                 q_resid=q_resid,
@@ -1552,6 +1981,9 @@ class HYV4FlashAttention(nn.Module):
                 ctx=ctx,
                 leaf=leaf,
                 slots=decode_slots,
+                rope_cos_sin=rope_cos_sin,
+                token_keys=pre_token_keys,
+                head_weights=pre_head_weights,
             )
         else:
             extend_slots = router.write_locations(self.attn_mha, ForwardMode.EXTEND)
@@ -1567,6 +1999,9 @@ class HYV4FlashAttention(nn.Module):
                     ctx=ctx,
                     leaf=leaf,
                     slots=extend_slots,
+                    rope_cos_sin=rope_cos_sin,
+                    token_keys=pre_token_keys,
+                    head_weights=pre_head_weights,
                 )
             else:
                 assert isinstance(leaf, Hy4FlashSWABackend)
@@ -1580,9 +2015,16 @@ class HYV4FlashAttention(nn.Module):
                     window_left=self.window_left,
                 )
 
-        attn_output = attn_output * torch.sigmoid(gate_states)
-        out = self.o_proj(attn_output)[0]
-        return self.post_proj_norm(out)
+        fused_fp8_gate, use_mn_major = _o_proj_fp8_block_mode(self.o_proj)
+        if fused_fp8_gate and attn_output.dtype in (torch.bfloat16, torch.float16):
+            q_fp8, q_scale = hy4_sigmoid_gate_quantize_fp8(
+                attn_output, gate_states, mn_major_tma=use_mn_major
+            )
+            out = self.o_proj(q_fp8, scale=q_scale)[0]
+        else:
+            attn_output = attn_output * torch.sigmoid(gate_states)
+            out = self.o_proj(attn_output)[0]
+        return out if skip_post_norm else self.post_proj_norm(out)
 
 
 # ===----------------------------------------------------------------------=== #
@@ -1605,6 +2047,7 @@ class HYV4FlashMLP(nn.Module):
         rms_norm_eps: float,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        reduce_results: bool = True,
     ) -> None:
         super().__init__()
         if is_shared_expert:
@@ -1630,7 +2073,7 @@ class HYV4FlashMLP(nn.Module):
             intermediate_size,
             hidden_size,
             bias=False,
-            reduce_results=True,
+            reduce_results=reduce_results,
             tp_rank=tp_rank,
             tp_size=tp_size,
             tp_group=tp_group,
@@ -1642,7 +2085,9 @@ class HYV4FlashMLP(nn.Module):
             RMSNorm(hidden_size, eps=rms_norm_eps) if has_post_norm else None
         )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, *, skip_post_norm: bool = False
+    ) -> torch.Tensor:
         if hidden_states.is_cuda:
             gate_up = self.gate_up_proj(hidden_states)[0]
             activated = self.act_fn(gate_up)
@@ -1651,7 +2096,7 @@ class HYV4FlashMLP(nn.Module):
             gate_up = _linear_cpu_or_cuda(self.gate_up_proj, hidden_states)
             gate, up = gate_up.chunk(2, dim=-1)
             out = _linear_cpu_or_cuda(self.down_proj, F.silu(gate) * up)
-        if self.post_fc2_norm is not None:
+        if self.post_fc2_norm is not None and not skip_post_norm:
             out = _apply_hy4_rmsnorm(out, self.post_fc2_norm)
         return out
 
@@ -1677,12 +2122,60 @@ class HYV4FlashTopkRouter(nn.Module):
             torch.zeros(self.num_experts, dtype=torch.float32),
             requires_grad=False,
         )
+        self._bias_fp32: torch.Tensor | None = None
 
-    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def prepare_router_weights(self) -> None:
+        """Cache contiguous FP32 correction bias once at post-load."""
+        self._bias_fp32 = self.e_score_correction_bias.detach().float().contiguous()
+
+    def project_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project ``hidden_states`` to FP32 router logits ``[T, num_experts]``."""
         flat = hidden_states.view(-1, self.hidden_size)
-        router_logits = F.linear(flat.float(), self.weight.float())
+        if (
+            flat.is_cuda
+            and flat.dtype == torch.bfloat16
+            and self.weight.dtype == torch.bfloat16
+            and flat.is_contiguous()
+            and self.weight.is_contiguous()
+        ):
+            # Native BF16xBF16 -> FP32 accumulation eliminates the 386 MB/step
+            # BF16->FP32 weight copy while preserving exact FP32 logits.
+            if flat.shape[0] == 1:
+                return triton_rowcta_gemm_fp32(flat, self.weight)
+            if skinny_mm_supported(flat, self.weight):
+                return skinny_mm(
+                    flat,
+                    self.weight,
+                    None,
+                    out_dtype=torch.float32,
+                    compact_m=True,
+                )
+            return mm(flat, self.weight, out_dtype=torch.float32)
+        return F.linear(flat.float(), self.weight.float())
+
+    def select_topk(
+        self,
+        router_logits: torch.Tensor,
+        *,
+        wait_after_compute: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Select top-k experts and normalized sigmoid weights from FP32 logits."""
+        bias_f32 = self._bias_fp32
+        if bias_f32 is None or bias_f32.device != router_logits.device:
+            bias_f32 = self.e_score_correction_bias.float()
+        if router_logits.is_cuda and not (
+            self.num_group > 1 and self.topk_group < self.num_group
+        ):
+            return hy4_sigmoid_bias_topk(
+                router_logits,
+                bias_f32,
+                top_k=self.top_k,
+                routed_scaling_factor=self.routed_scaling_factor,
+                norm_topk_prob=self.norm_topk_prob,
+                wait_after_compute=wait_after_compute,
+            )
         scores = router_logits.sigmoid()
-        scores_for_choice = scores + self.e_score_correction_bias.float()
+        scores_for_choice = scores + bias_f32
         if self.num_group > 1 and self.topk_group < self.num_group:
             experts_per_group = self.num_experts // self.num_group
             group_scores = (
@@ -1713,6 +2206,9 @@ class HYV4FlashTopkRouter(nn.Module):
             )
         topk_weights = topk_weights * self.routed_scaling_factor
         return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
+    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.select_topk(self.project_logits(hidden_states))
 
 
 class HYV4FlashLatentMoE(nn.Module):
@@ -1775,6 +2271,15 @@ class HYV4FlashLatentMoE(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("routed_expert_up_proj", prefix),
         )
+        # Fuse routed + shared AllReduce when routed_expert_up_proj is unquantized
+        # and bias-free: W_up @ sum(r_i) + sum(s_i) == sum(W_up @ r_i + s_i).
+        self._fuse_allreduce = (
+            mapping.moe.tp_ep_size > 1
+            and not self.experts.supports_all_to_all_ep
+            and self.routed_expert_up_proj.weight.dtype
+            in (torch.bfloat16, torch.float16, torch.float32)
+            and self.routed_expert_up_proj.bias is None
+        )
         self.shared_experts = HYV4FlashMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
@@ -1785,8 +2290,52 @@ class HYV4FlashLatentMoE(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             quant_config=quant_config,
             prefix=add_prefix("shared_experts", prefix),
+            reduce_results=not self._fuse_allreduce,
         )
         self.combine_output_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self._packed_down_shared_weight: torch.Tensor | None = None
+        self._packed_up_shared_weight: torch.Tensor | None = None
+
+    def prepare_packed_bf16_projections(self) -> None:
+        """Pack BF16 input ``[routed_down; shared.gate_up]`` and output ``[routed_up, shared.down]``."""
+        self.gate.prepare_router_weights()
+        if (
+            self.config.hidden_act == "silu"
+            and _is_unquantized_no_bias_linear(self.routed_expert_down_proj)
+            and _is_unquantized_no_bias_linear(self.shared_experts.gate_up_proj)
+            and self.routed_expert_down_proj.weight.dtype
+            == self.shared_experts.gate_up_proj.weight.dtype
+            and self.routed_expert_down_proj.weight.device
+            == self.shared_experts.gate_up_proj.weight.device
+        ):
+            self._packed_down_shared_weight = torch.cat(
+                (
+                    self.routed_expert_down_proj.weight.detach(),
+                    self.shared_experts.gate_up_proj.weight.detach(),
+                ),
+                dim=0,
+            ).contiguous()
+        else:
+            self._packed_down_shared_weight = None
+
+        if (
+            (self._fuse_allreduce or self.mapping.moe.tp_ep_size == 1)
+            and _is_unquantized_no_bias_linear(self.routed_expert_up_proj)
+            and _is_unquantized_no_bias_linear(self.shared_experts.down_proj)
+            and self.routed_expert_up_proj.weight.dtype
+            == self.shared_experts.down_proj.weight.dtype
+            and self.routed_expert_up_proj.weight.device
+            == self.shared_experts.down_proj.weight.device
+        ):
+            self._packed_up_shared_weight = torch.cat(
+                (
+                    self.routed_expert_up_proj.weight.detach(),
+                    self.shared_experts.down_proj.weight.detach(),
+                ),
+                dim=1,
+            ).contiguous()
+        else:
+            self._packed_up_shared_weight = None
 
     def _forward_experts_cpu(
         self,
@@ -1831,11 +2380,60 @@ class HYV4FlashLatentMoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         ctx: ForwardContext | None = None,
+        *,
+        skip_post_norm: bool = False,
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
-        topk_weights, topk_ids = self.gate(hidden_states)
-        routed_in = _linear_cpu_or_cuda(self.routed_expert_down_proj, hidden_states)
+        packed_w = self._packed_down_shared_weight
+        packed_up = self._packed_up_shared_weight
+        routed_dim = self.config.routed_expert_hidden_size
+        can_use_packed_in = (
+            hidden_states.is_cuda
+            and packed_w is not None
+            and packed_w.device == hidden_states.device
+            and packed_w.dtype == hidden_states.dtype
+        )
+        shared_act: torch.Tensor | None = None
+        # For decode-size batches, overlap router_gate -> packed_down
+        # (skinny_mm with PDL) -> topk(wait_after_compute=True) -> split_swiglu:
+        # packed_down waits for router_gate before launching dependents, so the
+        # small topk kernel safely reads router_logits while running concurrently
+        # on idle SMs alongside packed_down, then waits for packed_down before
+        # releasing split_swiglu.
+        reordered_max_m = (
+            32 if (packed_w is not None and packed_w.shape[0] <= 3072) else 16
+        )
+        use_pdl_reordered_entry = (
+            can_use_packed_in
+            and hidden_states.shape[0] <= reordered_max_m
+            and skinny_mm_supported(hidden_states, packed_w)
+            and not (
+                self.gate.num_group > 1 and self.gate.topk_group < self.gate.num_group
+            )
+        )
+        if use_pdl_reordered_entry:
+            assert packed_w is not None
+            router_logits = self.gate.project_logits(hidden_states)
+            packed = skinny_mm(
+                hidden_states,
+                packed_w,
+                None,
+                out_dtype=hidden_states.dtype,
+                compact_m=True,
+            )
+            topk_weights, topk_ids = self.gate.select_topk(
+                router_logits, wait_after_compute=pdl_enabled()
+            )
+        else:
+            topk_weights, topk_ids = self.gate(hidden_states)
+            packed = F.linear(hidden_states, packed_w) if can_use_packed_in else None
+        if packed is not None:
+            routed_in, shared_act = hy4_split_routed_and_shared_swiglu(
+                packed, routed_dim
+            )
+        else:
+            routed_in = _linear_cpu_or_cuda(self.routed_expert_down_proj, hidden_states)
         if hidden_states.is_cuda:
             topk_output = StandardTopKOutput(
                 topk_weights=topk_weights,
@@ -1856,6 +2454,38 @@ class HYV4FlashLatentMoE(nn.Module):
                 num_global_tokens=num_global_tokens,
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
             )
+            if self._fuse_allreduce:
+                if (
+                    shared_act is not None
+                    and packed_up is not None
+                    and packed_up.device == routed_latent.device
+                    and packed_up.dtype == routed_latent.dtype
+                ):
+                    up_in = torch.cat((routed_latent, shared_act), dim=1)
+                    if skinny_mm_supported(up_in, packed_up):
+                        local_sum = skinny_mm(
+                            up_in,
+                            packed_up,
+                            None,
+                            out_dtype=up_in.dtype,
+                            compact_m=True,
+                        )
+                    else:
+                        local_sum = F.linear(up_in, packed_up)
+                else:
+                    routed_out = self.routed_expert_up_proj(routed_latent)[0]
+                    shared_out = (
+                        self.shared_experts.down_proj(shared_act)[0]
+                        if shared_act is not None
+                        else self.shared_experts(hidden_states)
+                    )
+                    local_sum = routed_out + shared_out
+                combined = all_reduce(local_sum, group=self.mapping.moe.tp_ep_group)
+                return (
+                    combined
+                    if skip_post_norm
+                    else _apply_hy4_rmsnorm(combined, self.combine_output_norm)
+                )
             if (
                 self.mapping.moe.tp_ep_size > 1
                 and not self.experts.supports_all_to_all_ep
@@ -1863,11 +2493,42 @@ class HYV4FlashLatentMoE(nn.Module):
                 routed_latent = all_reduce(
                     routed_latent, group=self.mapping.moe.tp_ep_group
                 )
+            elif (
+                shared_act is not None
+                and packed_up is not None
+                and packed_up.device == routed_latent.device
+                and packed_up.dtype == routed_latent.dtype
+            ):
+                up_in = torch.cat((routed_latent, shared_act), dim=1)
+                if skinny_mm_supported(up_in, packed_up):
+                    combined = skinny_mm(
+                        up_in,
+                        packed_up,
+                        None,
+                        out_dtype=up_in.dtype,
+                        compact_m=True,
+                    )
+                else:
+                    combined = F.linear(up_in, packed_up)
+                return (
+                    combined
+                    if skip_post_norm
+                    else _apply_hy4_rmsnorm(combined, self.combine_output_norm)
+                )
         else:
             routed_latent = self._forward_experts_cpu(routed_in, topk_ids, topk_weights)
         routed_out = _linear_cpu_or_cuda(self.routed_expert_up_proj, routed_latent)
-        shared_out = self.shared_experts(hidden_states)
-        return _apply_hy4_rmsnorm(routed_out + shared_out, self.combine_output_norm)
+        shared_out = (
+            self.shared_experts.down_proj(shared_act)[0]
+            if shared_act is not None
+            else self.shared_experts(hidden_states)
+        )
+        combined = routed_out + shared_out
+        return (
+            combined
+            if skip_post_norm
+            else _apply_hy4_rmsnorm(combined, self.combine_output_norm)
+        )
 
 
 # ===----------------------------------------------------------------------=== #
@@ -1889,6 +2550,7 @@ class HYV4FlashDecoderLayer(nn.Module):
         super().__init__()
         self.config = config
         self.layer_id = layer_id
+        self.layer_type = config.layer_types[layer_id]
         self.is_moe_layer = config.mlp_layer_types[layer_id] == "sparse"
 
         self.engram_layer: HYV4FlashEngramLayer | None = None
@@ -1945,21 +2607,116 @@ class HYV4FlashDecoderLayer(nn.Module):
         *,
         ngram_tokens: torch.Tensor | None = None,
         engram_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        positions_3d: torch.Tensor | None = None,
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
+        pending_mlp_post: (
+            tuple[HYV4FlashHyperConnection, torch.Tensor, torch.Tensor, RMSNorm | None]
+            | None
+        ) = None,
+        defer_mlp_post: bool = False,
+    ):
+        inplace_post = hidden_streams.is_cuda and not hidden_streams.requires_grad
+        fuse_post_norm = hidden_streams.is_cuda and ctx is not None
         if self.engram_layer is not None and ngram_tokens is not None:
-            hidden_streams = hidden_streams + self.engram_layer(
-                hidden_streams, ngram_tokens, engram_mask
+            if pending_mlp_post is not None:
+                prev_hc, prev_out, prev_coeff, prev_norm = pending_mlp_post
+                hidden_streams = prev_hc.post(
+                    hidden_streams,
+                    prev_out,
+                    prev_coeff,
+                    inplace=inplace_post,
+                    norm=prev_norm,
+                )
+                pending_mlp_post = None
+            hidden_streams = self.engram_layer(
+                hidden_streams, ngram_tokens, engram_mask, add_to_hidden=True
             )
 
-        attn_post, attn_in = self.hc_attn_layer.pre(hidden_streams)
-        attn_in = _apply_hy4_rmsnorm(attn_in, self.input_layernorm)
-        attn_out = self.self_attn(positions, attn_in, ctx)
-        hidden_streams = self.hc_attn_layer.post(hidden_streams, attn_out, attn_post)
-
-        mlp_post, mlp_in = self.hc_mlp_layer.pre(hidden_streams)
-        mlp_in = _apply_hy4_rmsnorm(mlp_in, self.post_attention_layernorm)
-        mlp_out = self.mlp(mlp_in, ctx=ctx) if self.is_moe_layer else self.mlp(mlp_in)
-        hidden_streams = self.hc_mlp_layer.post(hidden_streams, mlp_out, mlp_post)
+        gate_fp8, gate_mn = (
+            _o_proj_fp8_block_mode(self.self_attn.linear_gate)
+            if fuse_post_norm
+            else (False, False)
+        )
+        use_attn_fp8 = (
+            gate_fp8
+            and gate_mn
+            and hidden_streams.dtype in (torch.bfloat16, torch.float16)
+        )
+        if pending_mlp_post is not None:
+            prev_hc, prev_out, prev_coeff, prev_norm = pending_mlp_post
+            if use_attn_fp8:
+                hidden_streams, attn_post, attn_in, attn_fp8, attn_scale = (
+                    prev_hc.post_into_next_pre(
+                        hidden_streams,
+                        prev_out,
+                        prev_coeff,
+                        self.hc_attn_layer,
+                        inplace=inplace_post,
+                        post_norm=prev_norm,
+                        pre_norm=self.input_layernorm,
+                        return_fp8_mn_major=True,
+                    )
+                )
+                prequant_attn: tuple[torch.Tensor, torch.Tensor] | None = (
+                    attn_fp8,
+                    attn_scale,
+                )
+            else:
+                hidden_streams, attn_post, attn_in = prev_hc.post_into_next_pre(
+                    hidden_streams,
+                    prev_out,
+                    prev_coeff,
+                    self.hc_attn_layer,
+                    inplace=inplace_post,
+                    post_norm=prev_norm,
+                    pre_norm=self.input_layernorm,
+                )
+                prequant_attn = None
+        elif use_attn_fp8:
+            attn_post, attn_in, attn_fp8, attn_scale = self.hc_attn_layer.pre(
+                hidden_streams,
+                norm=self.input_layernorm,
+                return_fp8_mn_major=True,
+            )
+            prequant_attn = (attn_fp8, attn_scale)
+        else:
+            attn_post, attn_in = self.hc_attn_layer.pre(
+                hidden_streams, norm=self.input_layernorm
+            )
+            prequant_attn = None
+        attn_out = self.self_attn(
+            positions,
+            attn_in,
+            ctx,
+            positions_3d=positions_3d,
+            rope_cos_sin=rope_cos_sin,
+            prequant_hidden=prequant_attn,
+            skip_post_norm=fuse_post_norm,
+        )
+        hidden_streams, mlp_post, mlp_in = self.hc_attn_layer.post_into_next_pre(
+            hidden_streams,
+            attn_out,
+            attn_post,
+            self.hc_mlp_layer,
+            inplace=inplace_post,
+            post_norm=self.self_attn.post_proj_norm if fuse_post_norm else None,
+            pre_norm=self.post_attention_layernorm,
+        )
+        if self.is_moe_layer:
+            mlp_out = self.mlp(mlp_in, ctx=ctx, skip_post_norm=fuse_post_norm)
+            mlp_post_norm = self.mlp.combine_output_norm if fuse_post_norm else None
+        else:
+            mlp_out = self.mlp(mlp_in, skip_post_norm=fuse_post_norm)
+            mlp_post_norm = self.mlp.post_fc2_norm if fuse_post_norm else None
+        if defer_mlp_post:
+            return hidden_streams, (self.hc_mlp_layer, mlp_out, mlp_post, mlp_post_norm)
+        hidden_streams = self.hc_mlp_layer.post(
+            hidden_streams,
+            mlp_out,
+            mlp_post,
+            inplace=inplace_post,
+            norm=mlp_post_norm,
+        )
         return hidden_streams
 
 
@@ -2000,6 +2757,27 @@ class HYV4FlashTextModel(nn.Module):
         self.hc_head = HYV4FlashHyperHead(config)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        # Pre-register per-layer-type RoPE inverse frequencies (at most 2: DSA & SWA)
+        # so forward computes cos/sin once per type instead of 42+12 times per step.
+        self._rope_inv_freq_names: dict[str, str] = {}
+        self._rope_sections: dict[str, tuple[int, int, int]] = {}
+        for layer_type in dict.fromkeys(config.layer_types):
+            rope_params = config.rope_parameters[layer_type]
+            theta = float(rope_params["rope_theta"])
+            inv_freq = 1.0 / (
+                theta
+                ** (
+                    torch.arange(0, config.qk_rope_head_dim, 2, dtype=torch.float32)
+                    / config.qk_rope_head_dim
+                )
+            )
+            buf_name = f"_rope_inv_freq_{layer_type}"
+            self.register_buffer(buf_name, inv_freq, persistent=False)
+            self._rope_inv_freq_names[layer_type] = buf_name
+            self._rope_sections[layer_type] = tuple(
+                int(s) for s in rope_params["mrope_section"]
+            )
+
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
 
@@ -2032,14 +2810,49 @@ class HYV4FlashTextModel(nn.Module):
         hidden_streams = (
             hidden_states.unsqueeze(1).expand(-1, self.hc_mult, -1).contiguous()
         )
-        for layer in self.layers:
-            hidden_streams = layer(
+        positions_3d: torch.Tensor | None = None
+        rope_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        if ctx is not None and hidden_states.is_cuda and hidden_states.shape[0] > 0:
+            positions_3d = _normalize_positions_3d(positions)
+            for layer_type, buf_name in self._rope_inv_freq_names.items():
+                cos, sin = compute_hy4_mrope_cos_sin(
+                    positions_3d,
+                    getattr(self, buf_name),
+                    self._rope_sections[layer_type],
+                )
+                rope_cache[layer_type] = (
+                    cos.to(hidden_states.dtype).contiguous(),
+                    sin.to(hidden_states.dtype).contiguous(),
+                )
+        num_layers = len(self.layers)
+        can_defer_post = (
+            ctx is not None
+            and hidden_streams.is_cuda
+            and not hidden_streams.requires_grad
+        )
+        pending_mlp_post = None
+        for idx, layer in enumerate(self.layers):
+            defer = (
+                can_defer_post
+                and idx + 1 < num_layers
+                and self.layers[idx + 1].engram_layer is None
+            )
+            out = layer(
                 positions,
                 hidden_streams,
                 ctx,
                 ngram_tokens=ngram_tokens,
                 engram_mask=engram_mask,
+                positions_3d=positions_3d,
+                rope_cos_sin=rope_cache.get(layer.layer_type),
+                pending_mlp_post=pending_mlp_post,
+                defer_mlp_post=defer,
             )
+            if defer:
+                hidden_streams, pending_mlp_post = out
+            else:
+                hidden_streams = out
+                pending_mlp_post = None
         collapsed = self.hc_head(hidden_streams)
         hidden_states = _apply_hy4_rmsnorm(collapsed, self.norm)
 
@@ -2230,6 +3043,48 @@ _TEXT_FILTERED_WEIGHT_PREFIXES = (
 )
 
 
+class HYV4FlashLMHeadFP32Method(UnquantizedEmbeddingMethod):
+    """Project BF16 activations and BF16 LM-head weights directly into FP32 logits."""
+
+    def apply(
+        self,
+        layer: nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        weight = layer.weight
+        if x.is_cuda and weight.dtype == torch.bfloat16:
+            x_2d = x.reshape(-1, x.shape[-1])
+            if x_2d.shape[0] == 0:
+                return torch.empty(
+                    (*x.shape[:-1], weight.shape[0]),
+                    dtype=torch.float32,
+                    device=x.device,
+                )
+            if x_2d.dtype != torch.bfloat16:
+                x_2d = x_2d.to(torch.bfloat16)
+            out = torch.mm(x_2d, weight.t(), out_dtype=torch.float32)
+            if bias is not None:
+                out = out + bias.float()
+            return out.view(*x.shape[:-1], weight.shape[0])
+        return F.linear(
+            x.float(),
+            weight.float(),
+            bias.float() if bias is not None else None,
+        )
+
+
+class HYV4FlashLogitsProcessor(LogitsProcessor):
+    """Logits processor reporting FP32 shard logits for BF16-weight FP32-output heads."""
+
+    def sampled_shard_dtype(self, lm_head: VocabParallelEmbedding) -> torch.dtype:
+        if isinstance(
+            getattr(lm_head, "quant_method", None), HYV4FlashLMHeadFP32Method
+        ):
+            return torch.float32
+        return super().sampled_shard_dtype(lm_head)
+
+
 def build_hy4_lm_head(
     *,
     config: HYV4FlashTextConfig | HYV4FlashDFlyConfig,
@@ -2237,11 +3092,22 @@ def build_hy4_lm_head(
     quant_config: QuantizationConfig | None,
     prefix: str,
 ) -> nn.Module:
-    """Build the Hy4-flash LM head (FP32 unquantized when ``enable_lm_head_fp32``)."""
-    head_dtype = torch.float32 if config.enable_lm_head_fp32 else None
+    """Build the Hy4-flash LM head (FP32 output; BF16 weights on Hopper+ CUDA BF16)."""
+    use_bf16_w_fp32_out = (
+        bool(config.enable_lm_head_fp32)
+        and torch.get_default_dtype() == torch.bfloat16
+        and torch.get_default_device().type == "cuda"
+        and Platform.get().is_hopper_plus
+        and global_server_args_dict["numerics"] not in BITWISE_ENVELOPES
+    )
+    head_dtype = (
+        torch.bfloat16
+        if use_bf16_w_fp32_out
+        else (torch.float32 if config.enable_lm_head_fp32 else None)
+    )
     head_quant = None if config.enable_lm_head_fp32 else quant_config
     if mapping.attn.has_dp and not mapping.lm_head.has_tp:
-        return ReplicatedLinear(
+        lm_head: nn.Module = ReplicatedLinear(
             config.hidden_size,
             config.vocab_size,
             bias=False,
@@ -2249,16 +3115,20 @@ def build_hy4_lm_head(
             quant_config=head_quant,
             prefix=add_prefix("lm_head", prefix),
         )
-    return ParallelLMHead(
-        config.vocab_size,
-        config.hidden_size,
-        params_dtype=head_dtype,
-        quant_config=head_quant,
-        prefix=add_prefix("lm_head", prefix),
-        tp_rank=mapping.lm_head.tp_rank,
-        tp_size=mapping.lm_head.tp_size,
-        tp_group=mapping.lm_head.tp_group,
-    )
+    else:
+        lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            params_dtype=head_dtype,
+            quant_config=head_quant,
+            prefix=add_prefix("lm_head", prefix),
+            tp_rank=mapping.lm_head.tp_rank,
+            tp_size=mapping.lm_head.tp_size,
+            tp_group=mapping.lm_head.tp_group,
+        )
+    if use_bf16_w_fp32_out:
+        lm_head.quant_method = HYV4FlashLMHeadFP32Method()
+    return lm_head
 
 
 def _load_missing_hy4_engram_tables(
@@ -2341,6 +3211,7 @@ class HYV4FlashForCausalLM(BaseCausalLM):
     """Hy4-flash text-only CausalLM with optional FP32 LM head."""
 
     model_cls = HYV4FlashTextModel
+    logits_processor_cls = HYV4FlashLogitsProcessor
     quant_module_name_replacements = _HY4_QUANT_REPLACEMENTS
 
     def __init__(
@@ -2424,8 +3295,16 @@ class HYV4FlashForCausalLM(BaseCausalLM):
     def post_load_weights(self) -> None:
         if self.model is None:
             return
+        _enable_hopper_deepgemm(self)
         for layer in self.model.layers:
             layer.self_attn.prepare_absorbed_mla_weights()
+            layer.self_attn.prepare_packed_bf16_projections()
+            if layer.self_attn.compressed_indexer is not None:
+                layer.self_attn.compressed_indexer.prepare_pooling_weights()
+            if isinstance(layer.mlp, HYV4FlashLatentMoE):
+                layer.mlp.prepare_packed_bf16_projections()
+            if layer.engram_layer is not None:
+                layer.engram_layer.prepare_packed_weights()
             if (
                 isinstance(layer.mlp, HYV4FlashLatentMoE)
                 and layer.mlp.experts.w13_weight.is_cuda
@@ -2634,7 +3513,9 @@ __all__ = [
     "HYV4FlashHyperConnection",
     "HYV4FlashHyperHead",
     "HYV4FlashHyperPre",
+    "HYV4FlashLMHeadFP32Method",
     "HYV4FlashLatentMoE",
+    "HYV4FlashLogitsProcessor",
     "HYV4FlashMLP",
     "HYV4FlashTextModel",
     "HYV4FlashTopkRouter",
